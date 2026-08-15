@@ -1,8 +1,12 @@
-import { memo, useState, useCallback, useRef } from "react";
-import { VideoFrameThumbnail } from "../ui/VideoFrameThumbnail";
-import { MEDIA_EXT, IMAGE_EXT, VIDEO_EXT, AUDIO_EXT } from "../../utils/mediaTypes";
-import { TIMELINE_ASSET_MIME } from "../../utils/timelineAssetDrop";
+// fallow-ignore-file code-duplication
+import { memo, useState, useCallback, useRef, useMemo, useEffect } from "react";
+import { MEDIA_EXT, FONT_EXT } from "../../utils/mediaTypes";
 import { copyTextToClipboard } from "../../utils/clipboard";
+import { usePlayerStore } from "../../player/store/playerStore";
+import { type MediaCategory, getCategory, CATEGORY_LABELS, FILTER_ORDER } from "./assetHelpers";
+import { AudioRow } from "./AudioRow";
+import { GlobalAssetsView } from "./GlobalAssetsView";
+import { AssetCard, FontRow } from "./AssetCard";
 
 interface AssetsTabProps {
   projectId: string;
@@ -10,272 +14,80 @@ interface AssetsTabProps {
   onImport?: (files: FileList) => void;
   onDelete?: (path: string) => void;
   onRename?: (oldPath: string, newPath: string) => void;
+  onAddAssetToTimeline?: (path: string) => void;
 }
 
-/** Inline thumbnail content — rendered inside the container div in AssetCard. */
-function AssetThumbnail({
-  serveUrl,
-  name,
-  isImage,
-  isVideo,
-  isAudio,
-}: {
-  serveUrl: string;
-  name: string;
-  isImage: boolean;
-  isVideo: boolean;
-  isAudio: boolean;
-}) {
-  return (
-    <>
-      {isImage && (
-        <img
-          src={serveUrl}
-          alt={name}
-          loading="lazy"
-          className="w-full h-full object-contain"
-          onError={(e) => {
-            (e.target as HTMLImageElement).style.display = "none";
-          }}
-        />
-      )}
-      {isVideo && <VideoFrameThumbnail src={serveUrl} />}
-      {isAudio && (
-        <div className="w-full h-full flex items-center justify-center">
-          <svg
-            width="16"
-            height="16"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            className="text-purple-400"
-          >
-            <path d="M9 18V5l12-2v13" strokeLinecap="round" strokeLinejoin="round" />
-            <circle cx="6" cy="18" r="3" />
-            <circle cx="18" cy="16" r="3" />
-          </svg>
-        </div>
-      )}
-      {!isImage && !isVideo && !isAudio && (
-        <div className="w-full h-full flex items-center justify-center">
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            className="text-neutral-600"
-          >
-            <path
-              d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-            <polyline points="14 2 14 8 20 8" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </div>
-      )}
-    </>
-  );
+export type UsageFilter = "all" | "used" | "unused";
+
+/** Filter assets by whether the composition references them. Pure — unit-tested. */
+export function filterByUsage(
+  assets: string[],
+  usedPaths: Set<string>,
+  usageFilter: UsageFilter,
+): string[] {
+  if (usageFilter === "used") return assets.filter((a) => usedPaths.has(a));
+  if (usageFilter === "unused") return assets.filter((a) => !usedPaths.has(a));
+  return assets;
 }
 
-function AssetCard({
-  projectId,
-  asset,
-  onCopy,
-  isCopied,
-  onDelete,
-  onRename,
-}: {
-  projectId: string;
-  asset: string;
-  onCopy: (path: string) => void;
-  isCopied: boolean;
-  onDelete?: (path: string) => void;
-  onRename?: (oldPath: string, newPath: string) => void;
-}) {
-  const [hovered, setHovered] = useState(false);
-  const [contextMenu, setContextMenu] = useState<{ x: number; y: number } | null>(null);
-  const [renaming, setRenaming] = useState(false);
-  const [renameName, setRenameName] = useState("");
-  const [confirmDelete, setConfirmDelete] = useState(false);
-  const name = asset.split("/").pop() ?? asset;
-  const serveUrl = `/api/projects/${projectId}/preview/${asset}`;
-  const isVideo = VIDEO_EXT.test(asset);
+/** Count used vs unused over a media set. Pure — unit-tested. */
+export function countUsage(
+  assets: string[],
+  usedPaths: Set<string>,
+): { used: number; unused: number } {
+  let used = 0;
+  for (const a of assets) if (usedPaths.has(a)) used++;
+  return { used, unused: assets.length - used };
+}
 
-  return (
-    <>
-      <div
-        draggable
-        onClick={() => onCopy(asset)}
-        onDragStart={(e) => {
-          e.dataTransfer.effectAllowed = "copy";
-          e.dataTransfer.setData(TIMELINE_ASSET_MIME, JSON.stringify({ path: asset }));
-          e.dataTransfer.setData("text/plain", asset);
-        }}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          setContextMenu({ x: e.clientX, y: e.clientY });
-        }}
-        onPointerEnter={() => setHovered(true)}
-        onPointerLeave={() => setHovered(false)}
-        className={`w-full text-left px-2 py-1.5 flex items-center gap-2.5 transition-colors cursor-pointer ${
-          isCopied
-            ? "bg-studio-accent/10 border-l-2 border-studio-accent"
-            : "border-l-2 border-transparent hover:bg-neutral-800/50"
-        }`}
-      >
-        <div className="w-16 h-10 rounded overflow-hidden bg-neutral-900 flex-shrink-0 relative">
-          <AssetThumbnail
-            serveUrl={serveUrl}
-            name={name}
-            isImage={IMAGE_EXT.test(asset)}
-            isVideo={isVideo}
-            isAudio={AUDIO_EXT.test(asset)}
-          />
-          {isVideo && hovered && (
-            <video
-              src={serveUrl}
-              autoPlay
-              muted
-              loop
-              playsInline
-              className="absolute inset-0 w-full h-full object-contain"
-            />
-          )}
-        </div>
-        <div className="min-w-0 flex-1">
-          {renaming ? (
-            <input
-              autoFocus
-              value={renameName}
-              onChange={(e) => setRenameName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  const trimmed = renameName.trim();
-                  if (trimmed && trimmed !== name) {
-                    const dir = asset.includes("/")
-                      ? asset.slice(0, asset.lastIndexOf("/") + 1)
-                      : "";
-                    onRename?.(asset, dir + trimmed);
-                  }
-                  setRenaming(false);
-                } else if (e.key === "Escape") {
-                  setRenaming(false);
-                }
-              }}
-              onBlur={() => {
-                const trimmed = renameName.trim();
-                if (trimmed && trimmed !== name) {
-                  const dir = asset.includes("/") ? asset.slice(0, asset.lastIndexOf("/") + 1) : "";
-                  onRename?.(asset, dir + trimmed);
-                }
-                setRenaming(false);
-              }}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full bg-neutral-800 text-neutral-200 text-[11px] px-1.5 py-0.5 rounded border border-neutral-600 outline-none focus:border-studio-accent"
-              spellCheck={false}
-            />
-          ) : (
-            <>
-              <span className="text-[11px] font-medium text-neutral-300 truncate block">
-                {name}
-              </span>
-              {isCopied ? (
-                <span className="text-[9px] text-studio-accent">Copied!</span>
-              ) : (
-                <span className="text-[9px] text-neutral-600 truncate block">{asset}</span>
-              )}
-            </>
-          )}
-        </div>
-      </div>
+/**
+ * Project-relative asset paths referenced by composition elements — the set the
+ * "in use" badge, used-first sort, and usage filter all key on. Element src is
+ * populated from the core runtime's `resolveNodeAssetUrl` which calls
+ * `new URL(raw, document.baseURI).toString()`, turning authored relative paths
+ * into fully-absolute URLs with percent-encoded characters, e.g.
+ *   "assets/my file (1).mp4"
+ *   → "http://localhost:3012/api/projects/demo/preview/assets/my%20file%20(1).mp4"
+ *
+ * This function normalizes every src shape to the bare project-relative path so
+ * it matches the asset-list entries:
+ *   - Absolute URL  → strip origin + /api/projects/<id>/preview/ prefix, decode %XX
+ *   - Server-relative /api/…preview/… → same strip + decode
+ *   - Relative "./"-prefixed or bare → strip leading ./ or /
+ *   - ?query / #hash → dropped
+ *
+ * Pure — unit-tested.
+ */
+export function deriveUsedPaths(elements: Array<{ src?: string }>): Set<string> {
+  const paths = new Set<string>();
+  for (const el of elements) {
+    if (!el.src) continue;
+    let s = el.src;
 
-      {/* Context menu */}
-      {contextMenu && (
-        <div
-          className="fixed inset-0 z-[200]"
-          onClick={() => setContextMenu(null)}
-          onContextMenu={(e) => {
-            e.preventDefault();
-            setContextMenu(null);
-          }}
-        >
-          <div
-            className="absolute bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl py-1 min-w-[140px] text-xs"
-            style={{ left: contextMenu.x, top: contextMenu.y }}
-          >
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onCopy(asset);
-                setContextMenu(null);
-              }}
-              className="w-full text-left px-3 py-1.5 text-neutral-300 hover:bg-neutral-800 transition-colors"
-            >
-              Copy path
-            </button>
-            {onRename && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setRenameName(name);
-                  setRenaming(true);
-                  setContextMenu(null);
-                }}
-                className="w-full text-left px-3 py-1.5 text-neutral-300 hover:bg-neutral-800 transition-colors"
-              >
-                Rename
-              </button>
-            )}
-            {onDelete && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setConfirmDelete(true);
-                  setContextMenu(null);
-                }}
-                className="w-full text-left px-3 py-1.5 text-red-400 hover:bg-neutral-800 transition-colors"
-              >
-                Delete
-              </button>
-            )}
-          </div>
-        </div>
-      )}
+    // Strip absolute origin if present (http://host/path → /path)
+    try {
+      const u = new URL(s);
+      s = u.pathname + (u.search ? u.search : "") + (u.hash ? u.hash : "");
+    } catch {
+      // Not a valid absolute URL — leave as-is (relative path)
+    }
 
-      {/* Delete confirmation */}
-      {confirmDelete && (
-        <div className="px-2 py-1.5 bg-red-950/30 border-l-2 border-red-500 flex items-center justify-between gap-2">
-          <span className="text-[10px] text-red-400 truncate">Delete {name}?</span>
-          <div className="flex items-center gap-1 flex-shrink-0">
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onDelete?.(asset);
-                setConfirmDelete(false);
-              }}
-              className="px-2 py-0.5 text-[10px] rounded bg-red-600 text-white hover:bg-red-500 transition-colors"
-            >
-              Delete
-            </button>
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                setConfirmDelete(false);
-              }}
-              className="px-2 py-0.5 text-[10px] rounded text-neutral-400 hover:text-neutral-200 transition-colors"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-    </>
-  );
+    s = s
+      .replace(/^\/api\/projects\/[^/]+\/preview\//, "") // strip the dev serve prefix
+      .replace(/^\.?\//, "") // strip leading ./ or /
+      .split(/[?#]/)[0]; // drop query / hash
+
+    // Decode percent-encoded characters (spaces, parens, etc.) so the path
+    // matches the plain-text asset-list entries the server returns.
+    try {
+      s = decodeURIComponent(s);
+    } catch {
+      // Malformed encoding — use as-is
+    }
+
+    if (s) paths.add(s);
+  }
+  return paths;
 }
 
 export const AssetsTab = memo(function AssetsTab({
@@ -284,11 +96,54 @@ export const AssetsTab = memo(function AssetsTab({
   onImport,
   onDelete,
   onRename,
+  onAddAssetToTimeline,
 }: AssetsTabProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [dragOver, setDragOver] = useState(false);
   const [copiedPath, setCopiedPath] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState<MediaCategory | "all">("all");
+  const [usageFilter, setUsageFilter] = useState<"all" | "used" | "unused">("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [viewMode, setViewMode] = useState<"local" | "global">("local");
+  const [manifest, setManifest] = useState<
+    Map<string, { description?: string; duration?: number; width?: number; height?: number }>
+  >(new Map());
 
+  const manifest404Ref = useRef<Set<string>>(new Set());
+  const assetsKey = assets.join("|");
+  useEffect(() => {
+    if (manifest404Ref.current.has(projectId)) return;
+    let cancelled = false;
+    fetch(`/api/projects/${projectId}/preview/.media/manifest.jsonl`)
+      .then((r) => {
+        if (!r.ok) {
+          manifest404Ref.current.add(projectId);
+          return "";
+        }
+        return r.text();
+      })
+      .then((text) => {
+        if (cancelled || !text) return;
+        const m = new Map<
+          string,
+          { description?: string; duration?: number; width?: number; height?: number }
+        >();
+        for (const line of text.split("\n")) {
+          if (!line.trim()) continue;
+          try {
+            const rec = JSON.parse(line);
+            if (rec.path) m.set(rec.path, rec);
+          } catch {
+            /* skip */
+          }
+        }
+        setManifest(m);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, assetsKey]);
   const handleDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
@@ -297,7 +152,6 @@ export const AssetsTab = memo(function AssetsTab({
     },
     [onImport],
   );
-
   const handleCopyPath = useCallback(async (path: string) => {
     const copied = await copyTextToClipboard(path);
     if (copied) {
@@ -305,9 +159,60 @@ export const AssetsTab = memo(function AssetsTab({
       setTimeout(() => setCopiedPath(null), 1500);
     }
   }, []);
-
-  const mediaAssets = assets.filter((a) => MEDIA_EXT.test(a));
-
+  const elements = usePlayerStore((s) => s.elements);
+  const usedPaths = useMemo(() => deriveUsedPaths(elements), [elements]);
+  const mediaAssets = useMemo(() => {
+    const media = assets.filter((a) => MEDIA_EXT.test(a) || FONT_EXT.test(a));
+    const all = filterByUsage(media, usedPaths, usageFilter);
+    if (!searchQuery) return all;
+    const q = searchQuery.toLowerCase();
+    return all.filter((a) => {
+      if (
+        a
+          .split("/")
+          .pop()
+          ?.replace(/\.[^.]*$/, "")
+          .toLowerCase()
+          .includes(q)
+      )
+        return true;
+      const rec = manifest.get(a);
+      return rec?.description?.toLowerCase().includes(q);
+    });
+  }, [assets, searchQuery, manifest, usageFilter, usedPaths]);
+  const categorized = useMemo(() => {
+    const groups: Record<MediaCategory, string[]> = { audio: [], images: [], video: [], fonts: [] };
+    for (const a of mediaAssets) {
+      const cat = getCategory(a);
+      if (cat) groups[cat].push(a);
+    }
+    // Sort: used assets first within each category
+    for (const cat of FILTER_ORDER) {
+      groups[cat].sort((a, b) => {
+        const aUsed = usedPaths.has(a) ? 0 : 1;
+        const bUsed = usedPaths.has(b) ? 0 : 1;
+        return aUsed - bUsed;
+      });
+    }
+    return groups;
+  }, [mediaAssets, usedPaths]);
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { all: mediaAssets.length };
+    for (const cat of FILTER_ORDER) c[cat] = categorized[cat].length;
+    return c;
+  }, [mediaAssets, categorized]);
+  const usageCounts = useMemo(
+    () =>
+      countUsage(
+        assets.filter((a) => MEDIA_EXT.test(a) || FONT_EXT.test(a)),
+        usedPaths,
+      ),
+    [assets, usedPaths],
+  );
+  const visibleCategories =
+    activeFilter === "all"
+      ? FILTER_ORDER.filter((c) => categorized[c].length > 0)
+      : [activeFilter as MediaCategory].filter((c) => categorized[c].length > 0);
   return (
     <div
       className={`flex-1 flex flex-col min-h-0 transition-colors ${dragOver ? "bg-studio-accent/[0.05]" : ""}`}
@@ -318,45 +223,154 @@ export const AssetsTab = memo(function AssetsTab({
       onDragLeave={() => setDragOver(false)}
       onDrop={handleDrop}
     >
-      {/* Import button */}
-      {onImport && (
-        <div className="px-3 py-2 border-b border-neutral-800/40 flex-shrink-0">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] rounded-lg border border-dashed border-neutral-700/50 text-neutral-500 hover:text-neutral-300 hover:border-neutral-600 transition-colors"
-          >
-            <svg
-              width="12"
-              height="12"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="2.5"
-              strokeLinecap="round"
+      {/* Header — matches design panel Section pattern */}
+      <div className="px-4 pt-2.5 pb-1.5 flex-shrink-0">
+        {/* Scope toggle */}
+        <div className="flex gap-1 mb-2.5 p-0.5 rounded-md bg-panel-input">
+          {(["local", "global"] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => setViewMode(m)}
+              className={`flex-1 px-2 py-1 text-[11px] font-medium rounded transition-colors ${
+                viewMode === m
+                  ? "bg-panel-accent/15 text-panel-accent"
+                  : "text-panel-text-3 hover:text-panel-text-1"
+              }`}
             >
-              <path d="M12 5v14M5 12h14" />
-            </svg>
-            Import media
-          </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/*,image/*,audio/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files?.length) {
-                onImport(e.target.files);
-                e.target.value = "";
-              }
-            }}
-          />
+              {m === "local" ? "This project" : "All projects"}
+            </button>
+          ))}
         </div>
-      )}
+        {/* Import */}
+        {onImport && (
+          <>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-full flex items-center justify-center gap-1.5 rounded-md bg-panel-input px-3 py-[7px] text-[11px] font-medium text-panel-text-3 hover:text-panel-text-1 transition-colors mb-2.5"
+            >
+              <svg
+                width="11"
+                height="11"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+              >
+                <path d="M12 5v14M5 12h14" />
+              </svg>
+              Import media
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/*,image/*,audio/*,font/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files?.length) {
+                  onImport(e.target.files);
+                  e.target.value = "";
+                }
+              }}
+            />
+          </>
+        )}
 
-      {/* Asset list */}
-      <div className="flex-1 overflow-y-auto">
-        {mediaAssets.length === 0 ? (
+        {/* Search */}
+        {mediaAssets.length > 0 && (
+          <div className="flex items-center gap-1.5 rounded-md bg-panel-input px-2.5 py-[5px] mb-2">
+            <svg width="12" height="12" viewBox="0 0 256 256" fill="none" className="flex-shrink-0">
+              <circle
+                cx="116"
+                cy="116"
+                r="76"
+                stroke="currentColor"
+                strokeWidth="22"
+                className="text-panel-text-5"
+              />
+              <line
+                x1="170"
+                y1="170"
+                x2="232"
+                y2="232"
+                stroke="currentColor"
+                strokeWidth="22"
+                strokeLinecap="round"
+                className="text-panel-text-5"
+              />
+            </svg>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search assets..."
+              className="min-w-0 w-full bg-transparent text-[11px] text-panel-text-1 outline-none placeholder:text-panel-text-5"
+            />
+          </div>
+        )}
+
+        {/* Filter chips */}
+        {viewMode === "local" && mediaAssets.length > 0 && (
+          <div className="flex gap-1.5 flex-wrap">
+            <button
+              onClick={() => setActiveFilter("all")}
+              className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors ${
+                activeFilter === "all"
+                  ? "bg-panel-accent/15 text-panel-accent"
+                  : "bg-panel-input text-panel-text-3 hover:text-panel-text-1"
+              }`}
+            >
+              All {counts.all}
+            </button>
+            {FILTER_ORDER.map((cat) =>
+              counts[cat] > 0 ? (
+                <button
+                  key={cat}
+                  onClick={() => setActiveFilter(activeFilter === cat ? "all" : cat)}
+                  className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors ${
+                    activeFilter === cat
+                      ? "bg-panel-accent/15 text-panel-accent"
+                      : "bg-panel-input text-panel-text-3 hover:text-panel-text-1"
+                  }`}
+                >
+                  {CATEGORY_LABELS[cat]} {counts[cat]}
+                </button>
+              ) : null,
+            )}
+            {usageCounts.used > 0 && usageCounts.unused > 0 && (
+              <>
+                <span className="w-px self-stretch bg-panel-input mx-0.5" aria-hidden="true" />
+                <button
+                  onClick={() => setUsageFilter(usageFilter === "used" ? "all" : "used")}
+                  className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors ${
+                    usageFilter === "used"
+                      ? "bg-panel-accent/15 text-panel-accent"
+                      : "bg-panel-input text-panel-text-3 hover:text-panel-text-1"
+                  }`}
+                >
+                  In use {usageCounts.used}
+                </button>
+                <button
+                  onClick={() => setUsageFilter(usageFilter === "unused" ? "all" : "unused")}
+                  className={`px-2.5 py-1 text-[11px] font-medium rounded-md transition-colors ${
+                    usageFilter === "unused"
+                      ? "bg-panel-accent/15 text-panel-accent"
+                      : "bg-panel-input text-panel-text-3 hover:text-panel-text-1"
+                  }`}
+                >
+                  Unused {usageCounts.unused}
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="flex-1 overflow-y-auto mt-1">
+        {viewMode === "global" ? (
+          <GlobalAssetsView searchQuery={searchQuery} />
+        ) : mediaAssets.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full px-4 gap-2">
             <svg
               width="24"
@@ -378,16 +392,63 @@ export const AssetsTab = memo(function AssetsTab({
             <p className="text-[10px] text-neutral-600 text-center">Drop media files here</p>
           </div>
         ) : (
-          mediaAssets.map((asset) => (
-            <AssetCard
-              key={asset}
-              projectId={projectId}
-              asset={asset}
-              onCopy={handleCopyPath}
-              isCopied={copiedPath === asset}
-              onDelete={onDelete}
-              onRename={onRename}
-            />
+          visibleCategories.map((cat) => (
+            <div key={cat} className="mb-1">
+              {activeFilter === "all" && (
+                <div className="flex items-center gap-2 px-4 py-2 border-t border-panel-border">
+                  <h3 className="text-[12px] font-semibold text-panel-text-1">
+                    {CATEGORY_LABELS[cat]}
+                  </h3>
+                  <span className="text-[11px] text-panel-text-5">{categorized[cat].length}</span>
+                </div>
+              )}
+              {cat === "audio" &&
+                categorized[cat].map((a) => (
+                  <AudioRow
+                    key={a}
+                    projectId={projectId}
+                    asset={a}
+                    used={usedPaths.has(a)}
+                    meta={manifest.get(a)}
+                    onCopy={handleCopyPath}
+                    isCopied={copiedPath === a}
+                    onDelete={onDelete}
+                    onRename={onRename}
+                    onAddAssetToTimeline={onAddAssetToTimeline}
+                  />
+                ))}
+              {(cat === "images" || cat === "video") && (
+                <div className="grid grid-cols-2 gap-1 px-2 pb-1">
+                  {categorized[cat].map((a) => (
+                    <AssetCard
+                      key={a}
+                      projectId={projectId}
+                      asset={a}
+                      used={usedPaths.has(a)}
+                      duration={manifest.get(a)?.duration}
+                      onCopy={handleCopyPath}
+                      isCopied={copiedPath === a}
+                      onDelete={onDelete}
+                      onRename={onRename}
+                      onAddAssetToTimeline={onAddAssetToTimeline}
+                    />
+                  ))}
+                </div>
+              )}
+              {cat === "fonts" &&
+                categorized[cat].map((a) => (
+                  <FontRow
+                    key={a}
+                    asset={a}
+                    used={usedPaths.has(a)}
+                    onCopy={handleCopyPath}
+                    isCopied={copiedPath === a}
+                    onDelete={onDelete}
+                    onRename={onRename}
+                    onAddAssetToTimeline={onAddAssetToTimeline}
+                  />
+                ))}
+            </div>
           ))
         )}
       </div>

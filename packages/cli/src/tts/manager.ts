@@ -145,4 +145,4 @@ export async function ensureVoices(options?: {
   return voicesPath;
 }
 
-export { MODELS_DIR, VOICES_DIR, DEFAULT_MODEL };
+export { MODELS_DIR, DEFAULT_MODEL };

@@ -11,7 +11,6 @@
  * by reusing the helpers rather than by careful comment-keeping.
  */
 
-import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   type CaptureSession,
@@ -19,22 +18,27 @@ import {
   type TransitionFn,
   TRANSITIONS,
   crossfade,
-  queryElementStacking,
 } from "@hyperframes/engine";
 import type { ProducerLogger } from "../../../logger.js";
 import {
   type HdrCompositeContext,
-  type HdrPerfCollector,
-  type ProgressCallback,
-  type RenderJob,
   type TransitionRange,
-  addHdrTiming,
   compositeHdrFrame,
-} from "../../renderOrchestrator.js";
+} from "../../hdrCompositor.js";
+import {
+  type HdrPerfCollector,
+  addHdrTiming,
+  timeHdrPhase,
+  timeHdrPhaseAsync,
+} from "../hdrPerf.js";
+import type { ProgressCallback, RenderJob } from "../../renderOrchestrator.js";
+import { writeFileExclusiveSync } from "../shared.js";
 import {
   captureSceneIntoBuffer,
   cleanupEndedHdrVideos,
+  ensureFrameWritten,
   type LayeredTransitionBuffers,
+  seekInjectAndQueryStacking,
 } from "./captureHdrFrameShared.js";
 import { updateJobStatus } from "../shared.js";
 
@@ -56,7 +60,7 @@ export interface SequentialLoopInput {
   hdrTargetTransfer: "pq" | "hlg" | undefined;
   hdrVideoEndTimes: Map<string, number>;
   cleanedUpVideos: Set<string>;
-  hdrVideoFrameSources: Map<string, import("../../renderOrchestrator.js").HdrVideoFrameSource>;
+  hdrVideoFrameSources: Map<string, import("../../hdrCompositor.js").HdrVideoFrameSource>;
   debugDumpEnabled: boolean;
   debugDumpDir: string | null;
   assertNotAborted: () => void;
@@ -105,20 +109,16 @@ export async function runSequentialLayeredFrameLoop(input: SequentialLoopInput):
     const time = (i * job.config.fps.den) / job.config.fps.num;
     if (hdrPerf) hdrPerf.frames += 1;
 
-    let timingStart = Date.now();
-    await domSession.page.evaluate((t: number) => {
-      if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-    }, time);
-    addHdrTiming(hdrPerf, "frameSeekMs", timingStart);
-
-    if (beforeCaptureHook) {
-      timingStart = Date.now();
-      await beforeCaptureHook(domSession.page, time);
-      addHdrTiming(hdrPerf, "frameInjectMs", timingStart);
-    }
-    timingStart = Date.now();
-    const stackingInfo = await queryElementStacking(domSession.page, nativeHdrIds);
-    addHdrTiming(hdrPerf, "stackingQueryMs", timingStart);
+    const stackingInfo = await seekInjectAndQueryStacking(
+      domSession.page,
+      time,
+      beforeCaptureHook,
+      nativeHdrIds,
+      hdrPerf,
+      "frameSeekMs",
+      "frameInjectMs",
+      "stackingQueryMs",
+    );
     const activeTransition = transitionRanges.find((t) => i >= t.startFrame && i <= t.endFrame);
 
     if (i % 30 === 0 && (log.isLevelEnabled?.("debug") ?? true)) {
@@ -142,19 +142,20 @@ export async function runSequentialLayeredFrameLoop(input: SequentialLoopInput):
             (activeTransition.endFrame - activeTransition.startFrame);
       const sceneAIds = new Set(sceneElements[activeTransition.fromScene] ?? []);
       const sceneBIds = new Set(sceneElements[activeTransition.toScene] ?? []);
-      timingStart = Date.now();
-      transitionBuffers.bufferA.fill(0);
-      transitionBuffers.bufferB.fill(0);
-      addHdrTiming(hdrPerf, "canvasClearMs", timingStart);
+      timeHdrPhase(hdrPerf, "canvasClearMs", () => {
+        transitionBuffers.bufferA.fill(0);
+        transitionBuffers.bufferB.fill(0);
+      });
 
-      for (const [sceneBuf, sceneIds] of [
+      const sceneCaptures: [Buffer, Set<string>][] = [
         [transitionBuffers.bufferA, sceneAIds],
         [transitionBuffers.bufferB, sceneBIds],
-      ] as const) {
+      ];
+      for (const [sceneBuf, sceneIds] of sceneCaptures) {
         assertNotAborted();
         await captureSceneIntoBuffer({
           session: domSession,
-          sceneBuf: sceneBuf as Buffer,
+          sceneBuf,
           sceneIds,
           stackingInfo,
           time,
@@ -172,7 +173,13 @@ export async function runSequentialLayeredFrameLoop(input: SequentialLoopInput):
         });
       }
 
-      const transitionFn: TransitionFn = TRANSITIONS[activeTransition.shader] ?? crossfade;
+      // CSS-crossfade transitions (shader omitted in the composition) take
+      // the same Node-side blend path — `crossfade` is the engine's
+      // canonical opacity blend, equivalent to applyFallbackTransition().
+      const shaderName = activeTransition.shader;
+      const transitionFn: TransitionFn = shaderName
+        ? (TRANSITIONS[shaderName] ?? crossfade)
+        : crossfade;
       transitionFn(
         transitionBuffers.bufferA,
         transitionBuffers.bufferB,
@@ -182,26 +189,24 @@ export async function runSequentialLayeredFrameLoop(input: SequentialLoopInput):
         progress,
       );
       addHdrTiming(hdrPerf, "transitionCompositeMs", transitionTimingStart);
-      timingStart = Date.now();
-      hdrEncoder.writeFrame(transitionBuffers.output);
-      addHdrTiming(hdrPerf, "encoderWriteMs", timingStart);
+      await timeHdrPhaseAsync(hdrPerf, "encoderWriteMs", async () =>
+        ensureFrameWritten(await hdrEncoder.writeFrame(transitionBuffers.output), i, hdrEncoder),
+      );
     } else {
       if (hdrPerf) hdrPerf.normalFrames += 1;
-      timingStart = Date.now();
-      normalCanvas.fill(0);
-      addHdrTiming(hdrPerf, "canvasClearMs", timingStart);
-      timingStart = Date.now();
-      await compositeHdrFrame(hdrCompositeCtx, normalCanvas, time, stackingInfo, undefined, i);
-      addHdrTiming(hdrPerf, "normalCompositeMs", timingStart);
+      timeHdrPhase(hdrPerf, "canvasClearMs", () => normalCanvas.fill(0));
+      await timeHdrPhaseAsync(hdrPerf, "normalCompositeMs", () =>
+        compositeHdrFrame(hdrCompositeCtx, normalCanvas, time, stackingInfo, undefined, i),
+      );
       if (debugDumpEnabled && debugDumpDir && i % 30 === 0) {
-        writeFileSync(
+        writeFileExclusiveSync(
           join(debugDumpDir, `frame_${String(i).padStart(4, "0")}_final_rgb48le.bin`),
           normalCanvas,
         );
       }
-      timingStart = Date.now();
-      hdrEncoder.writeFrame(normalCanvas);
-      addHdrTiming(hdrPerf, "encoderWriteMs", timingStart);
+      await timeHdrPhaseAsync(hdrPerf, "encoderWriteMs", async () =>
+        ensureFrameWritten(await hdrEncoder.writeFrame(normalCanvas), i, hdrEncoder),
+      );
     }
 
     cleanupEndedHdrVideos({

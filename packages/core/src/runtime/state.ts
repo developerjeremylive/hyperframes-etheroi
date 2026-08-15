@@ -5,10 +5,8 @@ import type { TransportClock } from "./clock";
 export type RuntimeState = {
   capturedTimeline: RuntimeTimelineLike | null;
   isPlaying: boolean;
-  rafId: number | null;
   currentTime: number;
   deterministicAdapters: RuntimeDeterministicAdapter[];
-  parityModeEnabled: boolean;
   canonicalFps: number;
   bridgeMuted: boolean;
   bridgeVolume: number;
@@ -21,6 +19,20 @@ export type RuntimeState = {
    * accuracy but produces no audio of its own.
    */
   mediaOutputMuted: boolean;
+  /**
+   * Disable runtime ownership of native media elements. Slideshow presenter
+   * mode keeps the slide timeline paused while users interact with embedded
+   * media, so the runtime must not auto-play, auto-pause, seek, or volume-sync
+   * those native elements on every transport tick.
+   */
+  nativeMediaSyncDisabled: boolean;
+  /**
+   * Disable the runtime's WebAudio replacement for native <audio> elements.
+   * Slideshow presenter/audience windows mirror native media element events
+   * across browsers, so muting those elements for WebAudio ownership breaks
+   * audible presenter playback and remote sync.
+   */
+  webAudioMediaDisabled: boolean;
   /**
    * Latch so the `media-autoplay-blocked` outbound message is posted at most
    * once per runtime session. The parent only needs the first signal — it
@@ -62,18 +74,15 @@ export type RuntimeState = {
    */
   bridgeMaxPostIntervalMs: number;
   controlBridgeHandler: ((event: MessageEvent) => void) | null;
-  clampDurationLoggedRaw: number | null;
   beforeUnloadHandler: (() => void) | null;
-  domReadyHandler: (() => void) | null;
   injectedCompStyles: HTMLStyleElement[];
   injectedCompScripts: HTMLScriptElement[];
+  injectedCompLinks: HTMLLinkElement[];
   cachedTimedMediaEls: Array<HTMLVideoElement | HTMLAudioElement>;
   cachedMediaClips: RuntimeMediaClip[];
   cachedVideoClips: RuntimeMediaClip[];
   cachedMediaTimelineDurationSeconds: number;
   tornDown: boolean;
-  maxTimelineDurationSeconds: number;
-  nativeVisualWatchdogTick: number;
   /**
    * Single-clock transport. The sole time authority — GSAP is always
    * paused and seeked to `clock.now()` on each rAF tick. Eliminates
@@ -88,14 +97,14 @@ export function createRuntimeState(): RuntimeState {
   return {
     capturedTimeline: null,
     isPlaying: false,
-    rafId: null,
     currentTime: 0,
     deterministicAdapters: [],
-    parityModeEnabled: true,
     canonicalFps: 30,
     bridgeMuted: false,
     bridgeVolume: 1,
     mediaOutputMuted: false,
+    nativeMediaSyncDisabled: false,
+    webAudioMediaDisabled: false,
     mediaAutoplayBlockedPosted: false,
     mediaForceSyncNextTick: false,
     playbackRate: 1,
@@ -105,18 +114,15 @@ export function createRuntimeState(): RuntimeState {
     bridgeLastPostedMuted: false,
     bridgeMaxPostIntervalMs: 80,
     controlBridgeHandler: null,
-    clampDurationLoggedRaw: null,
     beforeUnloadHandler: null,
-    domReadyHandler: null,
     injectedCompStyles: [],
     injectedCompScripts: [],
+    injectedCompLinks: [],
     cachedTimedMediaEls: [],
     cachedMediaClips: [],
     cachedVideoClips: [],
     cachedMediaTimelineDurationSeconds: 0,
     tornDown: false,
-    maxTimelineDurationSeconds: 1800,
-    nativeVisualWatchdogTick: 0,
     transportClock: null,
     transportRafId: null,
   };

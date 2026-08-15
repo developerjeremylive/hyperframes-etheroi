@@ -12,13 +12,10 @@ import type {
 import {
   buildStableSelector,
   escapeCssString,
-  findClosestByAttribute,
-  getElementDepth,
-  getPreferredClassSelector,
   getSelectorIndex,
   getSourceFileForElement,
   isHtmlElement,
-  isTextBearingTag,
+  isElementVisibleThroughAncestors,
   normalizeTimelineCompositionSource,
   querySelectorAllSafely,
 } from "./domEditingDom";
@@ -26,24 +23,32 @@ import {
 // ─── Visibility ──────────────────────────────────────────────────────────────
 
 export function isElementComputedVisible(el: HTMLElement): boolean {
-  const win = el.ownerDocument.defaultView;
-  if (!win) return true;
-  let current: HTMLElement | null = el;
-  while (current) {
-    const computed = win.getComputedStyle(current);
-    if (computed.display === "none" || computed.visibility === "hidden") return false;
-    const opacity = Number.parseFloat(computed.opacity);
-    if (Number.isFinite(opacity) && opacity <= 0.01) return false;
-    current = current.parentElement;
-  }
-  return true;
+  return isElementVisibleThroughAncestors(el);
 }
 
 const VISUAL_LEAF_TAGS = new Set(["img", "video", "canvas", "svg", "audio"]);
 
+// fallow-ignore-next-line complexity
+function hasVisualPresence(el: HTMLElement): boolean {
+  const win = el.ownerDocument.defaultView;
+  if (!win) return false;
+  const cs = win.getComputedStyle(el);
+  if (cs.backgroundImage !== "none") return true;
+  if (
+    cs.backgroundColor &&
+    cs.backgroundColor !== "transparent" &&
+    cs.backgroundColor !== "rgba(0, 0, 0, 0)"
+  )
+    return true;
+  if (cs.borderWidth && parseFloat(cs.borderWidth) > 0 && cs.borderStyle !== "none") return true;
+  if (cs.boxShadow && cs.boxShadow !== "none") return true;
+  return false;
+}
+
 function isEmptyVisualContainer(el: HTMLElement): boolean {
   const tag = el.tagName.toLowerCase();
   if (VISUAL_LEAF_TAGS.has(tag)) return false;
+  if (hasVisualPresence(el)) return false;
 
   const { children } = el;
   if (children.length === 0) {
@@ -60,7 +65,7 @@ function isEmptyVisualContainer(el: HTMLElement): boolean {
   return true;
 }
 
-export function hasRenderedBox(el: HTMLElement): boolean {
+function hasRenderedBox(el: HTMLElement): boolean {
   const rect = el.getBoundingClientRect();
   if (rect.width <= 1 || rect.height <= 1) return false;
   if (!isElementComputedVisible(el)) return false;
@@ -69,23 +74,6 @@ export function hasRenderedBox(el: HTMLElement): boolean {
 }
 
 // ─── Visual scoring ──────────────────────────────────────────────────────────
-
-function isEditableTextLeafForScoring(el: HTMLElement): boolean {
-  return isTextBearingTag(el.tagName.toLowerCase()) && el.children.length === 0;
-}
-
-function getVisualElementScore(el: HTMLElement, pointerStackIndex: number): number {
-  const tagName = el.tagName.toLowerCase();
-  const rect = el.getBoundingClientRect();
-  const area = Math.max(1, rect.width * rect.height);
-  const smallerElementBonus = Math.max(0, 1_000_000 - Math.min(area, 1_000_000)) / 1_000;
-  const visualLeafBonus =
-    isEditableTextLeafForScoring(el) || ["img", "video", "canvas", "svg"].includes(tagName)
-      ? 2_000
-      : 0;
-
-  return getElementDepth(el) * 10_000 + visualLeafBonus + smallerElementBonus - pointerStackIndex;
-}
 
 // ─── Layer patch target ──────────────────────────────────────────────────────
 
@@ -116,7 +104,7 @@ function isInspectableLayerElement(el: HTMLElement): boolean {
 export function getDomLayerPatchTarget(
   el: HTMLElement,
   activeCompositionPath: string | null,
-): Pick<DomEditSelection, "id" | "selector" | "selectorIndex" | "sourceFile"> | null {
+): Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex" | "sourceFile"> | null {
   if (!isInspectableLayerElement(el)) return null;
   if (el.hasAttribute("data-composition-id")) return null;
 
@@ -126,6 +114,7 @@ export function getDomLayerPatchTarget(
   const { sourceFile } = getSourceFileForElement(el, activeCompositionPath);
   return {
     id: el.id || undefined,
+    hfId: el.getAttribute("data-hf-id") || undefined,
     selector,
     selectorIndex: getSelectorIndex(
       el.ownerDocument,
@@ -174,25 +163,49 @@ export function resolveVisualDomEditSelectionTarget(
   elementsFromPoint: Iterable<Element | null | undefined>,
   options: Pick<DomEditContextOptions, "activeCompositionPath">,
 ): HTMLElement | null {
-  let best: { element: HTMLElement; score: number } | null = null;
-  let pointerStackIndex = 0;
+  const candidates = resolveAllVisualDomEditTargets(elementsFromPoint, options);
+  return candidates[0] ?? null;
+}
+
+/**
+ * Returns all independently-selectable elements at the given point, in paint
+ * order (topmost first). Used for click-cycling through stacked layers.
+ *
+ * Each entry in the returned array is an independent "layer" — an element
+ * that is not an ancestor of an earlier entry. This gives one result per
+ * z-stacked element rather than one per DOM node.
+ */
+export function resolveAllVisualDomEditTargets(
+  elementsFromPoint: Iterable<Element | null | undefined>,
+  options: Pick<DomEditContextOptions, "activeCompositionPath">,
+): HTMLElement[] {
+  const raw: HTMLElement[] = [];
 
   for (const entry of elementsFromPoint) {
-    if (!isHtmlElement(entry)) {
-      pointerStackIndex += 1;
-      continue;
-    }
-
+    if (!isHtmlElement(entry)) continue;
     if (hasRenderedBox(entry) && getDomLayerPatchTarget(entry, options.activeCompositionPath)) {
-      const score = getVisualElementScore(entry, pointerStackIndex);
-      if (!best || score > best.score) {
-        best = { element: entry, score };
-      }
+      raw.push(entry);
     }
-    pointerStackIndex += 1;
   }
 
-  return best?.element ?? null;
+  if (raw.length === 0) return [];
+
+  // First pass: for each contiguous ancestor-descendant run, keep only the
+  // deepest (most specific) element, matching the original single-pick logic.
+  const layers: HTMLElement[] = [];
+  let best = raw[0];
+  for (let i = 1; i < raw.length; i++) {
+    const el = raw[i];
+    if (best.contains(el)) {
+      best = el; // go deeper in this subtree
+    } else {
+      layers.push(best);
+      best = el;
+    }
+  }
+  layers.push(best);
+
+  return layers;
 }
 
 // ─── Raster detection ────────────────────────────────────────────────────────
@@ -224,45 +237,40 @@ export function isLargeRasterDomEditSelection(
 
 // ─── Element finders ──────────────────────────────────────────────────────────
 
+type FindElementSelection = Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex"> & {
+  sourceFile?: string;
+};
+
 export function findElementForSelection(
   doc: Document,
-  selection: Pick<DomEditSelection, "id" | "selector" | "selectorIndex" | "sourceFile">,
+  selection: FindElementSelection,
   activeCompositionPath: string | null = null,
 ): HTMLElement | null {
+  const sourceMatches = (candidate: Element): candidate is HTMLElement =>
+    isHtmlElement(candidate) &&
+    (!selection.sourceFile ||
+      getSourceFileForElement(candidate, activeCompositionPath).sourceFile ===
+        selection.sourceFile);
+  const findAll = (selector: string): HTMLElement[] =>
+    querySelectorAllSafely(doc, selector).filter(sourceMatches);
+
+  if (selection.hfId) {
+    const byHfId = findAll(`[data-hf-id="${escapeCssString(selection.hfId)}"]`)[0];
+    if (byHfId) return byHfId;
+  }
+
   if (selection.id) {
-    const byId = doc.getElementById(selection.id);
-    if (
-      isHtmlElement(byId) &&
-      (!selection.sourceFile ||
-        getSourceFileForElement(byId, activeCompositionPath).sourceFile === selection.sourceFile)
-    ) {
-      return byId;
-    }
+    // Flattened sub-compositions can repeat authored ids. getElementById returns
+    // only the first document match, so filter every id match by source first.
+    const byId = findAll(`[id="${escapeCssString(selection.id)}"]`)[0];
+    if (byId) return byId;
   }
 
   if (!selection.selector) return null;
-
-  if (selection.selector.startsWith(".") && selection.selectorIndex != null) {
-    const matches = querySelectorAllSafely(doc, selection.selector).filter(
-      (candidate): candidate is HTMLElement =>
-        isHtmlElement(candidate) &&
-        (!selection.sourceFile ||
-          getSourceFileForElement(candidate, activeCompositionPath).sourceFile ===
-            selection.sourceFile),
-    );
-    return matches[selection.selectorIndex] ?? null;
-  }
-
-  const matches = querySelectorAllSafely(doc, selection.selector).filter(
-    (candidate): candidate is HTMLElement =>
-      isHtmlElement(candidate) &&
-      (!selection.sourceFile ||
-        getSourceFileForElement(candidate, activeCompositionPath).sourceFile ===
-          selection.sourceFile),
-  );
-  return matches[0] ?? null;
+  return findAll(selection.selector)[selection.selectorIndex ?? 0] ?? null;
 }
 
+// fallow-ignore-next-line complexity
 export function findElementForTimelineElement(
   doc: Document,
   element: TimelineElementDomTarget,
@@ -324,7 +332,3 @@ export function getDirectLayerChildren(
       isHtmlElement(child) && getDomLayerPatchTarget(child, options.activeCompositionPath) !== null,
   );
 }
-
-// ─── Composition source helpers ───────────────────────────────────────────────
-
-export { findClosestByAttribute, getPreferredClassSelector, getSourceFileForElement };

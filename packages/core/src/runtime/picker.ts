@@ -1,4 +1,5 @@
 import type { RuntimeJson, RuntimeOutboundMessage, RuntimePickerElementInfo } from "./types";
+import { COLOR_GRADING_SOURCE_HIDDEN_ATTR } from "../colorGrading";
 import { swallow } from "./diagnostics";
 
 type PickerModuleDeps = {
@@ -67,7 +68,12 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
       if (computed.display === "none" || computed.visibility === "hidden") return true;
       if (computed.pointerEvents === "none") return true;
       const opacity = Number.parseFloat(computed.opacity);
-      if (Number.isFinite(opacity) && opacity <= 0.01) return true;
+      if (
+        Number.isFinite(opacity) &&
+        opacity <= 0.01 &&
+        !current.hasAttribute(COLOR_GRADING_SOURCE_HIDDEN_ATTR)
+      )
+        return true;
       current = current.parentElement;
     }
     return false;
@@ -89,13 +95,16 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
 
   function buildElementSelector(el: Element): string {
     const htmlEl = el as HTMLElement;
-    if (htmlEl.id) return `#${htmlEl.id}`;
+    // Escape the ID so digit-leading or otherwise CSS-illegal ids (e.g. `#0`,
+    // `#1`) produce valid selectors — `document.querySelector("#0")` throws
+    // SyntaxError per the CSS spec. Sibling branches below already escape.
+    if (htmlEl.id) return `#${CSS.escape(htmlEl.id)}`;
     const compositionId = el.getAttribute("data-composition-id");
-    if (compositionId) return `[data-composition-id="${compositionId}"]`;
+    if (compositionId) return `[data-composition-id="${CSS.escape(compositionId)}"]`;
     const compositionSrc = el.getAttribute("data-composition-src");
-    if (compositionSrc) return `[data-composition-src="${compositionSrc}"]`;
+    if (compositionSrc) return `[data-composition-src="${CSS.escape(compositionSrc)}"]`;
     const track = el.getAttribute("data-track-index");
-    if (track) return `[data-track-index="${track}"]`;
+    if (track) return `[data-track-index="${CSS.escape(track)}"]`;
     const tag = el.tagName.toLowerCase();
     const parent = el.parentElement;
     if (!parent) return tag;
@@ -136,8 +145,7 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
     if (blocksPickerAtPoint(raw[0] ?? null)) return [];
     const dedupe: Record<string, true> = {};
     const candidates: Element[] = [];
-    for (let i = 0; i < raw.length; i += 1) {
-      const node = raw[i];
+    for (const [i, node] of raw.entries()) {
       if (!isPickableElement(node)) continue;
       const key = `${node.tagName}::${(node as HTMLElement).id || ""}::${i}`;
       if (dedupe[key]) continue;
@@ -151,8 +159,7 @@ export function createPickerModule(deps: PickerModuleDeps): PickerModule {
   function extractElementInfo(el: Element): RuntimePickerElementInfo {
     const rect = el.getBoundingClientRect();
     const dataAttributes: Record<string, string> = {};
-    for (let i = 0; i < el.attributes.length; i += 1) {
-      const attr = el.attributes[i];
+    for (const attr of Array.from(el.attributes)) {
       if (attr.name.startsWith("data-")) {
         dataAttributes[attr.name] = attr.value;
       }

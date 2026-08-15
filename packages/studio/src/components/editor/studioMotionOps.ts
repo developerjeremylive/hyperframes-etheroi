@@ -18,6 +18,7 @@ import {
   type StudioMotionManifest,
   type StudioMotionTarget,
 } from "./studioMotionTypes";
+import { roundTo3 } from "../../utils/rounding";
 
 // ── Private helpers ──
 
@@ -34,7 +35,7 @@ function sanitizeEase(value: string): string {
 }
 
 function roundEaseNumber(value: number): number {
-  return Math.round(value * 1000) / 1000;
+  return roundTo3(value);
 }
 
 function clampRange(value: number, min: number, max: number, fallback: number): number {
@@ -129,7 +130,7 @@ export function buildStudioGsapPresetMotion(
 
 // ── Manifest parse/serialize ──
 
-export function parseMotionValues(value: unknown): StudioGsapMotionValues | null {
+function parseMotionValues(value: unknown): StudioGsapMotionValues | null {
   if (!value || typeof value !== "object") return null;
   const record = value as Record<string, unknown>;
   const parsed: StudioGsapMotionValues = {};

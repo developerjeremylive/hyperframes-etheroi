@@ -10,6 +10,9 @@ dist/
 .env.local
 .env.*.local
 
+# Lefthook per-developer overrides (not shared; see lefthook.yml for shared hooks)
+lefthook-local.yml
+
 # OS
 .DS_Store
 Thumbs.db
@@ -19,6 +22,8 @@ Thumbs.db
 # with `bun run upload:docs-images`. Add explicit negations below for any
 # non-generated assets (logos, svgs) that should stay in the repo.
 docs/images/
+
+videos/
 
 # IDE
 .vscode/
@@ -30,9 +35,12 @@ docs/images/
 coverage/
 .debug/
 
-# Producer regression test failures (generated debugging artifacts)
-packages/producer/tests/*/failures/
-packages/producer/tests/distributed/*/failures/
+# Producer regression test failures (generated debugging artifacts).
+# RECURSIVE (`**`) so a failures/ dump at ANY fixture depth is ignored — the
+# old non-recursive `tests/*/failures/` + `tests/distributed/*/failures/` rules
+# only matched one level deep, so a nested fixture like
+# `tests/hdr-regression/hdr-pq/failures/` could still get committed.
+packages/producer/tests/**/failures/
 packages/producer/tests/parity/fixtures/hyperframe.runtime.iife.js
 
 # Player perf test results (generated each run, attached as CI artifact)
@@ -43,6 +51,9 @@ output/
 renders/
 !packages/producer/tests/*/output/
 !packages/producer/tests/distributed/*/output/
+# Source dir that the renders/ output rule accidentally shadows (its files are
+# tracked; without this, pre-commit's format re-stage fails on them).
+!packages/studio/src/components/renders/
 
 # Composition source media (large binaries)
 compositions/**/*.mp4
@@ -61,23 +72,71 @@ tmp/
 .tmp/
 
 # Generated files
-packages/core/src/generated/
+packages/core/src/generated/*
+!packages/core/src/generated/position-edits-render-inline.ts
+!packages/core/src/generated/position-edits-render-inline.test.ts
 packages/producer/src/services/fontData.generated.ts
+
+# Plan documents (working artifacts, not committed)
+docs/plans/
 
 # Local proof / test artifacts
 qa-artifacts/
 my-video/
-examples/
+# Studio project state (hf-id backups, per-file state) — always runtime-generated,
+# never committed. Broadened from .hyperframes/backup/ after preview-generated state
+# leaked into a fixture commit.
+.hyperframes/
+# Studio authoring proxies are generated locally and can grow to multiple GB.
+.transcode-cache/
+examples/*
+# Tracked OSS examples — negations override the blanket `examples/*` ignore.
+!examples/aws-lambda
+!examples/aws-lambda/**
+!examples/k8s-jobs
+!examples/k8s-jobs/**
+!examples/gcp-cloud-run
+!examples/gcp-cloud-run/**
+!examples/docs-reference-project
+!examples/docs-reference-project/**
+# …but never the local smoke run's build/render artifacts.
+examples/gcp-cloud-run/scripts/gcp-smoke-artifacts/
 packages/studio/data/
+
 .desloppify/
 .worktrees/
 
 # Playwright MCP browser cache
 .playwright-mcp/
 
-# Installed skills (user-specific)
-.agents/
-.claude/skills/
+# Installed skills (user-specific — agent-installed during sessions).
+# .claude/ = Claude Code, .agents/ = Codex CLI (both auto-discover their project skills
+# from these dirs). The two mirror each other and both need the same "ignore agent-installed
+# skills; keep the six repo-native ones" recipe. See .claude/skills/README.md for the
+# packaging notes.
+
+.claude/*
+!.claude/settings.json
+!.claude/skills
+.claude/skills/*
+!.claude/skills/README.md
+!.claude/skills/changelog-video
+!.claude/skills/motion-doctrine
+!.claude/skills/cut-the-curve
+!.claude/skills/seam-craft
+!.claude/skills/captions-overlay
+!.claude/skills/oversized-cursor
+
+.agents/*
+!.agents/skills
+.agents/skills/*
+!.agents/skills/README.md
+!.agents/skills/changelog-video
+!.agents/skills/motion-doctrine
+!.agents/skills/cut-the-curve
+!.agents/skills/seam-craft
+!.agents/skills/captions-overlay
+!.agents/skills/oversized-cursor
 skills-lock.json
 
 # Skills from other PRs (not managed here)
@@ -90,6 +149,8 @@ captures/
 *-capture/
 *-demo/
 *-ad/
+!registry/blocks/slack-notification-ad/
+!registry/blocks/slack-notification-ad/**
 *-tour/
 *-brand/
 
@@ -98,11 +159,29 @@ captures/
 cursor-tests/
 basecamp-video/
 launch-video*/
+!skills/launch-video/
 ab-test/
 compositions/
 video-6-2-patched/
 claude-design-hyperframes-video/
-.claude/worktrees/
-.claude/
+# Per-site video work at the repo root (huly-*, raycast-*, etc.)
+# Anything under videos/ is already covered above, but agents sometimes write
+# project dirs to the repo root when iterating. Catch the common per-brand
+# patterns and any *-demo-N variants the *-demo/ rule above misses.
+huly-*/
+raycast-*/
+*-demo-*/
+test-runs/
+test-outputs/
+
+# Superpowers docs (Claude Code worktrees + local state are handled above by
+# the blanket .claude/ rule and its re-inclusions)
 docs/superpowers/
 .worktrees
+hyperframes-bench/
+tmp/
+# Studio-generated preview thumbnails
+.thumbnails/
+
+# Local editor settings
+.zed/

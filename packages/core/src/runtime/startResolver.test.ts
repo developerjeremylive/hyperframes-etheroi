@@ -178,6 +178,39 @@ describe("createRuntimeStartTimeResolver", () => {
       expect(resolver.resolveStartForElement(video)).toBe(54);
     });
 
+    it("walks up to the host's data-start when the inner root has none (host has its own data-composition-id)", () => {
+      const host = document.createElement("div");
+      host.setAttribute("data-composition-id", "montage");
+      host.setAttribute("data-start", "10");
+      document.body.appendChild(host);
+
+      const innerRoot = document.createElement("div");
+      innerRoot.setAttribute("data-composition-id", "scene-10");
+      host.appendChild(innerRoot);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(innerRoot)).toBe(10);
+    });
+
+    it("walks up to the host's data-start via data-composition-file (anonymous host, post-inlining)", () => {
+      // A host mounted via data-composition-src with no data-composition-id of
+      // its own. After inlining, data-composition-src is stripped and replaced
+      // with data-composition-file, and the composition's own id is restored
+      // onto the wrapper (which has no data-start of its own).
+      const host = document.createElement("div");
+      host.setAttribute("data-composition-file", "compositions/reveal1.html");
+      host.setAttribute("data-start", "4.619");
+      document.body.appendChild(host);
+
+      const wrapper = document.createElement("div");
+      wrapper.setAttribute("data-composition-id", "reveal1");
+      wrapper.setAttribute("data-hf-inner-root", "true");
+      host.appendChild(wrapper);
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(wrapper)).toBe(4.619);
+    });
+
     it("keeps nested references in the host composition timeline", () => {
       const host = document.createElement("div");
       host.id = "slide-5";
@@ -364,5 +397,37 @@ describe("createRuntimeStartTimeResolver", () => {
       const second = resolver.resolveDurationForElement(el);
       expect(first).toBe(second);
     });
+  });
+});
+
+describe("documentRef", () => {
+  it("resolves references against a supplied document instead of the global one", () => {
+    const doc = document.implementation.createHTMLDocument("t");
+    const intro = doc.createElement("div");
+    intro.id = "intro";
+    intro.setAttribute("data-start", "0");
+    intro.setAttribute("data-duration", "4");
+    doc.body.appendChild(intro);
+    const outro = doc.createElement("div");
+    outro.setAttribute("data-start", "intro + 2");
+    doc.body.appendChild(outro);
+
+    const resolver = createRuntimeStartTimeResolver({ documentRef: doc });
+    // intro ends at 0 + 4; outro starts 2s after → 6.
+    expect(resolver.resolveStartForElement(outro)).toBe(6);
+  });
+
+  it("defaults to the global document when documentRef is omitted", () => {
+    const el = document.createElement("div");
+    el.id = "ref-a";
+    el.setAttribute("data-start", "0");
+    el.setAttribute("data-duration", "2");
+    document.body.appendChild(el);
+    const dependent = document.createElement("div");
+    dependent.setAttribute("data-start", "ref-a");
+    document.body.appendChild(dependent);
+
+    const resolver = createRuntimeStartTimeResolver({});
+    expect(resolver.resolveStartForElement(dependent)).toBe(2);
   });
 });

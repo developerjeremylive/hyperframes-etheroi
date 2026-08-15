@@ -22,7 +22,7 @@ const GENERIC_FONT_FAMILIES = new Set([
   "fangsong",
 ]);
 
-export function primaryFontFamilyFromCss(value: string): string {
+function primaryFontFamilyFromCss(value: string): string {
   const first = value.split(",")[0] ?? "";
   return first.trim().replace(/^["']|["']$/g, "");
 }

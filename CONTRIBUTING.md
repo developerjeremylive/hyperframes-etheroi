@@ -91,11 +91,36 @@ Blocks don't need `demo.html` — they are already standalone compositions.
 
 ### Checklist for new items
 
+**Anyone can add an item.** Nothing here needs commit access, and the two steps
+that do need something a contributor may not have are handled by a maintainer
+before merge, listed at the end.
+
 1. Create `registry/<blocks|components>/<name>/registry-item.json` following the [schema](packages/core/schemas/registry-item.json)
-2. Add the item to `registry/registry.json`
-3. For components: include a `demo.html`
-4. Run `npx hyperframes lint` and `npx hyperframes validate` on your HTML
-5. Test the install flow: `hyperframes add <name> --dir /tmp/test-project`
+2. For components: include a `demo.html`
+3. Run `npx hyperframes lint` and `npx hyperframes validate` on your HTML
+4. Test the install flow: `hyperframes add <name> --dir /tmp/test-project`
+5. Regenerate the manifest: `npx tsx scripts/generate-registry-items.ts`
+
+`registry/registry.json` is generated from the item directories, so edit it with
+that script rather than by hand. An entry added by hand survives until the next
+regeneration and then disappears; entries left behind for directories that no
+longer exist are worse, because `hyperframes add <name>` resolves the name and
+then fails on missing files.
+
+### What a maintainer finishes for you
+
+Two things need assets an outside contributor is not expected to install. Open
+the pull request without them and say so; neither blocks review.
+
+| Thing                                           | If you have it                                            | If you do not                                                           |
+| ----------------------------------------------- | --------------------------------------------------------- | ----------------------------------------------------------------------- |
+| The search index (`registry/catalog-artifact/`) | The pre-commit hook rebuilds and stages it                | The hook skips, CI names the gap, a maintainer regenerates before merge |
+| The catalog preview image                       | Internal contributors run `scripts/upload-docs-images.sh` | Attach the preview MP4 to the PR instead                                |
+
+The search index needs a 32 MB embedding model, which is an opt-in for catalog
+search rather than a build dependency. Until it is regenerated your item is
+findable by word search and not by meaning, which is the same state as any item
+published since a user last refreshed their copy.
 
 ### Auto-generated docs
 
@@ -139,11 +164,16 @@ All packages use **fixed versioning** — every release bumps all packages to th
 ### Stable releases
 
 ```bash
-bun run set-version 0.2.0            # bumps all packages, commits, and creates git tag
-git push origin main --tags           # triggers the publish workflow
+bun run release:prepare 0.2.0        # drafts changelog if needed, then creates the release commit/tag after review
+git push origin main                  # push the release commit
+git push origin v0.2.0                # push the tag → triggers the publish workflow
 ```
 
-The `set-version` script automatically creates a `chore: release v<version>` commit and a `v<version>` git tag. Pushing the tag triggers CI to publish all packages to npm and create a GitHub Release.
+> Push the **specific tag**, not `git push --tags` — the latter pushes every local tag and the whole push is rejected if any one already exists on the remote.
+
+The `release:prepare` script drafts missing release notes on the first run and stops for manual review. After the generated TODO summary is rewritten, rerun the same command; it delegates to `set-version`, which creates a `chore: release v<version>` commit and a `v<version>` git tag. Pushing the tag triggers CI to publish all packages to npm and create a GitHub Release.
+
+`set-version` also refuses to tag if a **higher** semver tag already exists (a stale higher tag would hijack tag-sorting installers like `npx skills`). Delete the stray tag (`git tag -d <tag> && git push origin :refs/tags/<tag>`) or, only if intentional, pass `--skip-monotonicity-check`.
 
 ### Pre-releases (alpha / beta / rc)
 

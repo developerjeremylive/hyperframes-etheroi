@@ -9,9 +9,15 @@
 import { describe, expect, it } from "bun:test";
 import {
   BROWSER_GPU_NOT_SOFTWARE,
+  DISTRIBUTED_DURATION_OUT_OF_RANGE,
+  MAX_DISTRIBUTED_DURATION_SECONDS,
+  MAX_RENDER_DURATION_SECONDS,
   PlanValidationError,
+  RENDER_DURATION_OUT_OF_RANGE,
   SYSTEM_FONT_USED,
   parseFontFamilyValue,
+  validateDistributedDuration,
+  validateRenderDuration,
   validateNoGpuEncode,
   validateNoSystemFonts,
 } from "./planValidation.js";
@@ -91,6 +97,65 @@ describe("validateNoGpuEncode", () => {
   });
 });
 
+describe("validateDistributedDuration", () => {
+  it("keeps the generic validator and legacy distributed API behavior aligned", () => {
+    expect(MAX_RENDER_DURATION_SECONDS).toBe(MAX_DISTRIBUTED_DURATION_SECONDS);
+    expect(RENDER_DURATION_OUT_OF_RANGE).toBe(DISTRIBUTED_DURATION_OUT_OF_RANGE);
+    expect(() =>
+      validateRenderDuration({
+        duration: MAX_RENDER_DURATION_SECONDS,
+        totalFrames: MAX_RENDER_DURATION_SECONDS * 30,
+        fps: 30,
+      }),
+    ).not.toThrow();
+  });
+
+  it("accepts a finite duration within the distributed ceiling", () => {
+    expect(() =>
+      validateDistributedDuration({
+        duration: MAX_DISTRIBUTED_DURATION_SECONDS,
+        totalFrames: MAX_DISTRIBUTED_DURATION_SECONDS * 30,
+        fps: 30,
+      }),
+    ).not.toThrow();
+  });
+
+  it("throws DISTRIBUTED_DURATION_OUT_OF_RANGE for the engine's infinite-timeline sentinel", () => {
+    let caught: unknown;
+    try {
+      validateDistributedDuration({
+        duration: 10_000_000_000,
+        totalFrames: 300_000_000_000,
+        fps: 30,
+      });
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PlanValidationError);
+    expect((caught as PlanValidationError).code).toBe(DISTRIBUTED_DURATION_OUT_OF_RANGE);
+    expect((caught as Error).message).toContain("300000000000");
+    expect((caught as Error).message).toContain("GSAP repeat:-1");
+  });
+
+  it("throws DISTRIBUTED_DURATION_OUT_OF_RANGE for non-finite or zero values", () => {
+    for (const input of [
+      { duration: Number.POSITIVE_INFINITY, totalFrames: 1, fps: 30 },
+      { duration: 0, totalFrames: 1, fps: 30 },
+      { duration: 1, totalFrames: 0, fps: 30 },
+      { duration: 1, totalFrames: 1, fps: Number.NaN },
+    ]) {
+      let caught: unknown;
+      try {
+        validateDistributedDuration(input);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(PlanValidationError);
+      expect((caught as PlanValidationError).code).toBe(DISTRIBUTED_DURATION_OUT_OF_RANGE);
+    }
+  });
+});
+
 describe("parseFontFamilyValue", () => {
   it("splits a comma-separated list and strips whitespace + quotes", () => {
     expect(parseFontFamilyValue(`"Inter", -apple-system, sans-serif`)).toEqual([
@@ -102,6 +167,26 @@ describe("parseFontFamilyValue", () => {
 
   it("strips single quotes too", () => {
     expect(parseFontFamilyValue(`'My Custom Font', serif`)).toEqual(["My Custom Font", "serif"]);
+  });
+
+  it("keeps a comma inside a quoted family name", () => {
+    expect(parseFontFamilyValue(`"Display, Condensed", serif`)).toEqual([
+      "Display, Condensed",
+      "serif",
+    ]);
+  });
+
+  it("keeps a var() fallback in a single token", () => {
+    expect(parseFontFamilyValue(`var(--brand-font, inherit), sans-serif`)).toEqual([
+      "var(--brand-font, inherit)",
+      "sans-serif",
+    ]);
+  });
+
+  it("keeps a nested var() fallback in a single token", () => {
+    expect(
+      parseFontFamilyValue(`var(--brand-font, var(--fallback-font, "Inter")), sans-serif`),
+    ).toEqual([`var(--brand-font, var(--fallback-font, "Inter"))`, "sans-serif"]);
   });
 
   it("ignores empty entries (trailing commas)", () => {
@@ -206,6 +291,30 @@ describe("validateNoSystemFonts", () => {
     // The whole point: `font-family: "Inter", -apple-system, sans-serif` is
     // the canonical fallback chain. We want this to pass.
     const ok = `<style>body { font-family: "Inter", -apple-system, BlinkMacSystemFont, sans-serif; }</style>`;
+    expect(() => validateNoSystemFonts(ok)).not.toThrow();
+  });
+
+  it("resolves simple CSS var() primary aliases before rejecting system fonts", () => {
+    const offending = `<style>
+      :root { --ui-font: -apple-system, BlinkMacSystemFont, sans-serif; }
+      body { font-family: var(--ui-font), sans-serif; }
+    </style>`;
+    let caught: unknown;
+    try {
+      validateNoSystemFonts(offending);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PlanValidationError);
+    expect((caught as PlanValidationError).code).toBe(SYSTEM_FONT_USED);
+    expect((caught as Error).message).toContain(`"-apple-system"`);
+  });
+
+  it("accepts CSS var() primary aliases that resolve to deterministic fonts", () => {
+    const ok = `<style>
+      :root { --ui-font: "Inter", -apple-system, sans-serif; }
+      body { font-family: var(--ui-font), sans-serif; }
+    </style>`;
     expect(() => validateNoSystemFonts(ok)).not.toThrow();
   });
 });

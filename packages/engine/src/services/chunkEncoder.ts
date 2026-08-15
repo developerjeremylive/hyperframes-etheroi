@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication complexity
 /**
  * Chunk Encoder Service
  *
@@ -5,9 +6,8 @@
  * Supports CPU (libx264) and GPU encoding.
  */
 
-import { spawn } from "child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, extname } from "path";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import {
   type GpuEncoder,
@@ -16,9 +16,13 @@ import {
   mapPresetForGpuEncoder,
 } from "../utils/gpuEncoder.js";
 import { type HdrTransfer, getHdrEncoderColorParams } from "../utils/hdr.js";
+import { withEvenDimensionPad } from "../utils/evenDimensions.js";
 import { formatFfmpegError, runFfmpeg } from "../utils/runFfmpeg.js";
-import { fpsToFfmpegArg } from "@hyperframes/core";
+import { extractAudioMetadata } from "../utils/ffprobe.js";
+import { type Fps, fpsToFfmpegArg } from "@hyperframes/core";
 import type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
+import { appendVp9CpuUsedArg } from "./vp9Options.js";
+import { appendRenderProvenanceArgs } from "../utils/renderProvenance.js";
 
 export type { EncoderOptions, EncodeResult, MuxResult } from "./chunkEncoder.types.js";
 
@@ -34,6 +38,68 @@ export interface EncoderPreset {
   codec: "h264" | "h265" | "vp9" | "prores";
   pixelFormat: string;
   hdr?: { transfer: HdrTransfer };
+}
+
+function appendEncodeTimeoutMessage(error: string, timedOut: boolean, timeoutMs: number): string {
+  if (!timedOut) return error;
+  // Two independent reports of this exact timeout, both resolved by env vars
+  // that already exist but aren't named anywhere the user would see them at
+  // the point of failure — they had to go find FFMPEG_ENCODE_TIMEOUT_MS and
+  // PRODUCER_ENABLE_CHUNKED_ENCODE themselves. Name both here instead of
+  // just stating what happened.
+  return (
+    `${error}\nFFmpeg killed after exceeding ffmpegEncodeTimeout (${timeoutMs} ms). ` +
+    "Long or high-frame-count renders may need more time: set FFMPEG_ENCODE_TIMEOUT_MS " +
+    "to a higher value (ms), or set PRODUCER_ENABLE_CHUNKED_ENCODE=true to encode in " +
+    "smaller chunks instead of one long-running ffmpeg process."
+  );
+}
+
+function isAacSidecar(audioPath: string): boolean {
+  return extname(audioPath).toLowerCase() === ".aac";
+}
+
+const KNOWN_NON_AAC_AUDIO_EXTENSIONS = new Set([
+  ".flac",
+  ".mp3",
+  ".oga",
+  ".ogg",
+  ".opus",
+  ".wav",
+  ".webm",
+]);
+
+export interface MuxVideoWithAudioOptions extends Partial<
+  Pick<EngineConfig, "ffmpegProcessTimeout">
+> {
+  /**
+   * Codec of the sidecar audio when the caller already knows it. HyperFrames
+   * render paths pass the mixed AAC sidecar by contract, so muxing should not
+   * depend on the file extension alone.
+   */
+  audioCodec?: "aac";
+  /** Preserve a priming edit list known to have been created by AAC re-encoding. */
+  preserveAudioPrimingEditList?: boolean;
+  /** Hard cap copied audio to the already-encoded video's exact duration. */
+}
+
+async function shouldCopyAacSidecar(
+  audioPath: string,
+  options: MuxVideoWithAudioOptions | undefined,
+) {
+  if (options?.audioCodec === "aac" || isAacSidecar(audioPath)) return true;
+
+  const audioExtension = extname(audioPath).toLowerCase();
+  if (KNOWN_NON_AAC_AUDIO_EXTENSIONS.has(audioExtension)) return false;
+
+  try {
+    const metadata = await extractAudioMetadata(audioPath);
+    return metadata.audioCodec === "aac";
+  } catch {
+    // Preserve the pre-existing fallback for invalid or unprobeable sidecars:
+    // let the final ffmpeg transcode path surface the actionable mux error.
+    return false;
+  }
 }
 
 /**
@@ -91,6 +157,7 @@ export function buildEncoderArgs(
     quality = 23,
     bitrate,
     pixelFormat = "yuv420p",
+    vp9CpuUsed,
     useGpu = false,
   } = options;
 
@@ -139,9 +206,13 @@ export function buildEncoderArgs(
           if (bitrate) args.push("-b:v", bitrate);
           else args.push("-global_quality", String(quality));
           break;
+        case "amf":
+          if (bitrate) args.push("-b:v", bitrate);
+          else args.push("-rc", "cqp", "-qp_i", String(quality), "-qp_p", String(quality));
+          break;
       }
 
-      // Same B-frame story as the SW branch below — nvenc emits B-frames
+      // Same B-frame story as the SW branch below — nvenc/amf emit B-frames
       // by default (qsv via b_strategy, vaapi too), and the negative-DTS
       // freeze hits the same downstream players. The unconditional
       // `-avoid_negative_ts make_zero` near the bottom of this function
@@ -152,7 +223,10 @@ export function buildEncoderArgs(
       // negative DTS in practice on macOS Sonoma+.
       if (
         codec === "h264" &&
-        (gpuEncoder === "nvenc" || gpuEncoder === "qsv" || gpuEncoder === "vaapi")
+        (gpuEncoder === "nvenc" ||
+          gpuEncoder === "qsv" ||
+          gpuEncoder === "vaapi" ||
+          gpuEncoder === "amf")
       ) {
         args.push("-bf", "0");
         if (gpuEncoder === "qsv") {
@@ -254,13 +328,41 @@ export function buildEncoderArgs(
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
     args.push("-deadline", preset === "ultrafast" ? "realtime" : "good");
     args.push("-row-mt", "1");
+    appendVp9CpuUsedArg(args, vp9CpuUsed);
+
+    // `-auto-alt-ref 0` is mandatory for chunk concat-copy: libvpx-vp9's
+    // alt-ref frames can reference frames in either direction inside a
+    // GOP, so a chunk-boundary frame is not guaranteed to be the first
+    // displayable reference when alt-ref is on. The shared `vp9CpuUsed`
+    // option pins speed/quality against libvpx-vp9 default drift across
+    // versions for both chunked and streaming WebM encodes.
+    const lockGopVp9 = options.lockGopForChunkConcat === true;
+    if (lockGopVp9) {
+      if (
+        typeof options.gopSize !== "number" ||
+        !Number.isFinite(options.gopSize) ||
+        options.gopSize <= 0
+      ) {
+        throw new Error(
+          `[chunkEncoder] lockGopForChunkConcat=true requires a positive integer gopSize (received ${String(options.gopSize)})`,
+        );
+      }
+      const gop = Math.floor(options.gopSize);
+      args.push("-g", String(gop), "-keyint_min", String(gop), "-auto-alt-ref", "0");
+    }
     if (pixelFormat === "yuva420p") {
-      args.push("-auto-alt-ref", "0");
+      // Alpha + alt-ref is unsupported by libvpx-vp9. The closed-GOP
+      // branch above already emits `-auto-alt-ref 0`, so skip the
+      // duplicate push.
+      if (!lockGopVp9) {
+        args.push("-auto-alt-ref", "0");
+      }
       args.push("-metadata:s:v:0", "alpha_mode=1");
     }
   } else if (codec === "prores") {
     args.push("-c:v", "prores_ks", "-profile:v", preset, "-vendor", "apl0");
     args.push("-pix_fmt", pixelFormat);
+    appendRenderProvenanceArgs(args, outputPath);
     return [...args, "-y", outputPath];
   }
 
@@ -306,14 +408,33 @@ export function buildEncoderArgs(
 
     // Range conversion: Chrome's full-range RGB → limited/TV range.
     if (gpuEncoder === "vaapi") {
+      // vaapi already runs `format=nv12,hwupload`; the nv12 conversion aligns
+      // odd dimensions before upload, so only prepend the range conversion.
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
         args[vfIdx + 1] = `scale=in_range=pc:out_range=tv,${args[vfIdx + 1]}`;
       }
-    } else if (!shouldUseGpu) {
+    } else if (shouldUseGpu) {
+      // nvenc/videotoolbox/qsv/amf feed software frames straight to the HW
+      // encoder with no `-vf`. They hit the same "height not divisible by 2"
+      // abort as libx264 on an odd-sized 4:2:0 canvas, so pad odd dimensions
+      // up to even on the software side before the encode.
+      const vf = withEvenDimensionPad("", pixelFormat, options.width, options.height);
+      if (vf) args.push("-vf", vf);
+    } else {
       // Range conversion: Chrome screenshots are full-range RGB.
-      // The scale filter handles both 8-bit and 10-bit correctly.
-      args.push("-vf", "scale=in_range=pc:out_range=tv");
+      // The scale filter handles both 8-bit and 10-bit correctly. Pad odd
+      // dimensions up to even so libx264/libx265 (4:2:0) don't abort with
+      // "height not divisible by 2" on an odd-sized composition canvas.
+      args.push(
+        "-vf",
+        withEvenDimensionPad(
+          "scale=in_range=pc:out_range=tv",
+          pixelFormat,
+          options.width,
+          options.height,
+        ),
+      );
     }
 
     // Fixed timescale for consistent A/V timing across platforms.
@@ -325,6 +446,8 @@ export function buildEncoderArgs(
   }
 
   args.push("-avoid_negative_ts", "make_zero");
+
+  appendRenderProvenanceArgs(args, outputPath);
 
   args.push("-y", outputPath);
   return args;
@@ -365,75 +488,40 @@ export async function encodeFramesFromDir(
   const inputPath = join(framesDir, framePattern);
   const inputArgs = ["-framerate", fpsToFfmpegArg(options.fps), "-i", inputPath];
   const args = buildEncoderArgs(options, inputArgs, outputPath, gpuEncoder);
-
-  return new Promise((resolve) => {
-    const ffmpeg = spawn("ffmpeg", args);
-    let stderr = "";
-    const onAbort = () => {
-      ffmpeg.kill("SIGTERM");
+  const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+  const result = await runFfmpeg(args, { signal, timeout: encodeTimeout });
+  if (result.terminationReason === "abort") {
+    return {
+      success: false,
+      outputPath,
+      durationMs: result.durationMs,
+      framesEncoded: 0,
+      fileSize: 0,
+      error: "FFmpeg encode cancelled",
     };
-    if (signal) {
-      if (signal.aborted) {
-        ffmpeg.kill("SIGTERM");
-      } else {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
-
-    const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
-    const timer = setTimeout(() => {
-      ffmpeg.kill("SIGTERM");
-    }, encodeTimeout);
-
-    ffmpeg.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    ffmpeg.on("close", (code) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      const durationMs = Date.now() - startTime;
-      if (signal?.aborted) {
-        resolve({
-          success: false,
-          outputPath,
-          durationMs,
-          framesEncoded: 0,
-          fileSize: 0,
-          error: "FFmpeg encode cancelled",
-        });
-        return;
-      }
-
-      if (code !== 0) {
-        resolve({
-          success: false,
-          outputPath,
-          durationMs,
-          framesEncoded: 0,
-          fileSize: 0,
-          error: formatFfmpegError(code, stderr),
-        });
-        return;
-      }
-
-      const fileSize = existsSync(outputPath) ? statSync(outputPath).size : 0;
-      resolve({ success: true, outputPath, durationMs, framesEncoded: frameCount, fileSize });
-    });
-
-    ffmpeg.on("error", (err) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      resolve({
-        success: false,
-        outputPath,
-        durationMs: Date.now() - startTime,
-        framesEncoded: 0,
-        fileSize: 0,
-        error: `[FFmpeg] ${err.message}`,
-      });
-    });
-  });
+  }
+  if (!result.success) {
+    return {
+      success: false,
+      outputPath,
+      durationMs: result.durationMs,
+      framesEncoded: 0,
+      fileSize: 0,
+      error: appendEncodeTimeoutMessage(
+        formatFfmpegError(result.exitCode, result.stderr),
+        result.terminationReason === "deadline",
+        encodeTimeout,
+      ),
+    };
+  }
+  const fileSize = existsSync(outputPath) ? statSync(outputPath).size : 0;
+  return {
+    success: true,
+    outputPath,
+    durationMs: Date.now() - startTime,
+    framesEncoded: frameCount,
+    fileSize,
+  };
 }
 
 export async function encodeFramesChunkedConcat(
@@ -443,6 +531,7 @@ export async function encodeFramesChunkedConcat(
   options: EncoderOptions,
   chunkSizeFrames: number,
   signal?: AbortSignal,
+  config?: Partial<Pick<EngineConfig, "ffmpegEncodeTimeout">>,
 ): Promise<EncodeResult> {
   const start = Date.now();
   const files = readdirSync(framesDir)
@@ -497,20 +586,18 @@ export async function encodeFramesChunkedConcat(
     let gpuEncoder: GpuEncoder = null;
     if (options.useGpu) gpuEncoder = await getCachedGpuEncoder();
     const args = buildEncoderArgs(options, inputArgs, chunkPath, gpuEncoder);
-    const chunkResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-      const ffmpeg = spawn("ffmpeg", args);
-      let stderr = "";
-      ffmpeg.stderr.on("data", (d) => {
-        stderr += d.toString();
-      });
-      ffmpeg.on("close", (code) => {
-        if (code === 0) resolve({ success: true });
-        else resolve({ success: false, error: `Chunk ${i} encode failed: ${stderr.slice(-400)}` });
-      });
-      ffmpeg.on("error", (err) => {
-        resolve({ success: false, error: `Chunk ${i} encode error: ${err.message}` });
-      });
-    });
+    const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+    const processResult = await runFfmpeg(args, { signal, timeout: encodeTimeout });
+    const chunkResult = {
+      success: processResult.success,
+      error: processResult.success
+        ? undefined
+        : appendEncodeTimeoutMessage(
+            `Chunk ${i} encode failed: ${processResult.stderr.slice(-400)}`,
+            processResult.terminationReason === "deadline",
+            encodeTimeout,
+          ),
+    };
     if (!chunkResult.success) {
       return {
         success: false,
@@ -528,32 +615,26 @@ export async function encodeFramesChunkedConcat(
   const concatInput = chunkPaths.map((path) => `file '${path.replace(/'/g, "'\\''")}'`).join("\n");
   writeFileSync(concatListPath, concatInput, "utf-8");
 
-  const concatArgs = [
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    concatListPath,
-    "-c",
-    "copy",
-    "-y",
-    outputPath,
-  ];
-  const concatResult = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-    const ffmpeg = spawn("ffmpeg", concatArgs);
-    let stderr = "";
-    ffmpeg.stderr.on("data", (d) => {
-      stderr += d.toString();
-    });
-    ffmpeg.on("close", (code) => {
-      if (code === 0) resolve({ success: true });
-      else resolve({ success: false, error: `Chunk concat failed: ${stderr.slice(-400)}` });
-    });
-    ffmpeg.on("error", (err) => {
-      resolve({ success: false, error: `Chunk concat error: ${err.message}` });
-    });
-  });
+  const concatArgs = ["-f", "concat", "-safe", "0", "-i", concatListPath, "-c", "copy"];
+  // The concat demuxer does not carry per-chunk container metadata into the
+  // output, so the chunks' provenance is dropped here even though every chunk
+  // carries it. Re-assert on the concatenated file: for a no-audio mov/webm
+  // this is the last container write, since mux is skipped and applyFaststart
+  // only copies those two formats.
+  appendRenderProvenanceArgs(concatArgs, outputPath);
+  concatArgs.push("-y", outputPath);
+  const encodeTimeout = config?.ffmpegEncodeTimeout ?? DEFAULT_CONFIG.ffmpegEncodeTimeout;
+  const concatProcessResult = await runFfmpeg(concatArgs, { signal, timeout: encodeTimeout });
+  const concatResult = {
+    success: concatProcessResult.success,
+    error: concatProcessResult.success
+      ? undefined
+      : appendEncodeTimeoutMessage(
+          `Chunk concat failed: ${concatProcessResult.stderr.slice(-400)}`,
+          concatProcessResult.terminationReason === "deadline",
+          encodeTimeout,
+        ),
+  };
 
   if (!concatResult.success) {
     return {
@@ -581,26 +662,56 @@ export async function muxVideoWithAudio(
   audioPath: string,
   outputPath: string,
   signal?: AbortSignal,
-  config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+  config?: MuxVideoWithAudioOptions,
+  fps?: Fps,
 ): Promise<MuxResult> {
   const outputDir = dirname(outputPath);
   if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
   const isWebm = outputPath.endsWith(".webm");
   const isMov = outputPath.endsWith(".mov");
+  const shouldCopyAudio = isWebm ? false : await shouldCopyAacSidecar(audioPath, config);
   const args = ["-i", videoPath, "-i", audioPath, "-c:v", "copy"];
 
   if (isWebm) {
     args.push("-c:a", "libopus", "-b:a", "128k");
   } else if (isMov) {
-    args.push("-c:a", "aac", "-b:a", "192k");
+    if (shouldCopyAudio) {
+      args.push("-c:a", "copy");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "192k");
+    }
   } else {
-    args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart");
+    // processCompositionAudio (audioMixer.ts) performs the AAC encode and
+    // owns the single encoder-priming interval. Copying that sidecar into
+    // MP4 preserves the correct priming metadata; re-encoding it during mux
+    // creates another priming interval that ffmpeg writes as an empty leading
+    // video edit list, which QuickTime/Safari render as a black first frame.
+    if (shouldCopyAudio) {
+      args.push("-c:a", "copy", "-movflags", "+faststart");
+    } else {
+      args.push("-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart");
+    }
   }
+  const copiesContainerizedAac =
+    !isWebm && shouldCopyAudio && config?.preserveAudioPrimingEditList === true;
   // PTS bases can diverge during mux and reintroduce negative DTS. See
   // buildEncoderArgs for the full reasoning on why that breaks playback.
-  args.push("-avoid_negative_ts", "make_zero");
-  args.push("-shortest", "-y", outputPath);
+  // A freshly encoded M4A is the exception: its edit list already hides the
+  // AAC priming packet. `make_zero` discards that edit and shifts copied video
+  // forward by one AAC frame (~21ms), creating a visible first-frame offset.
+  if (!copiesContainerizedAac) args.push("-avoid_negative_ts", "make_zero");
+  // Re-assert provenance here: this stage re-muxes into the delivered
+  // container, and the mp4 muxer drops the encode stage's tags without the
+  // use_metadata_tags flag that appendRenderProvenanceArgs adds.
+  appendRenderProvenanceArgs(args, outputPath);
+  if (fps !== undefined) {
+    // Set the exact output framerate so the muxer doesn't PTS-average a
+    // fractional rational like `360000/12001` instead of `30/1` into the
+    // output container metadata. `-c:v copy` is retained; no re-encode.
+    args.push("-r", fpsToFfmpegArg(fps));
+  }
+  args.push("-y", outputPath);
 
   const processTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const result = await runFfmpeg(args, { signal, timeout: processTimeout });
@@ -626,6 +737,7 @@ export async function applyFaststart(
   outputPath: string,
   signal?: AbortSignal,
   config?: Partial<Pick<EngineConfig, "ffmpegProcessTimeout">>,
+  fps?: Fps,
 ): Promise<MuxResult> {
   // faststart is MP4-only (moves moov atom to file start for streaming).
   // WebM and MOV don't need it — skip the re-mux.
@@ -633,7 +745,15 @@ export async function applyFaststart(
     if (inputPath !== outputPath) copyFileSync(inputPath, outputPath);
     return { success: true, outputPath, durationMs: 0 };
   }
-  const args = ["-i", inputPath, "-c", "copy", "-movflags", "+faststart", "-y", outputPath];
+  const args = ["-i", inputPath, "-c", "copy", "-movflags", "+faststart"];
+  appendRenderProvenanceArgs(args, outputPath);
+  if (fps !== undefined) {
+    // Set the exact output framerate so the final remux doesn't PTS-average
+    // a fractional rational like `360000/12001` instead of `30/1` into the
+    // output container metadata. `-c copy` is retained; no re-encode.
+    args.push("-r", fpsToFfmpegArg(fps));
+  }
+  args.push("-y", outputPath);
 
   const processTimeout = config?.ffmpegProcessTimeout ?? DEFAULT_CONFIG.ffmpegProcessTimeout;
   const result = await runFfmpeg(args, { signal, timeout: processTimeout });

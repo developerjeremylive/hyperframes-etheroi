@@ -1,95 +1,114 @@
-import type { TimelineTrackStyle } from "./timelineTheme";
-
-import { memo, type ReactNode } from "react";
+import { memo, type CSSProperties, type ReactNode } from "react";
 import type { TimelineElement } from "../store/playerStore";
 import { defaultTimelineTheme, getClipHandleOpacity, type TimelineTheme } from "./timelineTheme";
-import { getTimelineEditCapabilities } from "./timelineEditing";
+import type { TimelineEditCapabilities } from "./timelineEditing";
+import { isAudioTimelineElement } from "../../utils/timelineInspector";
+import { timelineClipFocusId } from "./timelineNavigationIdentity";
 
 interface TimelineClipProps {
   el: TimelineElement;
   pps: number;
   clipY: number;
+  clipHeight?: number;
   isSelected: boolean;
   isHovered: boolean;
   isDragging?: boolean;
+  isGestureActor?: boolean;
+  isActive?: boolean;
   hasCustomContent: boolean;
+  capabilities: TimelineEditCapabilities;
   theme?: TimelineTheme;
-  trackStyle: TimelineTrackStyle;
   isComposition: boolean;
+  tabIndex?: 0 | -1;
   onHoverStart: () => void;
   onHoverEnd: () => void;
   onPointerDown?: (e: React.PointerEvent) => void;
   onResizeStart?: (edge: "start" | "end", e: React.PointerEvent) => void;
   onClick: (e: React.MouseEvent) => void;
   onDoubleClick: (e: React.MouseEvent) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
   children?: ReactNode;
 }
 
+// fallow-ignore-next-line complexity
 export const TimelineClip = memo(function TimelineClip({
   el,
   pps,
   clipY,
+  clipHeight,
   isSelected,
   isHovered,
   isDragging = false,
+  isGestureActor = false,
+  isActive = false,
   hasCustomContent,
+  capabilities,
   theme = defaultTimelineTheme,
-  trackStyle,
   isComposition,
+  tabIndex = -1,
   onHoverStart,
   onHoverEnd,
   onPointerDown,
   onResizeStart,
   onClick,
   onDoubleClick,
+  onContextMenu,
   children,
 }: TimelineClipProps) {
   const leftPx = el.start * pps;
   const widthPx = Math.max(el.duration * pps, 4);
   const handleOpacity = getClipHandleOpacity({ isHovered, isSelected, isDragging });
-  const borderColor = isSelected
-    ? theme.clipBorderActive
-    : isHovered
-      ? theme.clipBorderHover
-      : theme.clipBorder;
-  const boxShadow = isDragging
-    ? theme.clipShadowDragging
-    : isSelected
-      ? theme.clipShadowActive
-      : isHovered
-        ? theme.clipShadowHover
-        : theme.clipShadow;
-  const capabilities = getTimelineEditCapabilities(el);
   const displayLabel = el.label || el.id || el.tag;
-  const showHandles = handleOpacity > 0.01;
+  const showHandles = handleOpacity > 0.01 && (widthPx >= 32 || isSelected);
+  const showLabel = widthPx >= 40 || isSelected;
+  const showDefaultText = !hasCustomContent && (widthPx >= 40 || isSelected);
+  const startLabel = el.start.toFixed(1);
+  const endLabel = (el.start + el.duration).toFixed(1);
+  const clipClassName = [
+    "timeline-clip",
+    "absolute",
+    hasCustomContent ? "overflow-visible" : "overflow-hidden",
+    isSelected ? "is-selected" : "",
+    isHovered ? "is-hovered" : "",
+    isDragging ? "is-dragging" : "",
+    showDefaultText ? "" : "is-micro",
+    isAudioTimelineElement(el) ? "is-audio" : "",
+  ]
+    .filter((className) => className.length > 0)
+    .join(" ");
+  const style: CSSProperties = {
+    left: leftPx,
+    width: widthPx,
+    top: clipY,
+    ...(clipHeight === undefined ? { bottom: clipY } : { height: clipHeight }),
+    borderRadius: theme.clipRadius,
+    zIndex: isDragging ? 20 : isSelected ? 10 : isHovered ? 5 : 1,
+    // Regular cursor over clips (CapCut-style, user preference) — no grab hand.
+    cursor: "default",
+    appearance: "none",
+    color: "inherit",
+    font: "inherit",
+    padding: 0,
+    textAlign: "left",
+    transform: isDragging ? "translateY(-1px)" : undefined,
+  };
 
   return (
-    <div
-      data-clip="true"
-      className={
-        hasCustomContent ? "absolute overflow-hidden" : "absolute flex items-center overflow-hidden"
-      }
-      style={{
-        left: leftPx,
-        width: widthPx,
-        top: clipY,
-        bottom: clipY,
-        borderRadius: theme.clipRadius,
-        background: isSelected
-          ? `linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0)), linear-gradient(120deg, ${trackStyle.accent}22, transparent 28%), ${theme.clipBackgroundActive}`
-          : `linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)), linear-gradient(120deg, ${trackStyle.accent}1e, transparent 28%), ${theme.clipBackground}`,
-        backgroundImage:
-          isComposition && !hasCustomContent
-            ? `repeating-linear-gradient(135deg, transparent, transparent 3px, rgba(255,255,255,0.05) 3px, rgba(255,255,255,0.05) 6px)`
-            : undefined,
-        border: `1px solid ${borderColor}`,
-        boxShadow,
-        transition:
-          "border-color 120ms ease-out, box-shadow 140ms ease-out, background 140ms ease-out",
-        zIndex: isDragging ? 20 : isSelected ? 10 : isHovered ? 5 : 1,
-        cursor: capabilities.canMove ? "grab" : "default",
-        transform: isDragging ? "translateY(-1px)" : undefined,
-      }}
+    <button
+      type="button"
+      data-clip={isGestureActor ? undefined : "true"}
+      data-el-id={isGestureActor ? undefined : (el.key ?? el.id)}
+      data-timeline-focus-id={isGestureActor ? undefined : timelineClipFocusId(el.key ?? el.id)}
+      data-clip-start={el.start}
+      data-clip-end={el.start + el.duration}
+      data-clip-hidden={el.hidden ? "true" : undefined}
+      data-active={isActive ? "" : undefined}
+      aria-hidden={isGestureActor ? "true" : undefined}
+      tabIndex={isGestureActor ? undefined : tabIndex}
+      aria-label={`${displayLabel}, ${startLabel} to ${endLabel} seconds`}
+      aria-pressed={isGestureActor ? undefined : isSelected}
+      className={clipClassName}
+      style={style}
       title={
         isComposition
           ? `${el.compositionSrc} • Double-click to open`
@@ -100,80 +119,75 @@ export const TimelineClip = memo(function TimelineClip({
       onPointerDown={onPointerDown}
       onClick={onClick}
       onDoubleClick={onDoubleClick}
+      onContextMenu={onContextMenu}
     >
-      <div
-        aria-hidden="true"
-        role="presentation"
-        onPointerDown={(e) => onResizeStart?.("start", e)}
-        style={{
-          position: "absolute",
-          left: 0,
-          top: 0,
-          bottom: 0,
-          width: 18,
-          opacity: showHandles && capabilities.canTrimStart ? 1 : 0,
-          pointerEvents: onResizeStart && capabilities.canTrimStart ? "auto" : "none",
-          zIndex: 4,
-          transition: "opacity 120ms ease-out",
-          cursor: "col-resize",
-          background:
-            showHandles && capabilities.canTrimStart
-              ? `linear-gradient(90deg, ${trackStyle.accent}4d 0%, ${trackStyle.accent}22 42%, transparent 100%)`
-              : "transparent",
-        }}
-      >
+      {/* Left trim handle */}
+      {showHandles && capabilities.canTrimStart && (
         <div
+          aria-hidden="true"
+          onPointerDown={(e) => onResizeStart?.("start", e)}
           style={{
             position: "absolute",
-            left: 6,
-            top: 7,
-            bottom: 7,
-            width: 3,
-            borderRadius: 999,
-            background: theme.handleColor,
-            boxShadow: `0 0 0 1px ${trackStyle.accent}38, 0 0 12px ${trackStyle.accent}18`,
-            opacity: handleOpacity,
-            pointerEvents: "none",
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: 14,
+            cursor: "col-resize",
+            zIndex: 4,
           }}
-        />
-      </div>
-      <div
-        aria-hidden="true"
-        role="presentation"
-        onPointerDown={(e) => onResizeStart?.("end", e)}
-        style={{
-          position: "absolute",
-          right: 0,
-          top: 0,
-          bottom: 0,
-          width: 18,
-          opacity: showHandles && capabilities.canTrimEnd ? 1 : 0,
-          pointerEvents: onResizeStart && capabilities.canTrimEnd ? "auto" : "none",
-          zIndex: 4,
-          transition: "opacity 120ms ease-out",
-          cursor: "col-resize",
-          background:
-            showHandles && capabilities.canTrimEnd
-              ? `linear-gradient(270deg, ${trackStyle.accent}4d 0%, ${trackStyle.accent}22 42%, transparent 100%)`
-              : "transparent",
-        }}
-      >
+        >
+          <div
+            className="timeline-clip__handle-bar"
+            style={{
+              position: "absolute",
+              left: 4,
+              top: 6,
+              bottom: 6,
+              width: 2,
+              borderRadius: 1,
+              background: "rgba(255, 255, 255, 0.55)",
+              opacity: handleOpacity * 0.6,
+            }}
+          />
+        </div>
+      )}
+      {/* Right trim handle */}
+      {showHandles && capabilities.canTrimEnd && (
         <div
+          aria-hidden="true"
+          onPointerDown={(e) => onResizeStart?.("end", e)}
           style={{
             position: "absolute",
-            right: 6,
-            top: 7,
-            bottom: 7,
-            width: 3,
-            borderRadius: 999,
-            background: theme.handleColor,
-            boxShadow: `0 0 0 1px ${trackStyle.accent}38, 0 0 12px ${trackStyle.accent}18`,
-            opacity: handleOpacity,
-            pointerEvents: "none",
+            right: 0,
+            top: 0,
+            bottom: 0,
+            width: 14,
+            cursor: "col-resize",
+            zIndex: 4,
           }}
-        />
-      </div>
+        >
+          <div
+            className="timeline-clip__handle-bar"
+            style={{
+              position: "absolute",
+              right: 4,
+              top: 6,
+              bottom: 6,
+              width: 2,
+              borderRadius: 1,
+              background: "rgba(255, 255, 255, 0.55)",
+              opacity: handleOpacity * 0.6,
+            }}
+          />
+        </div>
+      )}
+      {showLabel && <span className="timeline-clip__label">{displayLabel}</span>}
+      {showDefaultText && (
+        <span className="timeline-clip__timecode">
+          {startLabel}-{endLabel}s
+        </span>
+      )}
       {children}
-    </div>
+    </button>
   );
 });

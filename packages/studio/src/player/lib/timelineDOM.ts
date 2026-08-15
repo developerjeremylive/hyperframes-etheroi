@@ -10,6 +10,8 @@
 
 import type { TimelineElement } from "../store/playerStore";
 import type { ClipManifestClip } from "./playbackTypes";
+import { resolveCssStackingContextId } from "@hyperframes/core/runtime/stacking-context";
+import { readClipTiming } from "@hyperframes/core/composition-contract";
 import {
   resolveMediaElement,
   applyMediaMetadataFromElement,
@@ -22,18 +24,27 @@ import {
   buildTimelineElementKey,
   buildTimelineElementIdentity,
   getTimelineElementIdentity,
+  isTimelineIgnoredElement,
+  readTimelineElementZIndex,
 } from "./timelineElementHelpers";
 
 // Re-export helpers that were previously public from this module so that
 // existing import sites (hook + tests) don't need to change.
+// fallow-ignore-next-line unused-exports
 export {
   readTimelineDurationFromDocument,
+  // fallow-ignore-next-line unused-exports
   resolveMediaElement,
+  // fallow-ignore-next-line unused-exports
   applyMediaMetadataFromElement,
   getTimelineElementSelector,
+  // fallow-ignore-next-line unused-exports
   getTimelineElementSourceFile,
+  // fallow-ignore-next-line unused-exports
   getTimelineElementSelectorIndex,
+  // fallow-ignore-next-line unused-exports
   buildTimelineElementIdentity,
+  // fallow-ignore-next-line unused-exports
   getTimelineElementIdentity,
   findTimelineDomNodeForClip,
 } from "./timelineElementHelpers";
@@ -44,7 +55,6 @@ export {
   autoHealMissingCompositionIds,
   setPreviewMediaMuted,
   setPreviewPlaybackRate,
-  shouldMutePreviewAudio,
   resolveIframe,
   buildMissingCompositionElements,
 } from "./timelineIframeHelpers";
@@ -53,6 +63,11 @@ export {
 // TimelineElement factories
 // ---------------------------------------------------------------------------
 
+function resolveClipTag(clip: ClipManifestClip): string {
+  return clip.tagName || clip.kind || "div";
+}
+
+// fallow-ignore-next-line complexity
 export function createTimelineElementFromManifestClip(params: {
   clip: ClipManifestClip;
   fallbackIndex: number;
@@ -64,7 +79,7 @@ export function createTimelineElementFromManifestClip(params: {
   const label = getTimelineElementDisplayLabel({
     id: clip.id,
     label: clip.label,
-    tag: clip.tagName || clip.kind,
+    tag: resolveClipTag(clip),
   });
 
   let domId: string | undefined;
@@ -72,8 +87,10 @@ export function createTimelineElementFromManifestClip(params: {
   let selectorIndex: number | undefined;
   let sourceFile: string | undefined;
 
+  let hfId: string | undefined;
   if (hostEl) {
     domId = hostEl.id || undefined;
+    hfId = hostEl.getAttribute("data-hf-id") || undefined;
     selector = getTimelineElementSelector(hostEl);
     selectorIndex =
       doc && selector ? getTimelineElementSelectorIndex(doc, hostEl, selector) : undefined;
@@ -93,24 +110,48 @@ export function createTimelineElementFromManifestClip(params: {
     id: identity.id,
     label,
     key: identity.key,
-    tag: clip.tagName || clip.kind,
+    kind: clip.kind,
+    tag: resolveClipTag(clip),
     start: clip.start,
     duration: clip.duration,
     track: clip.track,
+    // clip.track IS the authored data-track-index verbatim (the runtime honors
+    // it; see parseAuthoredTrack in core/runtime/timeline.ts). Record it at this
+    // translation boundary so later display-lane remaps (normalizeToZones,
+    // expanded-child rows) can persist in AUTHORED space instead of
+    // reconstructing it from lane occupants.
+    authoredTrack: clip.track,
+    // Runtime-computed stacking context — authoritative; helpers read it, never
+    // re-derive it.
+    stackingContextId: clip.stackingContextId ?? null,
     domId,
+    hfId,
     selector,
     selectorIndex,
     sourceFile,
+    playbackStart: clip.playbackStart,
+    playbackRate: clip.playbackRate,
   };
 
   if (hostEl) {
     applyMediaMetadataFromElement(entry, hostEl);
+    if (hostEl.hasAttribute("data-hidden")) entry.hidden = true;
+    const timelineRole = hostEl.getAttribute("data-timeline-role");
+    if (timelineRole) entry.timelineRole = timelineRole;
+    const fxChain = hostEl.getAttribute("data-fx-chain");
+    if (fxChain) entry.fxChain = fxChain;
+    const automation = hostEl.getAttribute("data-automation");
+    if (automation) entry.automation = automation;
+    entry.zIndex = readTimelineElementZIndex(hostEl);
   }
   if (clip.assetUrl) entry.src = clip.assetUrl;
   if (clip.kind === "composition" && clip.compositionId) {
+    entry.playbackStart ??= 0;
+    entry.playbackRate ??= 1;
     let resolvedSrc = clip.compositionSrc;
     if (!resolvedSrc) {
-      hostEl = doc?.querySelector(`[data-composition-id="${clip.compositionId}"]`) ?? hostEl;
+      hostEl =
+        doc?.querySelector(`[data-composition-id="${CSS.escape(clip.compositionId)}"]`) ?? hostEl;
       resolvedSrc =
         hostEl?.getAttribute("data-composition-src") ??
         hostEl?.getAttribute("data-composition-file") ??
@@ -127,6 +168,7 @@ export function createTimelineElementFromManifestClip(params: {
     }
     if (hostEl) {
       entry.domId = hostEl.id || undefined;
+      entry.hfId = hostEl.getAttribute("data-hf-id") || undefined;
       entry.selector = getTimelineElementSelector(hostEl);
       entry.selectorIndex =
         doc && entry.selector
@@ -187,6 +229,8 @@ export function createImplicitTimelineLayersFromDOM(
 
     layers.push({
       domId: child.id || undefined,
+      hfId: child.getAttribute("data-hf-id") || undefined,
+      zIndex: readTimelineElementZIndex(child),
       duration: rootDuration,
       id: identity.id,
       key: identity.key,
@@ -194,6 +238,7 @@ export function createImplicitTimelineLayersFromDOM(
       selector,
       selectorIndex,
       sourceFile,
+      stackingContextId: resolveCssStackingContextId(child),
       start: 0,
       tag: child.tagName.toLowerCase(),
       timingSource: "implicit",
@@ -214,27 +259,26 @@ export function parseTimelineFromDOM(doc: Document, rootDuration: number): Timel
   const els: TimelineElement[] = [];
   let trackCounter = 0;
 
+  // fallow-ignore-next-line complexity
   nodes.forEach((node) => {
     if (node === rootComp) return;
+    if (isTimelineIgnoredElement(node)) return;
     const el = node as HTMLElement;
-    const startStr = el.getAttribute("data-start");
-    if (startStr == null) return;
-    const start = parseFloat(startStr);
-    if (isNaN(start)) return;
+    const timing = readClipTiming(el);
+    const start = timing.start;
+    if (start == null) return;
     if (Number.isFinite(rootDuration) && rootDuration > 0 && start >= rootDuration) return;
 
     const tagLower = el.tagName.toLowerCase();
-    let dur = 0;
-    const durStr = el.getAttribute("data-duration");
-    if (durStr != null) dur = parseFloat(durStr);
-    if (isNaN(dur) || dur <= 0) dur = Math.max(0, rootDuration - start);
+    let dur = timing.duration ?? 0;
+    if (dur <= 0) dur = Math.max(0, rootDuration - start);
     if (Number.isFinite(rootDuration) && rootDuration > 0) {
       dur = Math.min(dur, Math.max(0, rootDuration - start));
     }
     if (!Number.isFinite(dur) || dur <= 0) return;
 
-    const trackStr = el.getAttribute("data-track-index");
-    const track = trackStr != null ? parseInt(trackStr, 10) : trackCounter++;
+    const track = timing.trackSource === "default" ? trackCounter++ : timing.trackIndex;
+    // fallow-ignore-next-line code-duplication
     const compId = el.getAttribute("data-composition-id");
     const selector = getTimelineElementSelector(el);
     const sourceFile = getTimelineElementSourceFile(el);
@@ -257,28 +301,60 @@ export function parseTimelineFromDOM(doc: Document, rootDuration: number): Timel
       id: identity.id,
       label,
       key: identity.key,
+      kind:
+        compId && compId !== rootComp?.getAttribute("data-composition-id")
+          ? "composition"
+          : tagLower === "video" || tagLower === "audio"
+            ? tagLower
+            : tagLower === "img"
+              ? "image"
+              : "element",
       tag: tagLower,
       start,
       duration: dur,
-      track: isNaN(track) ? 0 : track,
+      track,
       domId: el.id || undefined,
+      hfId: el.getAttribute("data-hf-id") || undefined,
       selector,
       selectorIndex,
       sourceFile,
+      stackingContextId: resolveCssStackingContextId(el),
       timingSource: "authored",
+      zIndex: readTimelineElementZIndex(el),
     };
 
     const mediaEl = resolveMediaElement(el);
+    applyMediaMetadataFromElement(entry, el);
     if (mediaEl) {
       if (mediaEl.tagName === "IMG") {
         entry.tag = "img";
       }
-      const src = mediaEl.getAttribute("src");
-      if (src) entry.src = src;
       const vol = el.getAttribute("data-volume") ?? mediaEl.getAttribute("data-volume");
       if (vol) entry.volume = parseFloat(vol);
-      applyMediaMetadataFromElement(entry, el);
+      // Override AFTER the helper (which sets the raw relative attribute) so the
+      // resolved absolute URL wins — the Studio can then fetch the asset
+      // regardless of whether the attribute value was relative or absolute.
+      const resolvedSrc = (mediaEl as HTMLMediaElement | HTMLImageElement).src || undefined;
+      if (resolvedSrc) entry.src = resolvedSrc;
     }
+
+    // Read from the element, like the manifest path does: without these an audio
+    // clip parsed straight from the DOM reserved no automation height and drew no
+    // lanes, while the property panel still showed its chain.
+    const domFxChain = el.getAttribute("data-fx-chain");
+    if (domFxChain) entry.fxChain = domFxChain;
+    const domAutomation = el.getAttribute("data-automation");
+    if (domAutomation) entry.automation = domAutomation;
+
+    if (el.hasAttribute("data-timeline-locked")) {
+      entry.timelineLocked = true;
+    }
+    if (el.hasAttribute("data-hidden")) {
+      entry.hidden = true;
+    }
+
+    const timelineRole = el.getAttribute("data-timeline-role");
+    if (timelineRole) entry.timelineRole = timelineRole;
 
     // Sub-compositions
     const compSrc =
@@ -292,6 +368,10 @@ export function parseTimelineFromDOM(doc: Document, rootDuration: number): Timel
         entry.src = innerVideo.getAttribute("src") || undefined;
         entry.tag = "video";
       }
+    }
+    if (entry.kind === "composition") {
+      entry.playbackStart ??= 0;
+      entry.playbackRate ??= 1;
     }
 
     els.push(entry);
@@ -323,7 +403,14 @@ export function mergeTimelineElementsPreservingDowngrades(
 
   const nextIdentities = new Set(nextElements.map(getTimelineElementIdentity));
   const preserved = currentElements.filter(
-    (element) => !nextIdentities.has(getTimelineElementIdentity(element)),
+    (element) =>
+      !nextIdentities.has(getTimelineElementIdentity(element)) &&
+      // Only preserve enriched sub-composition children (compositionSrc set),
+      // which a bare DOM re-scan legitimately drops and enrichMissingCompositions
+      // re-adds. A TOP-LEVEL element missing from the fresh scan was genuinely
+      // removed (undo of a split, a delete), so let it go — otherwise undoing a
+      // split leaves a ghost clip in the timeline even though the file is reverted.
+      element.compositionSrc != null,
   );
   if (preserved.length === 0) return nextElements;
   return [...nextElements, ...preserved];

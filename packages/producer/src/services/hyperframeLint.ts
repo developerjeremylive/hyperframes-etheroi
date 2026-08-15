@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve, join } from "node:path";
-import { lintHyperframeHtml, type HyperframeLintResult } from "@hyperframes/core/lint";
+import { lintHyperframeHtml, type HyperframeLintResult } from "@hyperframes/lint";
 
 export interface PreparedHyperframeLintInput {
   entryFile: string;
@@ -113,6 +113,8 @@ export function prepareHyperframeLintBody(
   return { error: "Missing lint source: provide projectDir, files, or html" };
 }
 
-export function runHyperframeLint(prepared: PreparedHyperframeLintInput): HyperframeLintResult {
+export async function runHyperframeLint(
+  prepared: PreparedHyperframeLintInput,
+): Promise<HyperframeLintResult> {
   return lintHyperframeHtml(prepared.html, { filePath: prepared.entryFile });
 }

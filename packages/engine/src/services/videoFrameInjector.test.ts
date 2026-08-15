@@ -1,9 +1,30 @@
 // @vitest-environment node
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { __testing } from "./videoFrameInjector.js";
+import { type Page } from "puppeteer-core";
+
+// Hoist mocks before importing the module under test so the mock factory wins.
+// The cache-hygiene block exercises createVideoFrameInjector against stubbed
+// page-side primitives so we can assert on Node-side state (cache poisoning)
+// without standing up a real browser.
+const { injectVideoFramesBatchMock, syncVideoFrameVisibilityMock } = vi.hoisted(() => ({
+  injectVideoFramesBatchMock: vi.fn<
+    (page: Page, updates: Array<{ videoId: string; dataUri: string }>) => Promise<string[]>
+  >(async (_page, updates) => updates.map((u) => u.videoId)),
+  syncVideoFrameVisibilityMock: vi.fn<(page: Page, ids: string[]) => Promise<void>>(
+    async () => undefined,
+  ),
+}));
+
+vi.mock("./screenshotService.js", () => ({
+  injectVideoFramesBatch: injectVideoFramesBatchMock,
+  syncVideoFrameVisibility: syncVideoFrameVisibilityMock,
+}));
+
+import { __testing, createVideoFrameInjector } from "./videoFrameInjector.js";
+import { type FrameLookupTable } from "./videoFrameExtractor.js";
 import { DEFAULT_CONFIG } from "../config.js";
 
 const { createFrameSourceCache } = __testing;
@@ -141,5 +162,159 @@ describe("frame source cache eviction", () => {
   it("stats() exposes counters used by telemetry", async () => {
     const cache = createFrameSourceCache(1, Number.MAX_SAFE_INTEGER);
     expect(cache.stats()).toMatchObject({ ...SHARED_STATS, entries: 0, bytes: 0 });
+  });
+});
+
+describe("createVideoFrameInjector cache hygiene against page-side skips", () => {
+  // Build a minimal FrameLookupTable stand-in that returns one fixed payload
+  // for every time so we can drive the hook deterministically. The real
+  // table is exercised exhaustively in videoFrameExtractor.test.ts.
+  function fakeTable(payload: { videoId: string; framePath: string; frameIndex: number }) {
+    return {
+      getActiveFramePayloads: () =>
+        new Map([
+          [payload.videoId, { framePath: payload.framePath, frameIndex: payload.frameIndex }],
+        ]),
+    } as unknown as FrameLookupTable;
+  }
+
+  // Bypass the on-disk frame cache by handing back a synthetic data URI.
+  function inlineResolver(framePath: string): string {
+    return `data:image/png;base64,fake-${framePath}`;
+  }
+
+  function makeGpuInjector() {
+    const evaluate = vi.fn(async () => undefined);
+    const page = { evaluate } as unknown as Page;
+    const hook = createVideoFrameInjector(
+      fakeTable({ videoId: "facet", framePath: "/f", frameIndex: 3 }),
+      { frameSrcResolver: inlineResolver },
+    );
+    return { evaluate, page, hook };
+  }
+
+  beforeEach(() => {
+    injectVideoFramesBatchMock.mockReset();
+    syncVideoFrameVisibilityMock.mockReset();
+    syncVideoFrameVisibilityMock.mockResolvedValue(undefined);
+  });
+
+  it("does not poison the lastInjected cache when the page reports zero ids injected", async () => {
+    // Regression for the agentic-finecut scenario after PR #1028's ancestor
+    // skip: when injectVideoFramesBatch silently drops a video (its sub-comp
+    // host is hidden), the caller used to record `lastInjectedFrame[v] = N`
+    // anyway. On the next frame, if the source frameIndex is unchanged
+    // (low-fps source, multiple output frames per source frame, or
+    // non-frame-aligned host start), the cache short-circuits the second
+    // call and the host's first visible frame paints blank because the
+    // replacement <img> was never created.
+    //
+    // Pin the contract: when the page returns `[]` (no ids actually
+    // injected), the cache must not record those frameIndexes, so a follow-
+    // up call at the same frameIndex still issues an inject.
+    // The injector calls page.evaluate after injecting frames (GPU reseek);
+    // stub it so these cache-hygiene cases exercise the real code path.
+    const fakePage = { evaluate: async () => undefined } as unknown as Page;
+    const hook = createVideoFrameInjector(
+      fakeTable({ videoId: "pip", framePath: "/p", frameIndex: 5 }),
+      {
+        frameSrcResolver: inlineResolver,
+      },
+    );
+    expect(hook).not.toBeNull();
+
+    // First call: simulate the ancestor-hidden skip — page-side reports it
+    // injected nothing.
+    injectVideoFramesBatchMock.mockResolvedValueOnce([]);
+    await hook!(fakePage, 0);
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(fakePage, [
+      { videoId: "pip", dataUri: "data:image/png;base64,fake-/p" },
+    ]);
+
+    // Second call: same frameIndex, but the previous call did not really
+    // paint. The cache must NOT short-circuit; the inject must run again.
+    injectVideoFramesBatchMock.mockResolvedValueOnce(["pip"]);
+    await hook!(fakePage, 0);
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(2);
+    expect(injectVideoFramesBatchMock).toHaveBeenLastCalledWith(fakePage, [
+      { videoId: "pip", dataUri: "data:image/png;base64,fake-/p" },
+    ]);
+  });
+
+  it("does cache normally when the page reports the id as injected", async () => {
+    // Counter-test: when injection succeeds for a videoId, the cache must
+    // record it and a second call at the same frameIndex must short-circuit.
+    // This pins the happy path so a future refactor can't trade the skip
+    // bug for a never-cache regression.
+    // The injector calls page.evaluate after injecting frames (GPU reseek);
+    // stub it so these cache-hygiene cases exercise the real code path.
+    const fakePage = { evaluate: async () => undefined } as unknown as Page;
+    const hook = createVideoFrameInjector(
+      fakeTable({ videoId: "pip", framePath: "/p", frameIndex: 5 }),
+      {
+        frameSrcResolver: inlineResolver,
+      },
+    );
+
+    injectVideoFramesBatchMock.mockResolvedValueOnce(["pip"]);
+    await hook!(fakePage, 0);
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
+
+    await hook!(fakePage, 0);
+    // Cache hit — no second inject for the same frameIndex.
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reinjects frame zero when a whole-chunk retry uses a fresh hook and page", async () => {
+    const table = fakeTable({ videoId: "hero", framePath: "/frame-0", frameIndex: 0 });
+    const beginFramePage = { evaluate: async () => undefined } as unknown as Page;
+    const screenshotPage = { evaluate: async () => undefined } as unknown as Page;
+    const beginFrameHook = createVideoFrameInjector(table, {
+      frameSrcResolver: inlineResolver,
+    });
+    const screenshotRetryHook = createVideoFrameInjector(table, {
+      frameSrcResolver: inlineResolver,
+    });
+
+    injectVideoFramesBatchMock.mockResolvedValue(["hero"]);
+    await beginFrameHook!(beginFramePage, 0);
+    await screenshotRetryHook!(screenshotPage, 0);
+
+    expect(injectVideoFramesBatchMock).toHaveBeenCalledTimes(2);
+    expect(injectVideoFramesBatchMock.mock.calls[0]?.[0]).toBe(beginFramePage);
+    expect(injectVideoFramesBatchMock.mock.calls[1]?.[0]).toBe(screenshotPage);
+  });
+
+  // Regression: WebGL/WebGPU compositions that sample a <video> as a texture
+  // render on `hf-seek` BEFORE frames are injected. After injecting the
+  // decoded frames, the hook must re-render the GPU adapters at the same time
+  // (window.__hfReseekGpu) so they re-upload their textures from the fresh
+  // frames — otherwise the facet flickers / goes black non-deterministically.
+  it("re-renders GPU adapters after injecting frames (post-injection reseek)", async () => {
+    const { evaluate, page, hook } = makeGpuInjector();
+
+    injectVideoFramesBatchMock.mockResolvedValueOnce(["facet"]);
+    await hook!(page, 1.5);
+
+    const reseekCall = evaluate.mock.calls.find((call) => call[1] === 1.5);
+    expect(reseekCall).toBeDefined();
+    // The evaluated page function invokes window.__hfReseekGpu(time).
+    const pageFn = reseekCall![0] as (t: number) => void;
+    const reseek = vi.fn();
+    (globalThis as unknown as { window?: unknown }).window = { __hfReseekGpu: reseek };
+    pageFn(1.5);
+    delete (globalThis as unknown as { window?: unknown }).window;
+    expect(reseek).toHaveBeenCalledWith(1.5);
+  });
+
+  it("does not reseek GPU when the page injected no frames", async () => {
+    const { evaluate, page, hook } = makeGpuInjector();
+
+    // Page dropped the video (e.g. hidden host) → nothing injected → no reseek.
+    injectVideoFramesBatchMock.mockResolvedValueOnce([]);
+    await hook!(page, 1.5);
+
+    expect(evaluate.mock.calls.some((call) => call[1] === 1.5)).toBe(false);
   });
 });

@@ -4,32 +4,47 @@ import { LeftSidebar, type LeftSidebarHandle } from "./sidebar/LeftSidebar";
 import { MediaPreview } from "./MediaPreview";
 import { isMediaFile } from "../utils/mediaTypes";
 import { usePanelLayoutContext } from "../contexts/PanelLayoutContext";
-import { useStudioContext } from "../contexts/StudioContext";
+import { useStudioShellContext } from "../contexts/StudioContext";
 import { useFileManagerContext } from "../contexts/FileManagerContext";
 import { getPersistedRenderSettings } from "./renders/renderSettings";
+import type { BlockPreviewInfo } from "./sidebar/BlocksTab";
 
 export interface StudioLeftSidebarProps {
   leftSidebarRef: RefObject<LeftSidebarHandle | null>;
   onSelectComposition: (comp: string) => void;
+  onAddBlock: (blockName: string) => void;
+  onPreviewBlock?: (preview: BlockPreviewInfo | null) => void;
   onLint: () => void;
   linting: boolean;
+  lintFindingCount?: number;
+  lintFindingsByFile?: Map<string, { count: number; messages: string[] }>;
+  onAddAssetToTimeline?: (path: string) => void;
+  onAddCompositionToTimeline?: (path: string) => void;
 }
 
+// fallow-ignore-next-line complexity
 export function StudioLeftSidebar({
   leftSidebarRef,
   onSelectComposition,
+  onAddBlock,
+  onPreviewBlock,
   onLint,
   linting,
+  lintFindingCount,
+  lintFindingsByFile,
+  onAddAssetToTimeline,
+  onAddCompositionToTimeline,
 }: StudioLeftSidebarProps) {
   const {
-    leftCollapsed,
+    effectiveLeftCollapsed,
     leftWidth,
+    adjustPanelWidth,
     toggleLeftSidebar,
     handlePanelResizeStart,
     handlePanelResizeMove,
     handlePanelResizeEnd,
   } = usePanelLayoutContext();
-  const { projectId, renderQueue, waitForPendingDomEditSaves } = useStudioContext();
+  const { projectId, renderQueue, waitForPendingDomEditSaves } = useStudioShellContext();
   const {
     compositions,
     assets,
@@ -56,9 +71,9 @@ export function StudioLeftSidebar({
     [renderQueue, waitForPendingDomEditSaves],
   );
 
-  if (leftCollapsed) {
+  if (effectiveLeftCollapsed) {
     return (
-      <div className="flex w-10 flex-shrink-0 flex-col items-center border-r border-neutral-800/50 bg-neutral-950 pt-1">
+      <div className="mr-0.5 flex w-10 flex-shrink-0 flex-col items-center rounded-lg border border-neutral-800/50 bg-neutral-950 pt-1">
         <button
           type="button"
           onClick={toggleLeftSidebar}
@@ -104,14 +119,22 @@ export function StudioLeftSidebar({
         onRenameFile={handleRenameFile}
         onDuplicateFile={handleDuplicateFile}
         onMoveFile={handleMoveFile}
-        onImportFiles={handleImportFiles}
+        onImportFiles={async (files, dir) => {
+          await handleImportFiles(files, dir);
+        }}
         codeChildren={
           editingFile ? (
             isMediaFile(editingFile.path) ? (
               <MediaPreview projectId={projectId} filePath={editingFile.path} />
+            ) : editingFile.content == null ? (
+              // Never mount the editor on unloaded content: a keystroke would
+              // autosave an empty document over the real file.
+              <div className="flex h-full items-center justify-center text-[11px] text-neutral-600">
+                Loading {editingFile.path}…
+              </div>
             ) : (
               <SourceEditor
-                content={editingFile.content ?? ""}
+                content={editingFile.content}
                 filePath={editingFile.path}
                 onChange={handleContentChange}
                 revealOffset={revealSourceOffset}
@@ -123,16 +146,45 @@ export function StudioLeftSidebar({
         isRendering={renderQueue.isRendering}
         onLint={onLint}
         linting={linting}
+        lintFindingCount={lintFindingCount}
+        lintFindingsByFile={lintFindingsByFile}
         onToggleCollapse={toggleLeftSidebar}
+        onAddBlock={onAddBlock}
+        onPreviewBlock={onPreviewBlock}
+        onAddAssetToTimeline={onAddAssetToTimeline}
+        onAddCompositionToTimeline={onAddCompositionToTimeline}
       />
+      {/* Vertical resize divider: 3px visible seam, 13px pointer-capture zone via
+          the absolutely-positioned inner hit area. The outer element is w-[3px] so
+          it contributes only 3px of gap in the flex row; the inner -left-[2px]
+          element widens the hit area without affecting layout. */}
       <div
-        className="group w-2 flex-shrink-0 cursor-col-resize flex items-center justify-center"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        tabIndex={0}
+        className="group relative w-[3px] flex-shrink-0 cursor-col-resize outline-none focus-visible:bg-studio-accent/20"
         style={{ touchAction: "none" }}
         onPointerDown={(e) => handlePanelResizeStart("left", e)}
         onPointerMove={handlePanelResizeMove}
         onPointerUp={handlePanelResizeEnd}
+        onPointerCancel={handlePanelResizeEnd}
+        onKeyDown={(e) => {
+          if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+          e.preventDefault();
+          const delta = e.key === "ArrowLeft" ? -16 : 16;
+          adjustPanelWidth("left", delta);
+        }}
       >
-        <div className="h-[52px] w-px bg-white/12 transition-colors group-hover:bg-white/18 group-active:bg-white/24" />
+        {/* Expanded hit zone, deliberately asymmetric: 2px into the sidebar card,
+            the 3px seam, then 8px into the preview pane's p-2 stage gutter — the
+            only dead space adjacent to this seam. It stops at 13px rather than the
+            24px WCAG 2.2 (2.5.8) target because the next pixel on either side is
+            live: the sidebar's scrolling tab content on the left, the preview
+            stage on the right. Silently stealing their clicks is the worse bug. */}
+        <div className="absolute inset-y-0 -left-[2px] w-[13px]" />
+        {/* Visible hairline */}
+        <div className="absolute top-1/2 left-0 h-[52px] w-[3px] -translate-y-1/2 bg-white/12 transition-colors group-hover:bg-white/18 group-active:bg-white/24" />
       </div>
     </>
   );

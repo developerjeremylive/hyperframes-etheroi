@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication
 /**
  * Shared FFmpeg process runner.
  *
@@ -6,6 +7,12 @@
  */
 
 import { spawn } from "child_process";
+import { getFfmpegBinary } from "./ffmpegBinaries.js";
+import { trackChildProcess } from "./processTracker.js";
+import {
+  ManagedChildProcess,
+  type ManagedProcessTerminationReason,
+} from "./managedChildProcess.js";
 
 export interface RunFfmpegOptions {
   signal?: AbortSignal;
@@ -18,11 +25,38 @@ export interface RunFfmpegResult {
   exitCode: number | null;
   stderr: string;
   durationMs: number;
+  terminationReason: ManagedProcessTerminationReason;
+  error?: Error;
 }
 
 const DEFAULT_TIMEOUT = 300_000;
 
 const DEFAULT_STDERR_TAIL_LINES = 15;
+
+function formatWindowsFfmpegExit(exitCode: number | null): string | undefined {
+  if (process.platform !== "win32" || exitCode === null) return undefined;
+  if (exitCode === 3221225781 || exitCode === -1073741515) {
+    const ffmpegPath = getFfmpegBinary();
+    return (
+      `[FFmpeg] Windows could not start "${ffmpegPath}": ` +
+      "0xC0000135 (STATUS_DLL_NOT_FOUND). A required DLL could not be loaded. " +
+      "Install a working 64-bit Windows FFmpeg build with all required runtime DLLs."
+    );
+  }
+  if (exitCode === 3221225595 || exitCode === -1073741701) {
+    return (
+      "[FFmpeg] Windows could not start ffmpeg.exe (STATUS_INVALID_IMAGE_FORMAT). " +
+      "The binary may be corrupted or the wrong architecture. Reinstall a 64-bit Windows FFmpeg build."
+    );
+  }
+  if (exitCode === 3221225794 || exitCode === -1073741502) {
+    return (
+      "[FFmpeg] Windows failed while initializing ffmpeg.exe. " +
+      "The binary may be corrupted, blocked, or missing runtime DLLs. Reinstall a 64-bit Windows FFmpeg build."
+    );
+  }
+  return undefined;
+}
 
 /**
  * Build a user-facing error message for a failed ffmpeg invocation.
@@ -47,65 +81,31 @@ export function formatFfmpegError(
   if (exitCode === null) {
     return tail ? `[FFmpeg] ${tail}` : "[FFmpeg] process error";
   }
+  const windowsMessage = formatWindowsFfmpegExit(exitCode);
+  if (windowsMessage) {
+    return tail ? `${windowsMessage}\nffmpeg stderr (tail):\n${tail}` : windowsMessage;
+  }
   return tail
     ? `FFmpeg exited with code ${exitCode}\nffmpeg stderr (tail):\n${tail}`
     : `FFmpeg exited with code ${exitCode}`;
 }
 
 export async function runFfmpeg(args: string[], opts?: RunFfmpegOptions): Promise<RunFfmpegResult> {
-  const startMs = Date.now();
-  const signal = opts?.signal;
   const timeout = opts?.timeout ?? DEFAULT_TIMEOUT;
-  const onStderr = opts?.onStderr;
-
-  return new Promise<RunFfmpegResult>((resolve) => {
-    const ffmpeg = spawn("ffmpeg", args);
-    let stderr = "";
-
-    const onAbort = () => {
-      ffmpeg.kill("SIGTERM");
-    };
-
-    if (signal) {
-      if (signal.aborted) {
-        ffmpeg.kill("SIGTERM");
-      } else {
-        signal.addEventListener("abort", onAbort, { once: true });
-      }
-    }
-
-    const timer = setTimeout(() => {
-      ffmpeg.kill("SIGTERM");
-    }, timeout);
-
-    ffmpeg.stderr.on("data", (data: Buffer) => {
-      const chunk = data.toString();
-      stderr += chunk;
-      if (onStderr) {
-        onStderr(chunk);
-      }
-    });
-
-    ffmpeg.on("close", (code) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      resolve({
-        success: !signal?.aborted && code === 0,
-        exitCode: code,
-        stderr,
-        durationMs: Date.now() - startMs,
-      });
-    });
-
-    ffmpeg.on("error", (err) => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-      resolve({
-        success: false,
-        exitCode: null,
-        stderr: err.message,
-        durationMs: Date.now() - startMs,
-      });
-    });
+  const ffmpeg = spawn(getFfmpegBinary(), args);
+  trackChildProcess(ffmpeg);
+  const managed = new ManagedChildProcess(ffmpeg, {
+    signal: opts?.signal,
+    deadlineAtMs: Date.now() + timeout,
+    onStderr: opts?.onStderr,
   });
+  const outcome = await managed.wait();
+  return {
+    success: outcome.reason === "exit" && outcome.exitCode === 0,
+    exitCode: outcome.exitCode,
+    stderr: outcome.stderr,
+    durationMs: outcome.durationMs,
+    terminationReason: outcome.reason,
+    error: outcome.error,
+  };
 }

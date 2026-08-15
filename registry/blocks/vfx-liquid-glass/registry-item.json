@@ -17,5 +17,23 @@
       "target": "compositions/vfx-liquid-glass.html",
       "type": "hyperframes:composition"
     }
+  ],
+  "preview": {
+    "video": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-liquid-glass.mp4",
+    "poster": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-liquid-glass.png"
+  },
+  "params": [
+    {
+      "key": "--bg-color",
+      "label": "Background",
+      "type": "color",
+      "default": "#030407"
+    },
+    {
+      "key": "--accent-color",
+      "label": "Accent",
+      "type": "color",
+      "default": "#00d4ff"
+    }
   ]
 }

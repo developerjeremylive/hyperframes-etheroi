@@ -5,14 +5,21 @@ function createMockDeps() {
   return {
     onPlay: vi.fn(),
     onPause: vi.fn(),
+    onStopMedia: vi.fn(),
     onSeek: vi.fn(),
     onTick: vi.fn(),
     onSetMuted: vi.fn(),
     onSetVolume: vi.fn(),
     onSetMediaOutputMuted: vi.fn(),
+    onSetNativeMediaSyncDisabled: vi.fn(),
+    onSetWebAudioMediaDisabled: vi.fn(),
     onSetPlaybackRate: vi.fn(),
+    onSetColorGrading: vi.fn(),
+    onSetColorGradingCompare: vi.fn(),
+    onSetRootDuration: vi.fn(),
     onEnablePickMode: vi.fn(),
     onDisablePickMode: vi.fn(),
+    getCanonicalFps: vi.fn(() => 30),
   };
 }
 
@@ -37,11 +44,33 @@ describe("installRuntimeControlBridge", () => {
     expect(deps.onPause).toHaveBeenCalledOnce();
   });
 
+  it("dispatches stop-media command", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("stop-media"));
+    expect(deps.onStopMedia).toHaveBeenCalledOnce();
+  });
+
   it("dispatches seek command with frame and mode", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
     handler(makeControlMessage("seek", { frame: 150, seekMode: "drag" }));
-    expect(deps.onSeek).toHaveBeenCalledWith(150, "drag");
+    expect(deps.onSeek).toHaveBeenCalledWith(5, "drag");
+  });
+
+  it("prefers canonical seconds in protocol v1 seek messages", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(
+      makeControlMessage("seek", {
+        protocolVersion: 1,
+        capabilities: ["seconds-time", "rational-fps", "seek-keep-playing"],
+        fps: { numerator: 60, denominator: 1 },
+        timeSeconds: 2.5,
+        frame: 999,
+      }),
+    );
+    expect(deps.onSeek).toHaveBeenCalledWith(2.5, "commit");
   });
 
   it("seek defaults frame to 0 and seekMode to commit", () => {
@@ -97,6 +126,38 @@ describe("installRuntimeControlBridge", () => {
     expect(deps.onSetMediaOutputMuted).toHaveBeenCalledWith(false);
   });
 
+  it("dispatches set-native-media-sync-disabled command", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("set-native-media-sync-disabled", { disabled: true }));
+    expect(deps.onSetNativeMediaSyncDisabled).toHaveBeenCalledWith(true);
+    handler(makeControlMessage("set-native-media-sync-disabled", { disabled: false }));
+    expect(deps.onSetNativeMediaSyncDisabled).toHaveBeenCalledWith(false);
+  });
+
+  it("set-native-media-sync-disabled coerces absent flag to false", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("set-native-media-sync-disabled"));
+    expect(deps.onSetNativeMediaSyncDisabled).toHaveBeenCalledWith(false);
+  });
+
+  it("dispatches set-web-audio-media-disabled command", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("set-web-audio-media-disabled", { disabled: true }));
+    expect(deps.onSetWebAudioMediaDisabled).toHaveBeenCalledWith(true);
+    handler(makeControlMessage("set-web-audio-media-disabled", { disabled: false }));
+    expect(deps.onSetWebAudioMediaDisabled).toHaveBeenCalledWith(false);
+  });
+
+  it("set-web-audio-media-disabled coerces absent flag to false", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("set-web-audio-media-disabled"));
+    expect(deps.onSetWebAudioMediaDisabled).toHaveBeenCalledWith(false);
+  });
+
   it("dispatches set-playback-rate command", () => {
     const deps = createMockDeps();
     const handler = installRuntimeControlBridge(deps);
@@ -109,6 +170,31 @@ describe("installRuntimeControlBridge", () => {
     const handler = installRuntimeControlBridge(deps);
     handler(makeControlMessage("set-playback-rate"));
     expect(deps.onSetPlaybackRate).toHaveBeenCalledWith(1);
+  });
+
+  it("dispatches set-root-duration command with numeric seconds", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("set-root-duration", { durationSeconds: "18.5" }));
+    expect(deps.onSetRootDuration).toHaveBeenCalledWith(18.5);
+  });
+
+  it("dispatches set-color-grading command with target and grading payload", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    const grading = { preset: "warm-daylight", intensity: 0.7 };
+    const target = { id: "hero-video", selectorIndex: 0 };
+    handler(makeControlMessage("set-color-grading", { target, grading }));
+    expect(deps.onSetColorGrading).toHaveBeenCalledWith(target, grading);
+  });
+
+  it("dispatches set-color-grading-compare command with target and compare payload", () => {
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    const compare = { enabled: true, position: 0.42 };
+    const target = { id: "hero-video", selectorIndex: 0 };
+    handler(makeControlMessage("set-color-grading-compare", { target, compare }));
+    expect(deps.onSetColorGradingCompare).toHaveBeenCalledWith(target, compare);
   });
 
   it("dispatches tick command", () => {
@@ -167,5 +253,40 @@ describe("installRuntimeControlBridge", () => {
     expect(() =>
       handler(makeControlMessage("flash-elements", { selectors: [".test"], duration: 500 })),
     ).not.toThrow();
+  });
+
+  it("posts a ready message to window.parent on install", () => {
+    // The bridge announces itself so the parent can replay any control
+    // messages it posted before the iframe runtime's listener was installed.
+    const postSpy = vi.spyOn(window.parent, "postMessage");
+    const deps = createMockDeps();
+    installRuntimeControlBridge(deps);
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "hf-preview",
+        type: "ready",
+        protocolVersion: 1,
+        fps: { numerator: 30, denominator: 1 },
+      }),
+      "*",
+    );
+    postSpy.mockRestore();
+  });
+
+  it("rejects an unknown protocol major with a diagnostic", () => {
+    const postSpy = vi.spyOn(window.parent, "postMessage");
+    const deps = createMockDeps();
+    const handler = installRuntimeControlBridge(deps);
+    handler(makeControlMessage("play", { protocolVersion: 2 }));
+
+    expect(deps.onPlay).not.toHaveBeenCalled();
+    expect(postSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "diagnostic",
+        code: "runtime.protocol.unsupported_protocol_version",
+      }),
+      "*",
+    );
+    postSpy.mockRestore();
   });
 });

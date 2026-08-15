@@ -1,16 +1,8 @@
 import type { TimelineElement } from "../player";
 
-export const TIMELINE_INSPECTOR_BOUNDARY_EPSILON_SECONDS = 0.08;
-
 const AUDIO_TIMELINE_TAGS = new Set(["audio", "music", "sfx", "sound", "narration"]);
 const AUDIO_SOURCE_EXT_RE = /\.(aac|flac|m4a|mp3|ogg|opus|wav)(?:[?#].*)?$/i;
-
-export function getTimelineElementKey(
-  element: Pick<TimelineElement, "id" | "key"> | null | undefined,
-): string | null {
-  if (!element) return null;
-  return element.key ?? element.id;
-}
+const MUSIC_ID_RE = /\b(music|bgm|soundtrack|background[-_]?music)\b/i;
 
 export function isAudioTimelineElement(
   element: Pick<TimelineElement, "tag" | "src"> | null | undefined,
@@ -21,96 +13,50 @@ export function isAudioTimelineElement(
   return Boolean(element.src && AUDIO_SOURCE_EXT_RE.test(element.src));
 }
 
-export function canInspectTimelineElement(
-  element: Pick<TimelineElement, "tag" | "src"> | null | undefined,
-): boolean {
-  return !isAudioTimelineElement(element);
-}
-
-export function shouldShowTimelineInspectorBounds(
-  currentTime: number,
-  element: Pick<TimelineElement, "start" | "duration"> | null | undefined,
-  epsilonSeconds = TIMELINE_INSPECTOR_BOUNDARY_EPSILON_SECONDS,
+/** True for the music track: an audio element with data-timeline-role="music",
+ *  or — when no role is set — an id matching the music regex. Voiceover/other
+ *  audio (explicit non-music role) is excluded. */
+export function isMusicTrack(
+  element:
+    | Pick<TimelineElement, "tag" | "src" | "id" | "domId" | "timelineRole">
+    | null
+    | undefined,
 ): boolean {
   if (!element) return false;
-  if (!Number.isFinite(currentTime)) return false;
-  if (!Number.isFinite(element.start) || !Number.isFinite(element.duration)) return false;
-  const start = Math.max(0, element.start);
-  const end = Math.max(start, start + Math.max(0, element.duration));
-  const epsilon = Math.max(0, epsilonSeconds);
-  return Math.abs(currentTime - start) <= epsilon || Math.abs(currentTime - end) <= epsilon;
+  if (!isAudioTimelineElement(element)) return false;
+  if (element.timelineRole === "music") return true;
+  if (element.timelineRole && element.timelineRole !== "music") return false;
+  const id = element.domId ?? element.id ?? "";
+  return MUSIC_ID_RE.test(id);
 }
 
-export function isTimelineElementActiveAtTime(
-  currentTime: number,
-  element: Pick<TimelineElement, "start" | "duration"> | null | undefined,
-  epsilonSeconds = TIMELINE_INSPECTOR_BOUNDARY_EPSILON_SECONDS,
-): boolean {
-  if (!element) return false;
-  if (!Number.isFinite(currentTime)) return false;
-  if (!Number.isFinite(element.start) || !Number.isFinite(element.duration)) return false;
-  const start = Math.max(0, element.start);
-  const end = Math.max(start, start + Math.max(0, element.duration));
-  const epsilon = Math.max(0, epsilonSeconds);
-  return currentTime >= start - epsilon && currentTime <= end + epsilon;
-}
+/**
+ * Resolve the best audio source for beat analysis. An explicitly tagged or
+ * named music track wins; when none is present (e.g. an audio file dropped
+ * from Finder with a generic id), the LONGEST untagged audio clip is used as a
+ * fallback. Ties on duration resolve to the FIRST such clip encountered (the loop
+ * keeps the current best on `>` only), i.e. discovery/DOM order wins.
+ * Returns the element and whether it was found via the fallback path.
+ *
+ * The `isMusicTrack` predicate is unchanged so beat-snap and drag-exclusion
+ * logic remain unaffected by this fallback.
+ */
+export function resolveBeatSourceTrack(
+  elements: readonly Pick<
+    TimelineElement,
+    "tag" | "src" | "id" | "domId" | "timelineRole" | "duration"
+  >[],
+): { element: (typeof elements)[number]; isFallback: boolean } | null {
+  const explicit = elements.find(isMusicTrack);
+  if (explicit) return { element: explicit, isFallback: false };
 
-export interface TimelineLayerVisibility {
-  visible: boolean;
-  compositeOpacity: number;
-  hasBox: boolean;
-  inViewport: boolean;
-}
-
-export function getTimelineLayerVisibilityInPreview(
-  element: HTMLElement,
-  options: { minCompositeOpacity?: number } = {},
-): TimelineLayerVisibility {
-  const hidden: TimelineLayerVisibility = {
-    visible: false,
-    compositeOpacity: 0,
-    hasBox: false,
-    inViewport: false,
-  };
-  if (!element.isConnected) return hidden;
-  const doc = element.ownerDocument;
-  const win = doc.defaultView;
-  if (!win) return hidden;
-
-  const minCompositeOpacity = options.minCompositeOpacity ?? 0.01;
-  let compositeOpacity = 1;
-  let current: HTMLElement | null = element;
-  while (current && current !== doc.body && current !== doc.documentElement) {
-    const style = win.getComputedStyle(current);
-    if (style.display === "none" || style.visibility === "hidden") {
-      return { ...hidden, compositeOpacity };
-    }
-    compositeOpacity *= Number.parseFloat(style.opacity || "1");
-    if (compositeOpacity <= minCompositeOpacity) {
-      return { ...hidden, compositeOpacity };
-    }
-    current = current.parentElement;
+  // Fallback: pick the longest audio clip (skipping explicitly non-music roles
+  // like "sfx" or "voiceover" to avoid triggering beat analysis on those).
+  let best: (typeof elements)[number] | null = null;
+  for (const el of elements) {
+    if (!isAudioTimelineElement(el)) continue;
+    if (el.timelineRole && el.timelineRole !== "music") continue;
+    if (!best || el.duration > best.duration) best = el;
   }
-
-  const rect = element.getBoundingClientRect();
-  const hasBox = rect.width > 0.5 && rect.height > 0.5;
-  if (!hasBox) return { visible: false, compositeOpacity, hasBox, inViewport: false };
-
-  const viewportWidth = win.innerWidth || doc.documentElement.clientWidth;
-  const viewportHeight = win.innerHeight || doc.documentElement.clientHeight;
-  const inViewport =
-    rect.right > 0 && rect.bottom > 0 && rect.left < viewportWidth && rect.top < viewportHeight;
-  return {
-    visible: inViewport,
-    compositeOpacity,
-    hasBox,
-    inViewport,
-  };
-}
-
-export function isTimelineLayerVisibleInPreview(
-  element: HTMLElement,
-  options: { minCompositeOpacity?: number } = {},
-): boolean {
-  return getTimelineLayerVisibilityInPreview(element, options).visible;
+  return best ? { element: best, isFallback: true } : null;
 }

@@ -13,6 +13,8 @@ export interface EditHistoryEntry {
   label: string;
   kind: EditHistoryKind;
   coalesceKey?: string;
+  /** Per-entry coalesce window override (ms). Falls back to the reducer default. */
+  coalesceMs?: number;
   createdAt: number;
   files: Record<string, EditHistoryFileSnapshot>;
 }
@@ -35,6 +37,7 @@ export interface BuildEditHistoryEntryInput {
   label: string;
   kind?: EditHistoryKind;
   coalesceKey?: string;
+  coalesceMs?: number;
   now: number;
   files: Record<string, { before: string; after: string }>;
 }
@@ -61,7 +64,7 @@ export type EditHistoryTransitionResult =
     };
 
 const DEFAULT_MAX_ENTRIES = 100;
-const DEFAULT_COALESCE_MS = 1500;
+const DEFAULT_COALESCE_MS = 300;
 
 export function hashEditHistoryContent(content: string): string {
   let hash = 2166136261;
@@ -99,6 +102,7 @@ export function buildEditHistoryEntry(input: BuildEditHistoryEntryInput): EditHi
     label: input.label,
     kind: input.kind ?? "manual",
     coalesceKey: input.coalesceKey,
+    coalesceMs: input.coalesceMs,
     createdAt: input.now,
     files,
   };
@@ -111,7 +115,9 @@ export function pushEditHistoryEntry(
 ): EditHistoryState {
   if (Object.keys(entry.files).length === 0) return state;
 
-  const coalesceMs = options?.coalesceMs ?? DEFAULT_COALESCE_MS;
+  // The incoming entry's own window wins so a caller can guarantee a merge even when a
+  // slow async step (e.g. a server GSAP rewrite) sits between the two records.
+  const coalesceMs = entry.coalesceMs ?? options?.coalesceMs ?? DEFAULT_COALESCE_MS;
   const maxEntries = options?.maxEntries ?? DEFAULT_MAX_ENTRIES;
   const previous = state.undo[state.undo.length - 1];
   let undo = state.undo;
@@ -120,9 +126,21 @@ export function pushEditHistoryEntry(
     previous &&
     previous.coalesceKey &&
     previous.coalesceKey === entry.coalesceKey &&
-    entry.createdAt - previous.createdAt <= coalesceMs
+    entry.createdAt - previous.createdAt <= coalesceMs &&
+    // A shared key/window is not enough: bytes from an external writer may
+    // have landed between the two Studio-owned edits. Only fold a path when
+    // the follow-up starts from the exact output the previous entry recorded.
+    // Otherwise keep both entries so undo restores the foreign bytes first and
+    // the older entry's content check safely blocks at that ownership boundary.
+    Object.entries(entry.files).every(([path, snapshot]) => {
+      const previousSnapshot = previous.files[path];
+      return !previousSnapshot || previousSnapshot.after === snapshot.before;
+    })
   ) {
-    const files: Record<string, EditHistoryFileSnapshot> = {};
+    // A follow-up may touch only a subset of the files in the original edit
+    // (for example, only one file in a multi-file timing move has GSAP). Keep
+    // previous-only paths in the single coalesced undo entry.
+    const files: Record<string, EditHistoryFileSnapshot> = { ...previous.files };
     for (const [path, snapshot] of Object.entries(entry.files)) {
       const previousSnapshot = previous.files[path];
       files[path] = previousSnapshot

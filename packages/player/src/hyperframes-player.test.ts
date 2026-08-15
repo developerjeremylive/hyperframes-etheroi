@@ -1,6 +1,55 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { formatTime, formatSpeed, SPEED_PRESETS } from "./controls.js";
 
+// Install a stubbed contentDocument getter on the given iframe element. The
+// new stopMedia / muted tests repeat this `Object.defineProperty(... { get })`
+// shape; routing through a named helper keeps the per-test bodies focused on
+// the actual assertion.
+function stubIframeContentDocument(iframe: HTMLIFrameElement, doc: Document): void {
+  Object.defineProperty(iframe, "contentDocument", {
+    configurable: true,
+    get: () => doc,
+  });
+}
+
+function createForeignFrameMediaDocument(): {
+  doc: Document;
+  video: HTMLMediaElement & { pause: ReturnType<typeof vi.fn> };
+  audio: HTMLMediaElement & { pause: ReturnType<typeof vi.fn> };
+} {
+  class FrameElement {
+    readonly tagName: string;
+    ownerDocument: {
+      defaultView: { Element: typeof FrameElement; HTMLMediaElement: typeof FrameElement };
+    } | null = null;
+
+    constructor(tagName: string) {
+      this.tagName = tagName;
+    }
+  }
+
+  class FrameMedia extends FrameElement {
+    muted = false;
+    defaultMuted = false;
+    pause = vi.fn();
+  }
+
+  const video = new FrameMedia("VIDEO");
+  const audio = new FrameMedia("AUDIO");
+  const fakeDoc = {
+    defaultView: { Element: FrameElement, HTMLMediaElement: FrameMedia },
+    querySelectorAll: () => [video, audio],
+  };
+  video.ownerDocument = fakeDoc;
+  audio.ownerDocument = fakeDoc;
+
+  return {
+    doc: fakeDoc as unknown as Document,
+    video: video as unknown as HTMLMediaElement & { pause: ReturnType<typeof vi.fn> },
+    audio: audio as unknown as HTMLMediaElement & { pause: ReturnType<typeof vi.fn> },
+  };
+}
+
 // ── Controls unit tests ──
 
 describe("SPEED_PRESETS", () => {
@@ -198,6 +247,72 @@ describe("HyperframesPlayer parent-frame media", () => {
     expect(mockAudio.pause).toHaveBeenCalled();
   });
 
+  function dispatchAutoplayBlockedFromPlayerFrame(player: HTMLElement): HTMLMediaElement {
+    const iframe = player.shadowRoot?.querySelector("iframe");
+    if (!(iframe instanceof HTMLIFrameElement)) throw new Error("expected player iframe");
+    const iframeDoc = iframe.contentDocument;
+    if (!iframeDoc) throw new Error("expected player iframe document");
+    const video = iframeDoc.createElement("video");
+    video.setAttribute("data-start", "0");
+    video.setAttribute("data-duration", "10");
+    video.muted = false;
+    iframeDoc.body.appendChild(video);
+
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: iframe.contentWindow,
+        data: { source: "hf-preview", type: "media-autoplay-blocked" },
+      }),
+    );
+
+    return video;
+  }
+
+  it("does not mute iframe media on autoplay fallback inside presenter slideshow", () => {
+    const slideshow = document.createElement("hyperframes-slideshow");
+    slideshow.appendChild(player);
+    document.body.appendChild(slideshow);
+
+    const video = dispatchAutoplayBlockedFromPlayerFrame(player);
+
+    expect(video.muted).toBe(false);
+    expect(player._audioOwner).toBe("runtime");
+    slideshow.remove();
+  });
+
+  it("does not promote autoplay fallback inside audience slideshow", () => {
+    const slideshow = document.createElement("hyperframes-slideshow");
+    slideshow.setAttribute("mode", "audience");
+    slideshow.appendChild(player);
+    document.body.appendChild(slideshow);
+
+    const video = dispatchAutoplayBlockedFromPlayerFrame(player);
+
+    expect(video.muted).toBe(false);
+    expect(player._audioOwner).toBe("runtime");
+    slideshow.remove();
+  });
+
+  it("seek() while playing pauses parent proxy (prevents mirrorTime stutter loop)", () => {
+    // Regression: previously `seek()` only called `seekAll()`, leaving the
+    // proxy playing. With the timeline frozen at the new seek target, the
+    // parent's `mirrorTime` drift-correction would yank `currentTime` back
+    // every ~80ms of accumulated drift, producing an audible audio stutter
+    // loop while the video frame stayed frozen. `seek()` must be symmetric
+    // with `pause()` for the parent-owned audio path.
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    player._promoteToParentProxy?.();
+    player.play();
+    expect(mockAudio.play).toHaveBeenCalled();
+    mockAudio.pause.mockClear();
+
+    player.seek(12.5);
+    expect(mockAudio.pause).toHaveBeenCalled();
+    expect(mockAudio.currentTime).toBe(12.5);
+  });
+
   it("promotion is idempotent", () => {
     player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
     document.body.appendChild(player);
@@ -301,6 +416,58 @@ describe("HyperframesPlayer parent-frame media", () => {
     player.remove();
     expect(mockAudio.pause).toHaveBeenCalled();
     expect(mockAudio.src).toBe("");
+  });
+
+  it("owns exactly one controls, media, and listener set across ten reconnects", () => {
+    const reconnectingPlayer = player as PlayerElement & {
+      readonly iframeElement: HTMLIFrameElement;
+      readonly paused: boolean;
+      readonly _parentMedia: unknown[];
+      shadowRoot: ShadowRoot;
+    };
+    reconnectingPlayer.setAttribute("controls", "");
+    reconnectingPlayer.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+
+    const windowAdd = vi.spyOn(window, "addEventListener");
+    const windowRemove = vi.spyOn(window, "removeEventListener");
+    const iframeAdd = vi.spyOn(reconnectingPlayer.iframeElement, "addEventListener");
+    const iframeRemove = vi.spyOn(reconnectingPlayer.iframeElement, "removeEventListener");
+
+    for (let cycle = 0; cycle < 10; cycle++) {
+      document.body.appendChild(reconnectingPlayer);
+      expect(reconnectingPlayer.shadowRoot.querySelectorAll(".hfp-controls")).toHaveLength(1);
+      expect(reconnectingPlayer._parentMedia).toHaveLength(1);
+
+      reconnectingPlayer.remove();
+      expect(reconnectingPlayer.shadowRoot.querySelectorAll(".hfp-controls")).toHaveLength(0);
+      expect(reconnectingPlayer._parentMedia).toHaveLength(0);
+      expect(reconnectingPlayer.paused).toBe(true);
+    }
+
+    document.body.appendChild(reconnectingPlayer);
+
+    expect(reconnectingPlayer.shadowRoot.querySelectorAll(".hfp-controls")).toHaveLength(1);
+    expect(reconnectingPlayer._parentMedia).toHaveLength(1);
+    expect(
+      windowAdd.mock.calls.filter(([eventName]) => eventName === "message").length -
+        windowRemove.mock.calls.filter(([eventName]) => eventName === "message").length,
+    ).toBe(1);
+    expect(
+      iframeAdd.mock.calls.filter(([eventName]) => eventName === "load").length -
+        iframeRemove.mock.calls.filter(([eventName]) => eventName === "load").length,
+    ).toBe(1);
+  });
+
+  it("returns parent-media ownership to the runtime after reconnect", () => {
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+    player._promoteToParentProxy?.();
+    expect(player._audioOwner).toBe("parent");
+
+    player.remove();
+    document.body.appendChild(player);
+
+    expect(player._audioOwner).toBe("runtime");
   });
 
   it("updates parent media when playback-rate changes after setup", () => {
@@ -813,8 +980,16 @@ describe("HyperframesPlayer seek() sync path", () => {
     seek: (t: number) => void;
     play: () => void;
     pause: () => void;
+    stopMedia: () => void;
     iframe: HTMLIFrameElement;
     _currentTime: number;
+    _parentMedia: Array<{
+      el: { pause: ReturnType<typeof vi.fn>; src: string };
+      start: number;
+      duration: number;
+      driftSamples: number;
+      source?: HTMLMediaElement | null;
+    }>;
   };
 
   let player: PlayerInternal;
@@ -885,7 +1060,27 @@ describe("HyperframesPlayer seek() sync path", () => {
         source: "hf-parent",
         type: "control",
         action: "seek",
-        frame: Math.round(12.5 * 30),
+        timeSeconds: 12.5,
+        frame: 375,
+        protocolVersion: 1,
+      }),
+      "*",
+    );
+  });
+
+  it("carries a frame fallback for accepted legacy cross-origin runtimes", () => {
+    // An older runtime ignores protocol-v1 metadata and reads only `frame`.
+    // Omitting it makes that bridge default every seek to frame zero.
+    const post = vi.fn();
+    stubContentWindow({ postMessage: post });
+
+    player.seek(7.5);
+
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "seek",
+        timeSeconds: 7.5,
+        frame: 225,
       }),
       "*",
     );
@@ -905,7 +1100,8 @@ describe("HyperframesPlayer seek() sync path", () => {
     player.seek(2);
 
     expect(timeline.seek).toHaveBeenCalledTimes(1);
-    expect(timeline.seek).toHaveBeenCalledWith(2);
+    // suppressEvents=false so onUpdate fires (imperative-visibility compositions repaint).
+    expect(timeline.seek).toHaveBeenCalledWith(2, false);
     expect(post).not.toHaveBeenCalled();
   });
 
@@ -944,9 +1140,63 @@ describe("HyperframesPlayer seek() sync path", () => {
     pause.mockClear();
     player.seek(2);
 
-    expect(timeline.seek).toHaveBeenCalledWith(2);
+    expect(timeline.seek).toHaveBeenCalledWith(2, false);
     expect(pause).toHaveBeenCalledTimes(1);
     expect(post).not.toHaveBeenCalled();
+  });
+
+  it("stopMedia pauses slide media without stopping global audio-src proxies", () => {
+    const post = vi.fn();
+    const doc = document.implementation.createHTMLDocument("composition");
+    const iframeVideo = doc.createElement("video");
+    const iframeAudio = doc.createElement("audio");
+    const iframeVideoPause = vi.fn();
+    const iframeAudioPause = vi.fn();
+    Object.defineProperty(iframeVideo, "pause", { configurable: true, value: iframeVideoPause });
+    Object.defineProperty(iframeAudio, "pause", { configurable: true, value: iframeAudioPause });
+    doc.body.append(iframeVideo, iframeAudio);
+    stubIframeContentDocument(player.iframe, doc);
+    stubContentWindow({ postMessage: post });
+
+    const slideProxyPause = vi.fn();
+    const globalProxyPause = vi.fn();
+    player._parentMedia.push(
+      {
+        el: { pause: slideProxyPause, src: "https://cdn.example.com/slide.mp4" },
+        start: 0,
+        duration: 5,
+        driftSamples: 0,
+        source: iframeVideo,
+      },
+      {
+        el: { pause: globalProxyPause, src: "https://cdn.example.com/background.mp3" },
+        start: 0,
+        duration: Infinity,
+        driftSamples: 0,
+        source: null,
+      },
+    );
+
+    player.stopMedia();
+
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: "stop-media" }), "*");
+    expect(iframeVideoPause).toHaveBeenCalledOnce();
+    expect(iframeAudioPause).toHaveBeenCalledOnce();
+    expect(slideProxyPause).toHaveBeenCalledOnce();
+    expect(globalProxyPause).not.toHaveBeenCalled();
+  });
+
+  it("stopMedia pauses iframe-realm media elements", () => {
+    const post = vi.fn();
+    const { doc, video, audio } = createForeignFrameMediaDocument();
+    stubIframeContentDocument(player.iframe, doc);
+    stubContentWindow({ postMessage: post });
+
+    player.stopMedia();
+
+    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: "stop-media" }), "*");
+    expect(video.pause).toHaveBeenCalledOnce();
+    expect(audio.pause).toHaveBeenCalledOnce();
   });
 
   it("does not bypass an installed runtime bridge for direct __timelines playback", () => {
@@ -984,7 +1234,15 @@ describe("HyperframesPlayer seek() sync path", () => {
 
     player.seek(7);
 
-    expect(post).toHaveBeenCalledWith(expect.objectContaining({ action: "seek", frame: 210 }), "*");
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "seek",
+        timeSeconds: 7,
+        frame: 210,
+        protocolVersion: 1,
+      }),
+      "*",
+    );
   });
 
   it("does not throw when contentWindow access raises (cross-origin embed)", () => {
@@ -1393,6 +1651,39 @@ describe("HyperframesPlayer volume and mute", () => {
     expect(player.hasAttribute("muted")).toBe(false);
   });
 
+  it("muted property directly mutes same-origin iframe media", () => {
+    document.body.appendChild(player);
+    const doc = document.implementation.createHTMLDocument("composition");
+    const video = doc.createElement("video");
+    const authoredMuted = doc.createElement("audio");
+    authoredMuted.defaultMuted = true;
+    doc.body.append(video, authoredMuted);
+    stubIframeContentDocument(player.iframeElement, doc);
+
+    player.muted = true;
+    expect(video.muted).toBe(true);
+    expect(authoredMuted.muted).toBe(true);
+
+    player.muted = false;
+    expect(video.muted).toBe(false);
+    expect(authoredMuted.muted).toBe(true);
+  });
+
+  it("muted property mutes iframe-realm media elements", () => {
+    document.body.appendChild(player);
+    const { doc, video, audio } = createForeignFrameMediaDocument();
+    audio.defaultMuted = true;
+    stubIframeContentDocument(player.iframeElement, doc);
+
+    player.muted = true;
+    expect(video.muted).toBe(true);
+    expect(audio.muted).toBe(true);
+
+    player.muted = false;
+    expect(video.muted).toBe(false);
+    expect(audio.muted).toBe(true);
+  });
+
   it("sends set-volume control to iframe", () => {
     document.body.appendChild(player);
 
@@ -1447,6 +1738,19 @@ describe("HyperframesPlayer volume and mute", () => {
     expect(slider.getAttribute("tabindex")).toBe("0");
   });
 
+  it("removes and recreates one controls bar when the controls attribute toggles", () => {
+    document.body.appendChild(player);
+
+    player.setAttribute("controls", "");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(1);
+
+    player.removeAttribute("controls");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(0);
+
+    player.setAttribute("controls", "");
+    expect(player.shadowRoot!.querySelectorAll(".hfp-controls")).toHaveLength(1);
+  });
+
   it("dispatches volumechange when muted toggles (HTML5 spec)", () => {
     document.body.appendChild(player);
 
@@ -1474,5 +1778,605 @@ describe("HyperframesPlayer volume and mute", () => {
     const mutedHtml = muteBtn.innerHTML;
 
     expect(zeroVolumeHtml).not.toBe(mutedHtml);
+  });
+});
+
+// ── Audio lock ──
+
+describe("HyperframesPlayer audio lock", () => {
+  let player: HTMLElement & { muted: boolean; audioLocked: boolean };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("audioLocked property toggles the audio-locked attribute", () => {
+    document.body.appendChild(player);
+
+    player.audioLocked = true;
+    expect(player.hasAttribute("audio-locked")).toBe(true);
+
+    player.audioLocked = false;
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+  });
+
+  it("forces muted when audio-locked is set", () => {
+    document.body.appendChild(player);
+    expect(player.hasAttribute("muted")).toBe(false);
+
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("re-asserts mute when something tries to unmute while locked", () => {
+    document.body.appendChild(player);
+    player.setAttribute("audio-locked", "");
+
+    // Direct property unmute
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(true);
+
+    // Raw attribute removal
+    player.removeAttribute("muted");
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("allows unmute again once unlocked", () => {
+    document.body.appendChild(player);
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+
+    // Unlock does NOT auto-unmute — it only lifts the restriction.
+    player.removeAttribute("audio-locked");
+    expect(player.muted).toBe(true);
+
+    // Now the viewer/host can unmute.
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(false);
+  });
+
+  it("hides the volume controls when locked after controls exist", () => {
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).not.toBe("none");
+
+    player.setAttribute("audio-locked", "");
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("hides the volume controls when controls are created while already locked", () => {
+    player.setAttribute("audio-locked", "");
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("restores the volume controls when unlocked", () => {
+    player.setAttribute("controls", "");
+    player.setAttribute("audio-locked", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+
+    player.removeAttribute("audio-locked");
+    expect(volumeWrap.style.display).not.toBe("none");
+  });
+});
+
+describe("HyperframesPlayer runtime ready handshake", () => {
+  // When the iframe runtime announces `{type: "ready"}` the player replays
+  // current bridge state (muted, volume, playback rate) so any control message
+  // that arrived before the iframe runtime registered its listener isn't lost.
+  // This fixes a deterministic race on warm-cache reloads of claude.ai and
+  // inside the Claude desktop Electron client where the iframe finishes
+  // loading after the player has already set audio-locked.
+  interface PlayerInternal extends HTMLElement {
+    muted: boolean;
+    volume: number;
+    audioLocked: boolean;
+    playbackRate: number;
+    ready: boolean;
+    duration: number;
+    paused: boolean;
+    iframe: HTMLIFrameElement;
+    _onMessage: (event: MessageEvent) => void;
+  }
+
+  let player: PlayerInternal;
+  let frameWindow: Window;
+  let postSpy: ReturnType<typeof vi.spyOn>;
+
+  function readyMessage() {
+    return new MessageEvent("message", {
+      source: frameWindow,
+      data: { source: "hf-preview", type: "ready" },
+    });
+  }
+
+  function timelineMessage(durationInFrames = 120) {
+    return new MessageEvent("message", {
+      source: frameWindow,
+      data: {
+        source: "hf-preview",
+        type: "timeline",
+        durationInFrames,
+        scenes: [],
+      },
+    });
+  }
+
+  function findControlCalls(action: string) {
+    return postSpy.mock.calls.filter((call) => {
+      const data = call[0] as { type?: string; action?: string };
+      return data?.type === "control" && data?.action === action;
+    });
+  }
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as PlayerInternal;
+    frameWindow = window;
+    postSpy = vi.spyOn(frameWindow, "postMessage").mockImplementation(() => undefined);
+    Object.defineProperty(player.iframe, "contentWindow", {
+      configurable: true,
+      get: () => frameWindow,
+    });
+    document.body.appendChild(player);
+  });
+
+  afterEach(() => {
+    player.remove();
+    vi.restoreAllMocks();
+  });
+
+  it("replays current muted state when runtime emits ready", () => {
+    player.muted = true;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    const muteCalls = findControlCalls("set-muted");
+    expect(muteCalls).toHaveLength(1);
+    expect(muteCalls[0]?.[0]).toMatchObject({
+      source: "hf-parent",
+      type: "control",
+      action: "set-muted",
+      muted: true,
+    });
+  });
+
+  it("replays volume and playback-rate alongside muted", () => {
+    player.volume = 0.5;
+    player.playbackRate = 1.25;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-muted")).toHaveLength(1);
+    expect(findControlCalls("set-volume")[0]?.[0]).toMatchObject({
+      action: "set-volume",
+      volume: 0.5,
+    });
+    expect(findControlCalls("set-playback-rate")[0]?.[0]).toMatchObject({
+      action: "set-playback-rate",
+      playbackRate: 1.25,
+    });
+  });
+
+  it("keeps runtime WebAudio media enabled outside slideshow embeds", () => {
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-native-media-sync-disabled")[0]?.[0]).toMatchObject({
+      action: "set-native-media-sync-disabled",
+      disabled: false,
+    });
+    expect(findControlCalls("set-web-audio-media-disabled")[0]?.[0]).toMatchObject({
+      action: "set-web-audio-media-disabled",
+      disabled: false,
+    });
+  });
+
+  it("disables runtime WebAudio media inside slideshow embeds", () => {
+    const slideshow = document.createElement("hyperframes-slideshow");
+    slideshow.appendChild(player);
+    document.body.appendChild(slideshow);
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-native-media-sync-disabled")[0]?.[0]).toMatchObject({
+      action: "set-native-media-sync-disabled",
+      disabled: true,
+    });
+    expect(findControlCalls("set-web-audio-media-disabled")[0]?.[0]).toMatchObject({
+      action: "set-web-audio-media-disabled",
+      disabled: true,
+    });
+    slideshow.remove();
+  });
+
+  it("replays the muted state forced by audio-locked", () => {
+    // The audio-locked attribute is the original motivating case for this
+    // handshake — its `muted = true` side effect must survive an iframe race.
+    player.setAttribute("audio-locked", "");
+    expect(player.muted).toBe(true);
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+
+    const muteCalls = findControlCalls("set-muted");
+    expect(muteCalls).toHaveLength(1);
+    expect(muteCalls[0]?.[0]).toMatchObject({ action: "set-muted", muted: true });
+  });
+
+  it("replays again on a second ready (idempotent — iframe reloads emit again)", () => {
+    player.muted = true;
+    postSpy.mockClear();
+
+    player._onMessage(readyMessage());
+    player._onMessage(readyMessage());
+
+    expect(findControlCalls("set-muted")).toHaveLength(2);
+  });
+
+  it("ignores ready events from a different window", () => {
+    postSpy.mockClear();
+    const otherSource = {} as Window;
+
+    player._onMessage(
+      new MessageEvent("message", {
+        source: otherSource,
+        data: { source: "hf-preview", type: "ready" },
+      }),
+    );
+
+    expect(findControlCalls("set-muted")).toHaveLength(0);
+  });
+
+  it("treats a cross-origin runtime timeline message as player ready", () => {
+    const readyEvents: Array<{ duration: number }> = [];
+    player.addEventListener("ready", (event) => {
+      readyEvents.push((event as CustomEvent<{ duration: number }>).detail);
+    });
+
+    player._onMessage(timelineMessage(120));
+
+    expect(player.ready).toBe(true);
+    expect(player.duration).toBe(4);
+    expect(readyEvents).toEqual([{ duration: 4 }]);
+  });
+
+  it("honors autoplay after cross-origin runtime timeline readiness", () => {
+    player.setAttribute("autoplay", "");
+    postSpy.mockClear();
+
+    player._onMessage(timelineMessage(120));
+
+    expect(player.paused).toBe(false);
+    expect(findControlCalls("play")).toHaveLength(1);
+  });
+
+  it("rescales the iframe on cross-origin timeline readiness even without a stage-size message", () => {
+    // Regression: the runtime's postTimeline() only sends `stage-size` when it
+    // can resolve the root's data-width/data-height at that instant — a race
+    // that can lose on first paint. onRuntimeTimelineReady must not depend on
+    // stage-size having arrived, or the iframe is left unscaled/untranslated
+    // (rendered pinned to the top-left instead of centered and fit).
+    Object.defineProperty(player, "offsetWidth", { value: 400, configurable: true });
+    Object.defineProperty(player, "offsetHeight", { value: 300, configurable: true });
+
+    expect(player.iframe.style.transform).toBe("");
+
+    player._onMessage(timelineMessage(120));
+
+    expect(player.iframe.style.transform).not.toBe("");
+    expect(player.iframe.style.transform).toContain("translate(-50%, -50%)");
+  });
+
+  it("warns at most once per instance when rescale keeps no-oping after ready", () => {
+    // A player that stays zero-size after ready (hidden tab, collapsed
+    // carousel card) keeps getting rescale attempts from every subsequent
+    // width/height attribute change and ResizeObserver tick. The diagnostic
+    // warning must not spam the console once per instance.
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    player._onMessage(timelineMessage(120)); // first no-op after ready
+    player.setAttribute("width", "800"); // still zero-size — would no-op again
+    player.setAttribute("height", "450"); // ditto
+
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("HyperframesPlayer audio lock — Claude desktop UA fallback", () => {
+  // Some host renderers (observed on the Claude desktop Electron client) strip
+  // unknown custom-element attributes before they reach the DOM, so the
+  // `audio-locked` attribute is lost. The player self-imposes the lock based
+  // on UA detection so chat-host audio stays muted even without the attribute.
+  let player: HTMLElement & { muted: boolean; audioLocked: boolean };
+  let originalUserAgent: PropertyDescriptor | undefined;
+
+  function stubUserAgent(ua: string) {
+    Object.defineProperty(navigator, "userAgent", {
+      value: ua,
+      configurable: true,
+    });
+  }
+
+  beforeEach(async () => {
+    originalUserAgent = Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(navigator),
+      "userAgent",
+    );
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    if (originalUserAgent) {
+      Object.defineProperty(Object.getPrototypeOf(navigator), "userAgent", originalUserAgent);
+    }
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("forces muted on Claude desktop UA even without the audio-locked attribute", () => {
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+    expect(player.muted).toBe(true);
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("re-asserts mute on Claude desktop when something tries to unmute", () => {
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    document.body.appendChild(player);
+
+    player.muted = false;
+    expect(player.hasAttribute("muted")).toBe(true);
+
+    player.removeAttribute("muted");
+    expect(player.hasAttribute("muted")).toBe(true);
+  });
+
+  it("hides the volume controls on Claude desktop without the attribute", () => {
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    player.setAttribute("controls", "");
+    document.body.appendChild(player);
+
+    const volumeWrap = player.shadowRoot!.querySelector(".hfp-volume-wrap") as HTMLElement;
+    expect(volumeWrap.style.display).toBe("none");
+  });
+
+  it("does NOT force mute on a regular browser UA", () => {
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.hasAttribute("audio-locked")).toBe(false);
+    expect(player.muted).toBe(false);
+    expect(player.hasAttribute("muted")).toBe(false);
+  });
+
+  it("does NOT force mute on Electron apps that aren't Claude desktop", () => {
+    // Other Electron clients (e.g. VS Code embedded view) shouldn't be muted.
+    stubUserAgent(
+      "Mozilla/5.0 (Macintosh) AppleWebKit/537.36 Chrome/126.0.0.0 Electron/31.0.0 Safari/537.36",
+    );
+
+    document.body.appendChild(player);
+
+    expect(player.muted).toBe(false);
+  });
+
+  it("keeps `audioLocked` property reflecting only the attribute, not the UA fallback", () => {
+    // External consumers (pacific widget, etc.) read `audioLocked` to mirror
+    // their own state. The UA fallback is an internal safety net and must not
+    // leak into the public property — otherwise unsetting `audioLocked` would
+    // appear to have no effect from the consumer's perspective.
+    stubUserAgent("Claude/1.11187.4 Chrome/126.0.0.0 Electron/31.0.0");
+    document.body.appendChild(player);
+
+    expect(player.audioLocked).toBe(false);
+  });
+});
+
+// ── Playback rate ──
+
+describe("HyperframesPlayer playback rate", () => {
+  let player: HTMLElement & {
+    playbackRate: number;
+    iframeElement: HTMLIFrameElement;
+  };
+  let mockAudio: {
+    preload: string;
+    src: string;
+    muted: boolean;
+    volume: number;
+    playbackRate: number;
+    currentTime: number;
+    load: ReturnType<typeof vi.fn>;
+    play: ReturnType<typeof vi.fn>;
+    pause: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+
+    mockAudio = {
+      preload: "",
+      src: "",
+      muted: false,
+      volume: 1,
+      playbackRate: 1,
+      currentTime: 0,
+      load: vi.fn(),
+      play: vi.fn().mockResolvedValue(undefined),
+      pause: vi.fn(),
+    };
+    vi.spyOn(globalThis, "Audio").mockImplementation(
+      () => mockAudio as unknown as HTMLAudioElement,
+    );
+
+    player = document.createElement("hyperframes-player") as typeof player;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    document.body.innerHTML = "";
+  });
+
+  it("defaults playbackRate to 1", () => {
+    document.body.appendChild(player);
+    expect(player.playbackRate).toBe(1);
+  });
+
+  it("clamps playbackRate to [0.1, 5]", () => {
+    document.body.appendChild(player);
+
+    player.playbackRate = 100;
+    expect(player.playbackRate).toBe(5);
+    // Assert the reflected attribute directly so the setter clamp is pinned
+    // independently of the getter clamp.
+    expect(player.getAttribute("playback-rate")).toBe("5");
+
+    player.playbackRate = 0.01;
+    expect(player.playbackRate).toBe(0.1);
+    expect(player.getAttribute("playback-rate")).toBe("0.1");
+  });
+
+  it("falls back to 1 for a non-positive or non-finite playbackRate", () => {
+    document.body.appendChild(player);
+
+    player.playbackRate = -2;
+    expect(player.playbackRate).toBe(1);
+    expect(player.getAttribute("playback-rate")).toBe("1");
+
+    player.playbackRate = 0;
+    expect(player.playbackRate).toBe(1);
+
+    player.playbackRate = NaN;
+    expect(player.playbackRate).toBe(1);
+  });
+
+  it("propagates the clamped rate to parent media, never an out-of-range value", () => {
+    player.setAttribute("audio-src", "https://cdn.example.com/narration.mp3");
+    document.body.appendChild(player);
+
+    player.setAttribute("playback-rate", "50");
+    expect(mockAudio.playbackRate).toBe(5);
+
+    player.setAttribute("playback-rate", "0.01");
+    expect(mockAudio.playbackRate).toBe(0.1);
+  });
+
+  it("sends the clamped rate as a set-playback-rate control to the iframe", () => {
+    document.body.appendChild(player);
+
+    const postMessageSpy = vi.fn();
+    Object.defineProperty(player.iframeElement, "contentWindow", {
+      value: { postMessage: postMessageSpy },
+      configurable: true,
+    });
+
+    player.setAttribute("playback-rate", "50");
+    expect(postMessageSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: "hf-parent",
+        type: "control",
+        action: "set-playback-rate",
+        playbackRate: 5,
+      }),
+      "*",
+    );
+  });
+
+  it("clamps an out-of-range value set directly via the attribute on read", () => {
+    document.body.appendChild(player);
+
+    player.setAttribute("playback-rate", "999");
+    expect(player.playbackRate).toBe(5);
+  });
+});
+
+// ── Composition dimension attributes ──
+//
+// width/height feed scaleIframeToFit's `w / compositionWidth` division. A
+// non-numeric, zero, or negative attribute must fall back to the defaults
+// instead of reaching the scale math as NaN (invalid `scale(NaN)` transform)
+// or zero (division by zero) — both blank the player with no signal.
+
+describe("HyperframesPlayer composition dimension attributes", () => {
+  type PlayerWithDimensions = HTMLElement & {
+    _compositionWidth?: number;
+    _compositionHeight?: number;
+  };
+
+  let player: PlayerWithDimensions;
+
+  beforeEach(async () => {
+    await import("./hyperframes-player.js");
+    player = document.createElement("hyperframes-player") as PlayerWithDimensions;
+    document.body.appendChild(player);
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("applies a valid width and height", () => {
+    player.setAttribute("width", "1280");
+    player.setAttribute("height", "720");
+    expect(player._compositionWidth).toBe(1280);
+    expect(player._compositionHeight).toBe(720);
+  });
+
+  it("falls back to defaults for non-numeric values", () => {
+    player.setAttribute("width", "abc");
+    player.setAttribute("height", "abc");
+    expect(player._compositionWidth).toBe(1920);
+    expect(player._compositionHeight).toBe(1080);
+  });
+
+  it("falls back to defaults for zero", () => {
+    player.setAttribute("width", "0");
+    player.setAttribute("height", "0");
+    expect(player._compositionWidth).toBe(1920);
+    expect(player._compositionHeight).toBe(1080);
+  });
+
+  it("falls back to defaults for negative values", () => {
+    player.setAttribute("width", "-500");
+    player.setAttribute("height", "-500");
+    expect(player._compositionWidth).toBe(1920);
+    expect(player._compositionHeight).toBe(1080);
+  });
+
+  it("recovers the defaults when the attribute is removed", () => {
+    player.setAttribute("width", "1280");
+    player.removeAttribute("width");
+    expect(player._compositionWidth).toBe(1920);
   });
 });

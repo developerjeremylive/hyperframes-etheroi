@@ -9,6 +9,7 @@ import {
   relative as nodeRelative,
   isAbsolute as nodeIsAbsolute,
 } from "node:path";
+import { fileURLToPath } from "node:url";
 
 export interface RenderPaths {
   absoluteProjectDir: string;
@@ -17,7 +18,9 @@ export interface RenderPaths {
 
 const DEFAULT_RENDERS_DIR =
   process.env.PRODUCER_RENDERS_DIR ??
-  nodeResolve(new URL(import.meta.url).pathname, "../../..", "renders");
+  // fileURLToPath (not URL.pathname): on Windows .pathname is "/D:/..." which
+  // resolves to a bogus renders dir.
+  nodeResolve(fileURLToPath(import.meta.url), "../../..", "renders");
 
 type PathModuleLike = {
   resolve: (...segments: string[]) => string;
@@ -107,6 +110,14 @@ export function toExternalAssetKey(absPath: string): string {
   normalised = normalised.replace(/^([A-Za-z]):\/?/, "$1/");
 
   return "hf-ext/" + normalised;
+}
+
+export function formatCaptureFrameName(index: number, ext: string): string {
+  return `frame_${String(index).padStart(6, "0")}.${ext}`;
+}
+
+export function formatExportFrameName(index: number, ext: string): string {
+  return `frame_${String(index + 1).padStart(6, "0")}.${ext}`;
 }
 
 export function resolveRenderPaths(

@@ -1,3 +1,4 @@
+// fallow-ignore-file unused-file code-duplication complexity
 /**
  * Audio Extractor Service
  *
@@ -8,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { getFfmpegBinary, trackChildProcess } from "@hyperframes/engine";
 
 export interface AudioElement {
   id: string;
@@ -81,7 +83,8 @@ export function parseAudioElements(html: string): AudioElement[] {
  */
 function runFFmpeg(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", args);
+    const ffmpeg = spawn(getFfmpegBinary(), args);
+    trackChildProcess(ffmpeg);
     let stderr = "";
 
     ffmpeg.stderr.on("data", (data) => {
@@ -204,13 +207,16 @@ async function mixTracks(
     const trimDuration = track.duration > 0 ? track.duration : totalDuration;
 
     filterParts.push(
-      `[${i}:a]atrim=0:${trimDuration},volume=${track.volume},adelay=${delayMs}|${delayMs},apad=whole_dur=${totalDuration}[a${i}]`,
+      `[${i}:a]atrim=0:${trimDuration},volume=${track.volume},adelay=${delayMs}|${delayMs},apad,atrim=0:${totalDuration}[a${i}]`,
     );
   });
 
   const mixInputs = tracks.map((_, i) => `[a${i}]`).join("");
-  const mixFilter = `${mixInputs}amix=inputs=${tracks.length}:duration=longest:normalize=0[out]`;
-  const fullFilter = [...filterParts, mixFilter].join(";");
+  // amix divides by track count by default (normalize=true). Compensate with
+  // a volume gain to preserve per-track levels across all FFmpeg versions.
+  const mixFilter = `${mixInputs}amix=inputs=${tracks.length}:duration=longest[mixed]`;
+  const postMixGain = `[mixed]volume=${tracks.length}[out]`;
+  const fullFilter = [...filterParts, mixFilter, postMixGain].join(";");
 
   const args = [
     ...inputs,

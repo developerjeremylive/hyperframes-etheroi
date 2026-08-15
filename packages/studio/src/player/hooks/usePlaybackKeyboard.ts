@@ -9,6 +9,7 @@
 import { useRef, useCallback } from "react";
 import { useCaptionStore } from "../../captions/store";
 import { shouldIgnorePlaybackShortcutEvent, SHUTTLE_SPEEDS } from "../lib/playbackShortcuts";
+import { canvasNudgeKeysClaimed } from "../../utils/canvasNudgeGate";
 import { usePlayerStore } from "../store/playerStore";
 import { stepFrameTime, STUDIO_PREVIEW_FPS } from "../lib/time";
 import type { PlaybackAdapter } from "../lib/playbackTypes";
@@ -97,6 +98,10 @@ export function usePlaybackKeyboard({
         togglePlay();
         return;
       }
+      // A nudgeable canvas selection owns the arrow keys (DomEditOverlay moves
+      // the element); frame-stepping would double-handle the same keystroke.
+      const arrowStep = e.code === "ArrowLeft" || e.code === "ArrowRight";
+      if (arrowStep && canvasNudgeKeysClaimed()) return;
       if (e.code === "ArrowLeft") {
         e.preventDefault();
         stepFrames(e.shiftKey ? -10 : -1);
@@ -108,6 +113,18 @@ export function usePlaybackKeyboard({
         return;
       }
       if (e.repeat) return;
+      if (key === "m") {
+        e.preventDefault();
+        const state = usePlayerStore.getState();
+        state.setAudioMuted(!state.audioMuted);
+        return;
+      }
+      if (key === "l" && e.shiftKey) {
+        e.preventDefault();
+        const state = usePlayerStore.getState();
+        state.setLoopEnabled(!state.loopEnabled);
+        return;
+      }
       if (key === "k") {
         e.preventDefault();
         pause();
@@ -167,23 +184,38 @@ export function usePlaybackKeyboard({
   playbackKeyDownRef.current = handlePlaybackKeyDown;
   playbackKeyUpRef.current = handlePlaybackKeyUp;
 
+  // fallow-ignore-next-line complexity
   const attachIframeShortcutListeners = useCallback(() => {
     iframeShortcutCleanupRef.current?.();
     iframeShortcutCleanupRef.current = null;
 
-    const iframeWin = iframeRef.current?.contentWindow;
-    const iframeDoc = iframeRef.current?.contentDocument;
+    let iframeWin: Window | null = null;
+    let iframeDoc: Document | null = null;
+    try {
+      iframeWin = iframeRef.current?.contentWindow ?? null;
+      iframeDoc = iframeRef.current?.contentDocument ?? null;
+    } catch {
+      return;
+    }
     if (!iframeWin && !iframeDoc) return;
 
     const handleIframeKeyDown = (e: KeyboardEvent) => playbackKeyDownRef.current(e);
     const handleIframeKeyUp = (e: KeyboardEvent) => playbackKeyUpRef.current(e);
-    iframeWin?.addEventListener("keydown", handleIframeKeyDown, true);
-    iframeWin?.addEventListener("keyup", handleIframeKeyUp, true);
+    try {
+      iframeWin?.addEventListener("keydown", handleIframeKeyDown, true);
+      iframeWin?.addEventListener("keyup", handleIframeKeyUp, true);
+    } catch {
+      /* cross-origin iframe */
+    }
     iframeDoc?.addEventListener("keydown", handleIframeKeyDown, true);
     iframeDoc?.addEventListener("keyup", handleIframeKeyUp, true);
     iframeShortcutCleanupRef.current = () => {
-      iframeWin?.removeEventListener("keydown", handleIframeKeyDown, true);
-      iframeWin?.removeEventListener("keyup", handleIframeKeyUp, true);
+      try {
+        iframeWin?.removeEventListener("keydown", handleIframeKeyDown, true);
+        iframeWin?.removeEventListener("keyup", handleIframeKeyUp, true);
+      } catch {
+        /* cross-origin iframe */
+      }
       iframeDoc?.removeEventListener("keydown", handleIframeKeyDown, true);
       iframeDoc?.removeEventListener("keyup", handleIframeKeyUp, true);
     };

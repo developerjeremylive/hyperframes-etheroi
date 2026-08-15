@@ -20,7 +20,7 @@ export function isFinitePositive(value: number): boolean {
   return Number.isFinite(value) && value > 0;
 }
 
-export function clampTime(time: number, duration: number): number {
+function clampTime(time: number, duration: number): number {
   const safeDuration = Math.max(0, Number.isFinite(duration) ? duration : 0);
   const safeTime = Math.max(0, Number.isFinite(time) ? time : 0);
   return safeDuration > 0 ? Math.min(safeTime, safeDuration) : safeTime;
@@ -113,17 +113,87 @@ export function createStaticSeekPlaybackAdapter(
       playing = false;
       stopTicker();
     },
-    seek: (time) => {
+    seek: (time, options) => {
       renderSeek(time);
-      if (playing) {
-        playStartTime = currentTime;
-        playStartNow = clock.now();
+      if (options?.keepPlaying) {
+        if (playing) {
+          playStartTime = currentTime;
+          playStartNow = clock.now();
+        }
+        return;
       }
+      // Default seek aligns with wrapTimeline: stop the RAF ticker so the
+      // adapter's `playing` flag matches the public seek contract instead of
+      // silently driving renderSeek in the background.
+      playing = false;
+      stopTicker();
     },
     getTime: () => currentTime,
     getDuration: () => safeDuration,
     isPlaying: () => playing,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Static-seek fallback cache
+// ---------------------------------------------------------------------------
+
+export type StaticSeekCacheEntry = {
+  player: RuntimePlaybackAdapter | PlaybackAdapter;
+  duration: number;
+  adapter: PlaybackAdapter;
+};
+
+type StaticSeekCacheRef = { current: StaticSeekCacheEntry | null };
+type WarnedRef = { current: boolean };
+
+/**
+ * Pause and drop the cached static-seek adapter. Must be called whenever
+ * adapter selection switches to a native adapter — a cached static-seek
+ * adapter that was mid-play keeps its private rAF loop seeking the player
+ * forever otherwise, fighting the native transport. Also re-arms the
+ * downgrade warning so a later re-downgrade is surfaced again.
+ */
+export function releaseStaticSeekCache(cache: StaticSeekCacheRef, warned: WarnedRef): void {
+  cache.current?.adapter.pause();
+  cache.current = null;
+  warned.current = false;
+}
+
+/**
+ * Resolve (with caching) the seek-driven fallback adapter. Warns once per
+ * downgrade streak: seek-driven playback never starts media elements or
+ * WebAudio, so without the warning the downgrade silently loses audio.
+ */
+export function resolveStaticSeekFallback(opts: {
+  cache: StaticSeekCacheRef;
+  warned: WarnedRef;
+  bestAdapter: RuntimePlaybackAdapter | PlaybackAdapter;
+  effectiveDuration: number;
+  docDuration: number;
+  clock: StaticSeekPlaybackClock;
+  getPlaybackRate: () => number;
+}): PlaybackAdapter {
+  const { cache, warned, bestAdapter, effectiveDuration, docDuration } = opts;
+  const cached = cache.current;
+  if (cached?.player === bestAdapter && cached.duration === effectiveDuration) {
+    return cached.adapter;
+  }
+  cached?.adapter.pause();
+  if (!warned.current) {
+    warned.current = true;
+    console.warn(
+      `[useTimelinePlayer] Selected adapter duration (${getAdapterDuration(bestAdapter)}s) does not cover the document duration (${docDuration}s); falling back to seek-driven playback, which never starts media elements or WebAudio. Audio will not play in preview — extend the GSAP timeline to cover the declared data-duration.`,
+    );
+  }
+  const adapter = createStaticSeekPlaybackAdapter(
+    bestAdapter,
+    effectiveDuration,
+    opts.clock,
+    opts.getPlaybackRate,
+  );
+  cache.current = { player: bestAdapter, duration: effectiveDuration, adapter };
+  return adapter;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,8 +205,10 @@ export function wrapTimeline(tl: TimelineLike): PlaybackAdapter {
     play: () => tl.play(),
     pause: () => tl.pause(),
     seek: (t, options) => {
-      if (!options?.keepPlaying) tl.pause();
+      const shouldPause = !options?.keepPlaying;
+      if (shouldPause) tl.pause();
       tl.seek(t);
+      if (shouldPause) tl.pause();
     },
     getTime: () => tl.time(),
     getDuration: () => tl.duration(),

@@ -1,10 +1,18 @@
-import { useState, useCallback, useRef, useEffect, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import type { EditingFile } from "../utils/studioHelpers";
 import { FONT_EXT, isMediaFile } from "../utils/mediaTypes";
 import { fontFamilyFromAssetPath, type ImportedFontAsset } from "../components/editor/fontAssets";
-import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
 import type { EditHistoryKind } from "../utils/editHistory";
 import { findTagByTarget, type PatchTarget } from "../utils/sourcePatcher";
+import {
+  createStudioSaveHttpError,
+  retryStudioSave,
+  StudioFileConflictError,
+  StudioSaveNetworkError,
+} from "../utils/studioSaveDiagnostics";
+import { studioExpectedFileVersion, studioWriteHeaders } from "../utils/studioFileVersion";
+import { useFileTree } from "./useFileTree";
+import { useEditorSave } from "./useEditorSave";
 
 // ── Types ──
 
@@ -32,15 +40,10 @@ export function useFileManager({
   domEditSaveTimestampRef,
   setRefreshKey,
 }: UseFileManagerOptions) {
-  // ── State ──
+  // ── Shared refs ──
 
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
-  const [projectDir, setProjectDir] = useState<string | null>(null);
-  const [fileTree, setFileTree] = useState<string[]>([]);
-  const [fileTreeLoaded, setFileTreeLoaded] = useState(false);
   const [revealSourceOffset, setRevealSourceOffset] = useState<number | null>(null);
-
-  // ── Refs ──
 
   const editingPathRef = useRef(editingFile?.path);
   editingPathRef.current = editingFile?.path;
@@ -48,134 +51,212 @@ export function useFileManager({
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
 
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const importedFontAssetsRef = useRef<ImportedFontAsset[]>([]);
+  const fileVersionScope = useMemo(
+    () => ({ projectId, versions: new Map<string, string | null>() }),
+    [projectId],
+  );
+  const fileVersions = fileVersionScope.versions;
+  const observeProjectFileVersion = useCallback(
+    (path: string, version: string | null) => {
+      fileVersions.set(path, version);
+    },
+    [fileVersions],
+  );
 
-  // ── Load file tree when projectId changes ──
+  // ── File tree ──
 
-  // eslint-disable-next-line no-restricted-syntax
-  useEffect(() => {
-    if (!projectId) {
-      setFileTreeLoaded(false);
-      return;
-    }
-    let cancelled = false;
-    setFileTreeLoaded(false);
-    fetch(`/api/projects/${projectId}`)
-      .then((r) => r.json())
-      .then((data: { files?: string[]; dir?: string }) => {
-        if (!cancelled && data.files) setFileTree(data.files);
-        if (!cancelled) setProjectDir(typeof data.dir === "string" ? data.dir : null);
-      })
-      .catch(() => {
-        if (!cancelled) setProjectDir(null);
-      })
-      .finally(() => {
-        if (!cancelled) setFileTreeLoaded(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [projectId]);
+  const {
+    projectDir,
+    fileTree,
+    setFileTree,
+    fileTreeLoaded,
+    refreshFileTree,
+    compositions,
+    assets,
+    fontAssets,
+  } = useFileTree({ projectId, projectIdRef });
 
   // ── Core file I/O ──
 
-  const readProjectFile = useCallback(async (path: string): Promise<string> => {
-    const pid = projectIdRef.current;
-    if (!pid) throw new Error("No active project");
-    const response = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`);
-    if (!response.ok) throw new Error(`Failed to read ${path}`);
-    const data = (await response.json()) as { content?: string };
-    if (typeof data.content !== "string") throw new Error(`Missing file contents for ${path}`);
-    return data.content;
-  }, []);
+  const readProjectFile = useCallback(
+    async (path: string): Promise<string> => {
+      if (!projectId) throw new Error("No active project");
+      const response = await fetch(
+        `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(path)}`,
+      );
+      if (!response.ok) throw new Error(`Failed to read ${path}`);
+      const data = (await response.json()) as { content?: string; version?: string };
+      if (typeof data.content !== "string") throw new Error(`Missing file contents for ${path}`);
+      fileVersions.set(path, data.version ?? response.headers.get("etag"));
+      return data.content;
+    },
+    [fileVersions, projectId],
+  );
 
-  const writeProjectFile = useCallback(async (path: string, content: string): Promise<void> => {
-    const pid = projectIdRef.current;
-    if (!pid) throw new Error("No active project");
-    const response = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "text/plain" },
-      body: content,
-    });
-    if (!response.ok) throw new Error(`Failed to save ${path}`);
+  const writeProjectFile = useCallback(
+    async (path: string, content: string, expectedContent?: string): Promise<void> => {
+      if (!projectId) throw new Error("No active project");
+      const writeProjectId = projectId;
+      let expectedVersion = await studioExpectedFileVersion(fileVersions, path, expectedContent);
+      if (expectedVersion === undefined) {
+        const preflight = await fetch(
+          `/api/projects/${encodeURIComponent(writeProjectId)}/files/${encodeURIComponent(path)}`,
+        );
+        if (preflight.ok) {
+          const data = (await preflight.json()) as { content?: string; version?: string };
+          throw new StudioFileConflictError({
+            filePath: path,
+            currentVersion: data.version ?? preflight.headers.get("etag"),
+            currentContent: data.content ?? null,
+            attemptedContent: content,
+          });
+        } else if (preflight.status === 404) {
+          expectedVersion = null;
+        } else {
+          throw await createStudioSaveHttpError(preflight, `Failed to read ${path} before save`);
+        }
+      }
+      await retryStudioSave(async () => {
+        // Each request gets its own receipt identity. If a committed request loses its response,
+        // the retry can produce a second filesystem receipt that must be suppressed independently.
+        let response: Response;
+        try {
+          response = await fetch(
+            `/api/projects/${encodeURIComponent(writeProjectId)}/files/${encodeURIComponent(path)}`,
+            {
+              method: "PUT",
+              headers: {
+                "Content-Type": "text/plain",
+                ...studioWriteHeaders(),
+                ...(expectedVersion ? { "If-Match": expectedVersion } : { "If-None-Match": "*" }),
+              },
+              body: content,
+            },
+          );
+        } catch (error) {
+          throw new StudioSaveNetworkError(`Failed to save ${path}: network error`, {
+            cause: error,
+          });
+        }
+        if (response.status === 409) {
+          const conflict = (await response.json().catch(() => null)) as {
+            currentVersion?: string | null;
+            currentContent?: string | null;
+          } | null;
+          const currentVersion = conflict?.currentVersion ?? null;
+          if (currentVersion && conflict?.currentContent === content) {
+            fileVersions.set(path, currentVersion);
+            return;
+          }
+          throw new StudioFileConflictError({
+            filePath: path,
+            currentVersion,
+            currentContent: conflict?.currentContent ?? null,
+            attemptedContent: content,
+          });
+        }
+        if (!response.ok) throw await createStudioSaveHttpError(response, `Failed to save ${path}`);
+        const result = (await response.json()) as { version?: string };
+        const version = result.version ?? response.headers.get("etag");
+        if (!version)
+          throw new Error(`Save response for ${path} did not include a content version`);
+        fileVersions.set(path, version);
+      });
+      if (projectIdRef.current === writeProjectId && editingPathRef.current === path) {
+        setEditingFile({ path, content });
+      }
+    },
+    [fileVersions, projectId],
+  );
+
+  const updateEditingFileContent = useCallback((path: string, content: string) => {
     if (editingPathRef.current === path) {
       setEditingFile({ path, content });
     }
   }, []);
 
-  const readOptionalProjectFile = useCallback(async (path: string): Promise<string> => {
-    const pid = projectIdRef.current;
-    if (!pid) throw new Error("No active project");
-    const response = await fetch(
-      `/api/projects/${pid}/files/${encodeURIComponent(path)}?optional=1`,
-    );
-    if (!response.ok) throw new Error(`Failed to read ${path}`);
-    const data = (await response.json()) as { content?: string };
-    return typeof data.content === "string" ? data.content : "";
-  }, []);
+  const readOptionalProjectFile = useCallback(
+    async (path: string): Promise<string> => {
+      if (!projectId) throw new Error("No active project");
+      const response = await fetch(
+        `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(path)}?optional=1`,
+      );
+      if (!response.ok) throw new Error(`Failed to read ${path}`);
+      const data = (await response.json()) as { content?: string; version?: string };
+      fileVersions.set(path, data.version ?? response.headers.get("etag"));
+      return typeof data.content === "string" ? data.content : "";
+    },
+    [fileVersions, projectId],
+  );
+
+  // ── Editor save (debounced content change) ──
+
+  const editorSave = useEditorSave({
+    editingPathRef,
+    projectIdRef,
+    readProjectFile,
+    writeProjectFile,
+    recordEdit,
+    domEditSaveTimestampRef,
+    setRefreshKey,
+    showToast,
+  });
+  const { saveRafRef, handleContentChange } = editorSave;
+
+  const overwriteExternalConflict = useCallback(
+    async (conflict: StudioFileConflictError) => {
+      if (conflict.currentContent != null) {
+        await writeProjectFile(
+          conflict.filePath,
+          conflict.attemptedContent,
+          conflict.currentContent,
+        );
+      } else {
+        fileVersions.set(conflict.filePath, conflict.currentVersion);
+        await writeProjectFile(conflict.filePath, conflict.attemptedContent);
+      }
+      updateEditingFileContent(conflict.filePath, conflict.attemptedContent);
+    },
+    [fileVersions, updateEditingFileContent, writeProjectFile],
+  );
 
   // ── File select ──
 
-  const handleFileSelect = useCallback((path: string) => {
-    const pid = projectIdRef.current;
-    if (!pid) return;
-    // Skip fetching binary content for media files — just set the path for preview
-    if (isMediaFile(path)) {
-      setEditingFile({ path, content: null });
-      return;
-    }
-    fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`)
-      .then((r) => r.json())
-      .then((data: { content?: string }) => {
-        if (data.content != null) {
-          setEditingFile({ path, content: data.content });
-        }
-      })
-      .catch(() => {});
-  }, []);
-
-  // ── Content change (debounced save) ──
-
-  const handleContentChange = useCallback(
-    (content: string) => {
-      const pid = projectIdRef.current;
-      if (!pid) return;
-      const path = editingPathRef.current;
-      if (!path) return;
-
-      // Debounce the server write (600ms)
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-      saveTimerRef.current = setTimeout(() => {
-        // Suppress the file-change watcher echo — the save callback triggers
-        // its own refresh, so a second one from the watcher causes a double-reload
-        // race that can leave the player in a non-playable state.
-        domEditSaveTimestampRef.current = Date.now();
-        saveProjectFilesWithHistory({
-          projectId: pid,
-          label: "Edit source",
-          kind: "source",
-          coalesceKey: `source:${path}`,
-          files: { [path]: content },
-          readFile: readProjectFile,
-          writeFile: writeProjectFile,
-          recordEdit,
-        })
-          .then(() => {
-            if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
-            refreshTimerRef.current = setTimeout(() => setRefreshKey((k) => k + 1), 600);
-          })
-          .catch(() => {});
-      }, 600);
-    },
-    [domEditSaveTimestampRef, readProjectFile, recordEdit, setRefreshKey, writeProjectFile],
-  );
-
-  // ── Open source for selection (click-to-source) ──
-
   const revealRequestIdRef = useRef(0);
   const revealAbortRef = useRef<AbortController | null>(null);
+
+  const handleFileSelect = useCallback(
+    (path: string) => {
+      const pid = projectIdRef.current;
+      if (!pid) return;
+      revealAbortRef.current?.abort();
+      revealAbortRef.current = null;
+      revealRequestIdRef.current++;
+      // Skip fetching binary content for media files — just set the path for preview
+      if (isMediaFile(path)) {
+        setEditingFile({ path, content: null });
+        return;
+      }
+      fetch(`/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(path)}`)
+        .then((r) => {
+          if (!r.ok) throw new Error(`Failed to load ${path} (${r.status})`);
+          return r.json();
+        })
+        .then((data: { content?: string; version?: string }) => {
+          if (data.content != null) {
+            fileVersions.set(path, data.version ?? null);
+            setEditingFile({ path, content: data.content });
+          }
+        })
+        .catch((err: unknown) => {
+          showToast(err instanceof Error ? err.message : `Failed to load ${path}`, "error");
+        });
+    },
+    [fileVersions, showToast],
+  );
+
+  // ── Click-to-source ──
 
   const openSourceForSelection = useCallback(
     (sourceFile: string, target: PatchTarget) => {
@@ -191,13 +272,14 @@ export function useFileManager({
       const requestId = ++revealRequestIdRef.current;
       const controller = new AbortController();
       revealAbortRef.current = controller;
-      fetch(`/api/projects/${pid}/files/${encodeURIComponent(sourceFile)}`, {
+      fetch(`/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(sourceFile)}`, {
         signal: controller.signal,
       })
         .then((r) => r.json())
-        .then((data: { content?: string }) => {
+        .then((data: { content?: string; version?: string }) => {
           if (requestId !== revealRequestIdRef.current) return;
           if (data.content != null) {
+            fileVersions.set(sourceFile, data.version ?? null);
             setEditingFile({ path: sourceFile, content: data.content });
             const match = findTagByTarget(data.content, target);
             setRevealSourceOffset(match ? match.start : null);
@@ -205,18 +287,8 @@ export function useFileManager({
         })
         .catch(() => {});
     },
-    [editingFile?.content],
+    [editingFile?.content, fileVersions],
   );
-
-  // ── File tree refresh ──
-
-  const refreshFileTree = useCallback(async () => {
-    const pid = projectIdRef.current;
-    if (!pid) return;
-    const res = await fetch(`/api/projects/${pid}`);
-    const data = await res.json();
-    if (data.files) setFileTree(data.files);
-  }, []);
 
   // ── Upload ──
 
@@ -233,7 +305,7 @@ export function useFileManager({
 
       const qs = dir ? `?dir=${encodeURIComponent(dir)}` : "";
       try {
-        const res = await fetch(`/api/projects/${pid}/upload${qs}`, {
+        const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/upload${qs}`, {
           method: "POST",
           body: formData,
         });
@@ -262,7 +334,7 @@ export function useFileManager({
     [refreshFileTree, setRefreshKey, showToast],
   );
 
-  // ── File management handlers ──
+  // ── File CRUD ──
 
   const handleCreateFile = useCallback(
     async (path: string) => {
@@ -273,29 +345,32 @@ export function useFileManager({
         content =
           '<!DOCTYPE html>\n<html>\n<head>\n  <meta charset="UTF-8">\n</head>\n<body>\n\n</body>\n</html>\n';
       }
-      const res = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain" },
-        body: content,
-      });
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(path)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "text/plain" },
+          body: content,
+        },
+      );
       if (res.ok) {
         await refreshFileTree();
         handleFileSelect(path);
       } else {
         const err = await res.json().catch(() => ({ error: "unknown" }));
         console.error(`Create file failed: ${err.error}`);
+        showToast(`Couldn't create ${path}: ${err.error}`, "error");
       }
     },
-    [refreshFileTree, handleFileSelect],
+    [refreshFileTree, handleFileSelect, showToast],
   );
 
   const handleCreateFolder = useCallback(
     async (path: string) => {
       const pid = projectIdRef.current;
       if (!pid) return;
-      // Create a .gitkeep inside the folder so it appears in the tree
       const res = await fetch(
-        `/api/projects/${pid}/files/${encodeURIComponent(path + "/.gitkeep")}`,
+        `/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(path + "/.gitkeep")}`,
         {
           method: "POST",
           headers: { "Content-Type": "text/plain" },
@@ -307,58 +382,66 @@ export function useFileManager({
       } else {
         const err = await res.json().catch(() => ({ error: "unknown" }));
         console.error(`Create folder failed: ${err.error}`);
+        showToast(`Couldn't create folder ${path}: ${err.error}`, "error");
       }
     },
-    [refreshFileTree],
+    [refreshFileTree, showToast],
   );
 
   const handleDeleteFile = useCallback(
     async (path: string) => {
       const pid = projectIdRef.current;
       if (!pid) return;
-      const res = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(path)}`, {
-        method: "DELETE",
-      });
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(path)}`,
+        {
+          method: "DELETE",
+        },
+      );
       if (res.ok) {
         if (editingPathRef.current === path) setEditingFile(null);
         await refreshFileTree();
       } else {
         const err = await res.json().catch(() => ({ error: "unknown" }));
         console.error(`Delete failed: ${err.error}`);
+        showToast(`Couldn't delete ${path}: ${err.error}`, "error");
       }
     },
-    [refreshFileTree],
+    [refreshFileTree, showToast],
   );
 
   const handleRenameFile = useCallback(
     async (oldPath: string, newPath: string) => {
       const pid = projectIdRef.current;
       if (!pid) return;
-      const res = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(oldPath)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ newPath }),
-      });
+      const res = await fetch(
+        `/api/projects/${encodeURIComponent(pid)}/files/${encodeURIComponent(oldPath)}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ newPath }),
+        },
+      );
       if (res.ok) {
         if (editingPathRef.current === oldPath) {
           handleFileSelect(newPath);
         }
         await refreshFileTree();
-        // Refresh preview — references in compositions may have been updated
         setRefreshKey((k) => k + 1);
       } else {
         const err = await res.json().catch(() => ({ error: "unknown" }));
         console.error(`Rename failed: ${err.error}`);
+        showToast(`Couldn't rename ${oldPath}: ${err.error}`, "error");
       }
     },
-    [refreshFileTree, handleFileSelect, setRefreshKey],
+    [refreshFileTree, handleFileSelect, setRefreshKey, showToast],
   );
 
   const handleDuplicateFile = useCallback(
     async (path: string) => {
       const pid = projectIdRef.current;
       if (!pid) return;
-      const res = await fetch(`/api/projects/${pid}/duplicate-file`, {
+      const res = await fetch(`/api/projects/${encodeURIComponent(pid)}/duplicate-file`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path }),
@@ -370,9 +453,10 @@ export function useFileManager({
       } else {
         const err = await res.json().catch(() => ({ error: "unknown" }));
         console.error(`Duplicate failed: ${err.error}`);
+        showToast(`Couldn't duplicate ${path}: ${err.error}`, "error");
       }
     },
-    [refreshFileTree, handleFileSelect],
+    [refreshFileTree, handleFileSelect, showToast],
   );
 
   const handleMoveFile = handleRenameFile;
@@ -386,17 +470,18 @@ export function useFileManager({
 
   const handleImportFonts = useCallback(
     async (files: FileList | File[]): Promise<ImportedFontAsset[]> => {
+      const pid = projectIdRef.current;
+      if (!pid) return [];
       const uploaded = await uploadProjectFiles(
         Array.from(files).filter((file) => FONT_EXT.test(file.name)),
         "assets/fonts",
       );
-      const pid = projectIdRef.current;
       const imported = uploaded
         .filter((asset) => FONT_EXT.test(asset))
         .map((asset) => ({
           family: fontFamilyFromAssetPath(asset),
           path: asset,
-          url: `/api/projects/${pid}/preview/${asset}`,
+          url: `/api/projects/${encodeURIComponent(pid)}/preview/${asset}`,
         }));
       importedFontAssetsRef.current = [
         ...imported,
@@ -408,31 +493,6 @@ export function useFileManager({
       return imported;
     },
     [uploadProjectFiles],
-  );
-
-  // ── Derived state ──
-
-  const compositions = useMemo(
-    () => fileTree.filter((f) => f === "index.html" || f.startsWith("compositions/")),
-    [fileTree],
-  );
-
-  const assets = useMemo(
-    () =>
-      fileTree.filter((f) => !f.endsWith(".html") && !f.endsWith(".md") && !f.endsWith(".json")),
-    [fileTree],
-  );
-
-  const fontAssets = useMemo<ImportedFontAsset[]>(
-    () =>
-      assets
-        .filter((asset) => FONT_EXT.test(asset))
-        .map((asset) => ({
-          family: fontFamilyFromAssetPath(asset),
-          path: asset,
-          url: `/api/projects/${projectId}/preview/${asset}`,
-        })),
-    [assets, projectId],
   );
 
   // ── Return ──
@@ -449,13 +509,19 @@ export function useFileManager({
     // Refs
     editingPathRef,
     projectIdRef,
-    saveTimerRef,
+    saveRafRef,
+    flushPendingSourceSave: editorSave.flushPendingSave,
+    discardPendingSourceSave: editorSave.discardPendingSave,
+    getPendingSourceCandidate: editorSave.getPendingCandidate,
     importedFontAssetsRef,
 
     // Core I/O
     readProjectFile,
     writeProjectFile,
+    overwriteExternalConflict,
     readOptionalProjectFile,
+    observeProjectFileVersion,
+    updateEditingFileContent,
 
     // Click-to-source
     revealSourceOffset,

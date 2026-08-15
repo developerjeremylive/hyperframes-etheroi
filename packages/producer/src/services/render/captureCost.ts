@@ -16,9 +16,11 @@ import {
   type CaptureOptions,
   type CaptureSession,
   type EngineConfig,
+  type WorkerSizing,
   calculateOptimalWorkers,
   captureFrameToBuffer,
   closeCaptureSession,
+  computeWorkerSizing,
   createCaptureSession,
   initializeSession,
 } from "@hyperframes/engine";
@@ -26,6 +28,7 @@ import type { CompiledComposition } from "../htmlCompiler.js";
 import type { FileServerHandle } from "../fileServer.js";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
 import type { RenderJob } from "../renderOrchestrator.js";
+import { normalizeErrorMessage } from "../../utils/errorMessage.js";
 
 export interface CaptureCostEstimate {
   multiplier: number;
@@ -52,11 +55,10 @@ export const CAPTURE_CALIBRATION_TARGET_MS = 600;
 export const MAX_MEASURED_CAPTURE_COST_MULTIPLIER = 8;
 
 /**
- * CDP protocol timeout used while running calibration. Bounded below
- * the normal `cfg.protocolTimeout` so a wedged BeginFrame calibration
- * times out fast and falls back to screenshot mode (see the
- * `shouldFallbackToScreenshotAfterCalibrationError` path in the
- * sequencer).
+ * CDP protocol timeout used while running calibration. This is a ceiling,
+ * not a floor — a wedged BeginFrame must time out fast so the sequencer
+ * can fall back to screenshot mode via
+ * `shouldFallbackToScreenshotAfterCalibrationError`.
  */
 export const CAPTURE_CALIBRATION_PROTOCOL_TIMEOUT_MS = 30_000;
 
@@ -106,6 +108,36 @@ function combineCaptureCostEstimates(
   };
 }
 
+/**
+ * Advisory heap warning (field OOM, 0.7.66 on 24GB: auto-picked 6 workers
+ * blew Node's default ~4GB heap). Returns the warning message, or undefined
+ * when it should not fire:
+ *
+ * - Auto-sized renders only (`requestedWorkers === undefined`) — the field
+ *   failure was auto sizing, and an explicit `--workers N` is the operator's
+ *   own call.
+ * - Not enforced as a cap yet — the per-worker budget constant is derived
+ *   from one field report; the `workers_heap_*` telemetry emitted with the
+ *   sizing decides whether to enforce (see the TODO on HEAP_PER_WORKER_MB in
+ *   @hyperframes/engine's parallelCoordinator). The message gives the
+ *   operator the actionable knobs today.
+ *
+ * Pure so the message shape + firing condition are unit-testable with a
+ * synthetic `WorkerSizing` (the real one depends on the host's heap).
+ */
+export function buildHeapAdvisoryWarning(
+  sizing: WorkerSizing,
+  requestedWorkers: number | undefined,
+): string | undefined {
+  if (requestedWorkers !== undefined || !sizing.exceedsHeapAdvisory) return undefined;
+  return (
+    `[Render] ${sizing.workers} capture workers may exceed this process's V8 heap ` +
+    `(limit ${sizing.heapLimitMb}MB supports ~${sizing.heapBasedWorkers}). If the render ` +
+    `dies with "JavaScript heap out of memory", raise the heap ` +
+    `(NODE_OPTIONS=--max-old-space-size=8192) or pass --workers ${sizing.heapBasedWorkers}.`
+  );
+}
+
 export function resolveRenderWorkerCount(
   totalFrames: number,
   requestedWorkers: number | undefined,
@@ -113,15 +145,49 @@ export function resolveRenderWorkerCount(
   compiled: Pick<CompiledComposition, "hasShaderTransitions" | "renderModeHints">,
   log: ProducerLogger = defaultLogger,
   measuredCaptureCost?: CaptureCostEstimate,
+  /** Sink for the sizing provenance so the orchestrator can thread it into telemetry. */
+  onSizing?: (sizing: WorkerSizing) => void,
 ): number {
+  // TODO(htmlInCanvas): workaround — Chrome's experimental drawElementImage
+  // API (CanvasDrawElement) is non-deterministic across concurrent browser
+  // instances due to paint-cache races and SwiftShader contention.
+  // Remove this clamp once Chromium stabilizes CanvasDrawElement for
+  // concurrent use.
+  const reasonCodes = new Set(compiled.renderModeHints.reasons.map((r) => r.code));
+  if (reasonCodes.has("htmlInCanvas")) {
+    log.warn(
+      "[Render] html-in-canvas (drawElementImage) detected — pinning to 1 worker (Chrome concurrency limitation).",
+      { requestedWorkers },
+    );
+    return 1;
+  }
+
+  // Low-memory safe profile pins capture to a single worker (unless the user
+  // asked for a specific count) so the pipeline never runs N concurrent
+  // Chrome instances on a constrained host. Kept here, alongside the other
+  // worker-count decisions, so the "why workers=N" log stays coherent across
+  // every path into capture.
+  if (cfg.lowMemoryMode && requestedWorkers === undefined) {
+    log.info(
+      "[Render] Low-memory profile — pinning to 1 capture worker (auto-worker calibration skipped).",
+    );
+    return 1;
+  }
+
   const captureCost = combineCaptureCostEstimates(
     estimateCaptureCostMultiplier(compiled),
     measuredCaptureCost,
   );
-  const workerCount = calculateOptimalWorkers(totalFrames, requestedWorkers, {
+  const sizing = computeWorkerSizing(totalFrames, requestedWorkers, {
     ...cfg,
     captureCostMultiplier: captureCost.multiplier,
   });
+  // The heap advisory is deliberately NOT logged here: this function's
+  // "no unexpected warns" unit-test contract would become dependent on the
+  // test machine's actual V8 heap limit. The orchestrator's onSizing consumer
+  // emits it via buildHeapAdvisoryWarning.
+  onSizing?.(sizing);
+  const workerCount = sizing.workers;
 
   if (requestedWorkers !== undefined || captureCost.multiplier <= 1) {
     return workerCount;
@@ -195,22 +261,43 @@ export async function measureCaptureCostFromSession(
   session: CaptureSession,
   totalFrames: number,
   fps: number,
+  log?: ProducerLogger,
 ): Promise<{ estimate: CaptureCostEstimate; samples: CaptureCalibrationSample[] }> {
   const sampledFrames = selectCaptureCalibrationFrames(totalFrames);
   const samples: CaptureCalibrationSample[] = [];
+  const totalSamples = sampledFrames.length;
 
-  for (const frameIndex of sampledFrames) {
-    const time = frameIndex / fps;
-    const startedAt = Date.now();
-    const result = await captureFrameToBuffer(session, frameIndex, time);
-    samples.push({
-      frameIndex,
-      captureTimeMs: result.captureTimeMs || Date.now() - startedAt,
-    });
+  // Calibration samples are SPARSE and non-contiguous, so static-frame dedup must not
+  // fire here: a sampled frame in the static set would reuse a far-away sample's buffer
+  // in ~0ms, both corrupting the per-frame cost estimate and returning the wrong pixels.
+  // Bypass dedup for the calibration sweep; restore the armed set (and clear the
+  // calibration-era buffer) so the real render that reuses this session still dedups.
+  const savedStaticFrames = session.staticFrames;
+  session.staticFrames = undefined;
+  try {
+    for (let i = 0; i < sampledFrames.length; i++) {
+      const frameIndex = sampledFrames[i]!;
+      log?.info(`Calibration: capturing test frame ${i + 1}/${totalSamples}...`);
+      const time = frameIndex / fps;
+      const startedAt = Date.now();
+      const result = await captureFrameToBuffer(session, frameIndex, time);
+      samples.push({
+        frameIndex,
+        captureTimeMs: result.captureTimeMs || Date.now() - startedAt,
+      });
+    }
+  } finally {
+    session.staticFrames = savedStaticFrames;
+    session.lastFrameBuffer = undefined;
+  }
+
+  const estimate = estimateMeasuredCaptureCostMultiplier(samples);
+  if (estimate.p95Ms !== undefined) {
+    log?.info(`Calibration complete, estimated cost: ${estimate.p95Ms}ms/frame (p95)`);
   }
 
   return {
-    estimate: estimateMeasuredCaptureCostMultiplier(samples),
+    estimate,
     samples,
   };
 }
@@ -267,6 +354,7 @@ export interface CaptureCalibrationOutcome {
  * the fallback fires (BeginFrame is no longer the active capture mode,
  * so the probe session is no longer reusable).
  */
+// fallow-ignore-next-line complexity
 export async function runCaptureCalibration(input: {
   cfg: EngineConfig;
   fileServer: FileServerHandle;
@@ -307,6 +395,7 @@ export async function runCaptureCalibration(input: {
     sessionDir: string,
     sessionCfg: EngineConfig,
   ): Promise<{ estimate: CaptureCostEstimate; samples: CaptureCalibrationSample[] }> => {
+    log.info("Launching browser for capture calibration...");
     const session = await createCaptureSession(
       fileServer.url,
       sessionDir,
@@ -316,15 +405,32 @@ export async function runCaptureCalibration(input: {
     );
     sessionRef.current = session;
     if (!session.isInitialized) {
-      await initializeSession(session);
+      log.info("Initializing calibration session...");
+      const calInitStart = Date.now();
+      const calHeartbeat = setInterval(() => {
+        const elapsed = ((Date.now() - calInitStart) / 1000).toFixed(1);
+        log.info(`Still waiting for browser initialization... (${elapsed}s elapsed)`);
+      }, 30_000);
+      try {
+        await initializeSession(session);
+      } finally {
+        clearInterval(calHeartbeat);
+      }
     }
     assertNotAborted();
-    const result = await measureCaptureCostFromSession(session, totalFrames, fps);
+    log.info("Calibration session ready, capturing test frames...");
+    const result = await measureCaptureCostFromSession(session, totalFrames, fps, log);
     logCaptureCalibrationResult(result, log);
     return result;
   };
 
   const calibrationCfg = createCaptureCalibrationConfig({ ...cfg, forceScreenshot });
+  log.info("[Render] Calibration config", {
+    protocolTimeout: calibrationCfg.protocolTimeout,
+    parentProtocolTimeout: cfg.protocolTimeout,
+    forceScreenshot,
+    totalFrames,
+  });
   let calibration:
     | { estimate: CaptureCostEstimate; samples: CaptureCalibrationSample[] }
     | undefined;
@@ -403,7 +509,7 @@ export async function runCaptureCalibration(input: {
  * protocol errors that recover cleanly under screenshot mode.
  */
 export function shouldFallbackToScreenshotAfterCalibrationError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = normalizeErrorMessage(error);
   return /HeadlessExperimental\.beginFrame timed out|beginFrame probe timeout|Another frame is pending|Frame still pending|Protocol error.*HeadlessExperimental\.beginFrame|Runtime\.callFunctionOn timed out|Runtime\.evaluate timed out/i.test(
     message,
   );

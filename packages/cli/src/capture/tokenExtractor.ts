@@ -234,6 +234,55 @@ const EXTRACT_SCRIPT = `(() => {
     }
   }
 
+  // 4e. Per-color signal stats — distinguish FILL vs TEXT vs INTERACTIVE vs
+  // large-AREA usage. The flat colorSet above ranks by total weight (so the
+  // canvas/text dominate); these per-color signals let downstream code find the
+  // BRAND color (chromatic, used on interactive/repeated fills) apart from
+  // section surfaces (one big block) and link/text colors. Single pass.
+  var colorStats = {};
+  function statFor(hex) {
+    if (!colorStats[hex]) colorStats[hex] = { count: 0, bgCount: 0, interactiveBg: 0, areaBg: 0, textCount: 0, maxArea: 0 };
+    return colorStats[hex];
+  }
+  var statEls = Array.from(allEls).slice(0, 9000);
+  for (var ti = 0; ti < statEls.length; ti++) {
+    try {
+      var sEl = statEls[ti];
+      var sCs = getComputedStyle(sEl);
+      if (sCs.display === "none" || sCs.visibility === "hidden") continue;
+      var sRect = sEl.getBoundingClientRect();
+      var sArea = sRect.width * sRect.height;
+      var sTag = sEl.tagName.toLowerCase();
+      var sRole = sEl.getAttribute("role") || "";
+      var sCls = sEl.getAttribute("class") || "";
+      var sInteractive = sTag === "a" || sTag === "button" ||
+        sRole === "button" || sRole === "link" || sRole === "menuitem" || sRole === "tab" ||
+        /\\b(btn|button|cta|primary|action)\\b/i.test(sCls);
+      var sBg = sCs.backgroundColor;
+      if (sBg && sBg !== "rgba(0, 0, 0, 0)" && sBg !== "transparent") {
+        var bgHex = rgbToHex(sBg);
+        if (bgHex) {
+          var st = statFor(bgHex);
+          st.count++; st.bgCount++;
+          if (sInteractive) st.interactiveBg++;
+          if (sArea > 50000) st.areaBg++;
+          if (sArea > st.maxArea) st.maxArea = Math.round(sArea);
+        }
+      }
+      var sColor = sCs.color;
+      if (sColor && sColor !== "rgba(0, 0, 0, 0)" && sColor !== "transparent") {
+        var txHex = rgbToHex(sColor);
+        if (txHex) { var st2 = statFor(txHex); st2.count++; st2.textCount++; }
+      }
+    } catch(e) {}
+  }
+  var colorStatsArr = Object.keys(colorStats).map(function(h) {
+    var s = colorStats[h];
+    return { hex: h, count: s.count, bgCount: s.bgCount, interactiveBg: s.interactiveBg, areaBg: s.areaBg, textCount: s.textCount, maxArea: s.maxArea };
+  }).filter(function(s) { return s.bgCount > 0 || s.interactiveBg > 0 || s.count >= 3; })
+    .sort(function(a, b) { return (b.bgCount + b.interactiveBg * 3 + b.textCount) - (a.bgCount + a.interactiveBg * 3 + a.textCount); })
+    .slice(0, 48);
+
   // 5. Headings
   var headingEls = Array.from(document.querySelectorAll("h1, h2, h3, h4")).slice(0, 20);
   var headings = headingEls.filter(isVisible).map(function(h) {
@@ -304,11 +353,41 @@ const EXTRACT_SCRIPT = `(() => {
     // Keep SVGs that have a label OR are at least 16px wide OR are inside a logo/brand context
     var inLogoContext = svg.closest('[class*="logo"], [class*="brand"], [class*="partner"], [class*="customer"], [class*="marquee"]') !== null;
     if (!label && !inLogoContext && (!w || parseInt(w) < 16)) return null;
+    var isLogo = (label && label.toLowerCase().indexOf("logo") !== -1) ||
+                 svg.closest('[class*="logo"], [class*="brand"], [class*="home"], [class*="marquee"], [class*="partner"], [class*="customer"]') !== null;
+    if (!isLogo) {
+      var bannerEl = svg.closest('header, nav, [role="banner"]');
+      if (bannerEl) {
+        var firstSvg = bannerEl.querySelector('svg');
+        if (firstSvg === svg) isLogo = true;
+      }
+    }
+    if (!isLogo) {
+      var anchor = svg.closest('a[href]');
+      if (anchor) {
+        var href = anchor.getAttribute('href') || '';
+        if (href === '/' || href === '#' || href === './' ||
+            /^https?:\\/\\/[^/]+\\/?$/.test(href)) {
+          isLogo = true;
+        }
+      }
+    }
+    if (!isLogo) {
+      var ariaLabel = svg.getAttribute('aria-label') || svg.getAttribute('title') || '';
+      var titleBrand = (document.title || '').split(/[-|—]/)[0].trim();
+      if (titleBrand.length > 1 && titleBrand.length < 30 &&
+          ariaLabel.toLowerCase().indexOf(titleBrand.toLowerCase()) !== -1) {
+        isLogo = true;
+      }
+    }
+    var rect = svg.getBoundingClientRect();
     return {
       label: label || undefined,
       viewBox: svg.getAttribute("viewBox") || undefined,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
       outerHTML: svg.outerHTML.slice(0, 10000),
-      isLogo: (label && label.toLowerCase().indexOf("logo") !== -1) || svg.closest('[class*="logo"], [class*="brand"], [class*="home"], [class*="marquee"], [class*="partner"], [class*="customer"]') !== null
+      isLogo: isLogo
     };
   }).filter(Boolean).slice(0, 50);
 
@@ -373,7 +452,45 @@ const EXTRACT_SCRIPT = `(() => {
       }
     }
     sectionBg = rgbToHex(sectionBg) || sectionBg;
-    var sectionEntry = { selector: selector, type: type, y: Math.round(y), height: Math.round(rect.height), heading: headingText, backgroundColor: sectionBg };
+    // Inner content for faithful page-card recreation downstream: CTAs, body
+    // text, in-section media URLs (remote — joined to local paths in index.ts),
+    // and a coarse layout hint. Mirrors the prior capture framework's richer
+    // section model that the page-scroll-spotlight blueprint depends on.
+    var absUrl = function (u) {
+      try { return u ? new URL(u, location.href).href : ""; } catch (e) { return ""; }
+    };
+    var sectionText = (el.innerText || el.textContent || "").trim().replace(/\\s+/g, " ").slice(0, 600);
+    var sectionCtas = [];
+    var ctaNodes = el.querySelectorAll("a, button");
+    for (var qi = 0; qi < ctaNodes.length && sectionCtas.length < 8; qi++) {
+      if (!isVisible(ctaNodes[qi])) continue;
+      var ctaTxt = (ctaNodes[qi].textContent || "").trim().replace(/\\s+/g, " ").slice(0, 60);
+      if (ctaTxt && ctaTxt.length > 1 && sectionCtas.indexOf(ctaTxt) === -1) sectionCtas.push(ctaTxt);
+    }
+    var sectionAssets = [];
+    var mediaNodes = el.querySelectorAll("img, video, source");
+    for (var ii = 0; ii < mediaNodes.length && sectionAssets.length < 10; ii++) {
+      var mn = mediaNodes[ii];
+      var msrc = mn.currentSrc || mn.src || mn.getAttribute("src") || mn.getAttribute("data-src") || mn.getAttribute("poster") || "";
+      var mau = absUrl(msrc);
+      if (mau && !mau.startsWith("data:") && sectionAssets.indexOf(mau) === -1) sectionAssets.push(mau);
+    }
+    if (sectionBgImage) {
+      var bau = absUrl(sectionBgImage);
+      if (bau && sectionAssets.indexOf(bau) === -1) sectionAssets.unshift(bau);
+    }
+    var imgCount = el.querySelectorAll("img").length;
+    var layout = "stacked";
+    if (imgCount >= 3) layout = "grid";
+    else if (el.querySelector("img, video") && headingText) layout = "split";
+    else if (headingText && imgCount === 0) layout = "centered";
+    var sectionEntry = {
+      selector: selector, type: type,
+      x: Math.round(rect.left + window.scrollX), y: Math.round(y),
+      width: Math.round(rect.width), height: Math.round(rect.height),
+      heading: headingText, backgroundColor: sectionBg,
+      callsToAction: sectionCtas, text: sectionText, layout: layout, assetUrls: sectionAssets
+    };
     if (sectionBgImage) sectionEntry.backgroundImage = sectionBgImage;
     sectionResults.push(sectionEntry);
   }
@@ -400,7 +517,9 @@ const EXTRACT_SCRIPT = `(() => {
     title: title, description: description, ogImage: ogImage,
     cssVariables: filteredVars, fonts: Object.keys(fontMap).map(function(k) { var f = fontMap[k]; f.weights.sort(function(a,b){return a-b;}); return f; }).filter(function(f) { return f.weights.length > 0 || f.variable; }).slice(0, 20), colors: Object.keys(colorSet).sort(function(a,b) { return colorSet[b] - colorSet[a]; }).slice(0, 20),
     headings: headings, ctas: ctas,
-    svgs: svgs, sections: filteredSections
+    svgs: svgs, sections: filteredSections,
+    colorStats: colorStatsArr,
+    page: { width: Math.round(document.documentElement.scrollWidth), height: Math.round(document.documentElement.scrollHeight), viewport: { width: window.innerWidth, height: window.innerHeight } }
   };
 })()`;
 

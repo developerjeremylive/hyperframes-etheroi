@@ -17,5 +17,23 @@
       "target": "compositions/vfx-portal.html",
       "type": "hyperframes:composition"
     }
+  ],
+  "preview": {
+    "video": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-portal.mp4",
+    "poster": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-portal.png"
+  },
+  "params": [
+    {
+      "key": "--bg-color",
+      "label": "Background",
+      "type": "color",
+      "default": "#000000"
+    },
+    {
+      "key": "--portal-color",
+      "label": "Portal color",
+      "type": "color",
+      "default": "#fafafa"
+    }
   ]
 }

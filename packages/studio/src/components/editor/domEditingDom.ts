@@ -3,6 +3,8 @@
  * selector utilities, and composition source resolution.
  * No imports from other domEditing* modules — safe to import from anywhere.
  */
+import { COLOR_GRADING_SOURCE_HIDDEN_ATTR } from "@hyperframes/core/color-grading";
+import { getSourceScopedSelectorIndex } from "../../utils/sourceScopedSelectorIndex";
 import { CURATED_STYLE_PROPERTIES } from "./domEditingTypes";
 
 // ─── Type guard ───────────────────────────────────────────────────────────────
@@ -19,42 +21,32 @@ export function isHtmlElement(value: unknown): value is HTMLElement {
 
 // ─── Style parsing ────────────────────────────────────────────────────────────
 
-export function parsePx(value: string | undefined): number | null {
-  if (!value) return null;
-  const trimmed = value.trim();
-  if (!trimmed.endsWith("px")) return null;
-  const parsed = parseFloat(trimmed);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function isIdentityTransform(value: string | undefined): boolean {
-  const transform = (value ?? "none").trim();
-  if (!transform || transform === "none") return true;
-
-  const matrix = transform.match(/^matrix\(([^)]+)\)$/i);
-  if (matrix) {
-    const values = matrix[1].split(",").map((part) => Number.parseFloat(part.trim()));
-    if (values.length !== 6 || values.some((part) => !Number.isFinite(part))) return false;
-    return (
-      Math.abs(values[0] - 1) < 0.0001 &&
-      Math.abs(values[1]) < 0.0001 &&
-      Math.abs(values[2]) < 0.0001 &&
-      Math.abs(values[3] - 1) < 0.0001 &&
-      Math.abs(values[4]) < 0.0001 &&
-      Math.abs(values[5]) < 0.0001
-    );
-  }
-
-  const matrix3d = transform.match(/^matrix3d\(([^)]+)\)$/i);
-  if (!matrix3d) return false;
-  const values = matrix3d[1].split(",").map((part) => Number.parseFloat(part.trim()));
-  if (values.length !== 16 || values.some((part) => !Number.isFinite(part))) return false;
-  const identity = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
-  return values.every((part, index) => Math.abs(part - identity[index]) < 0.0001);
-}
+// Single source of truth lives in @hyperframes/core/editing so the studio
+// callers and the core resolver can't drift. Re-exported here to keep this
+// module's public surface (6 studio callers import parsePx from it).
+export { parsePx } from "@hyperframes/core/editing";
 
 export function isTextBearingTag(tagName: string): boolean {
   return ["div", "span", "p", "strong", "h1", "h2", "h3", "h4", "h5", "h6"].includes(tagName);
+}
+
+export function isElementVisibleThroughAncestors(el: HTMLElement): boolean {
+  const win = el.ownerDocument.defaultView;
+  if (!win) return true;
+  let current: HTMLElement | null = el;
+  while (current) {
+    const computed = win.getComputedStyle(current);
+    if (computed.display === "none" || computed.visibility === "hidden") return false;
+    const opacity = Number.parseFloat(computed.opacity);
+    if (
+      Number.isFinite(opacity) &&
+      opacity <= 0.01 &&
+      !current.hasAttribute(COLOR_GRADING_SOURCE_HIDDEN_ATTR)
+    )
+      return false;
+    current = current.parentElement;
+  }
+  return true;
 }
 
 // ─── Style accessors ──────────────────────────────────────────────────────────
@@ -107,18 +99,32 @@ export function findClosestByAttribute(
   }
   return null;
 }
+// ─── Composition source resolution ───────────────────────────────────────────
 
-export function getElementDepth(el: HTMLElement): number {
-  let depth = 0;
-  let current = el.parentElement;
-  while (current) {
-    depth += 1;
-    current = current.parentElement;
-  }
-  return depth;
+// The runtime INLINES subcompositions and strips the source-file linkage from the
+// mounted root (it keeps `data-composition-id` but drops `data-composition-src`/
+// `-file`), so a subcomp element's DOM ancestors no longer say which file it came
+// from. This project-global map (composition-id → source file, built once from
+// index.html's clips — see NLEContext/EditorShell) recovers it. The studio loads one project at a
+// time, so module scope is the right lifetime; it's empty until set, in which case
+// resolution falls back to the historical attribute-only behavior.
+let compositionSourceMap: Map<string, string> = new Map();
+
+export function setCompositionSourceMap(map: Map<string, string>): void {
+  compositionSourceMap = map;
 }
 
-// ─── Composition source resolution ───────────────────────────────────────────
+function sourceFromCompositionId(ownerRoot: HTMLElement | null): string | undefined {
+  if (!ownerRoot || compositionSourceMap.size === 0) return undefined;
+  // The runtime may rename the mounted id to a runtime-unique one, preserving the
+  // authored id on `data-hf-original-composition-id` — prefer that, then the current id.
+  const authored = ownerRoot.getAttribute("data-hf-original-composition-id");
+  const current = ownerRoot.getAttribute("data-composition-id");
+  return (
+    (authored ? compositionSourceMap.get(authored) : undefined) ??
+    (current ? compositionSourceMap.get(current) : undefined)
+  );
+}
 
 export function getSourceFileForElement(
   el: HTMLElement,
@@ -131,6 +137,7 @@ export function getSourceFileForElement(
     sourceHost?.getAttribute("data-composition-src") ??
     ownerRoot?.getAttribute("data-composition-file") ??
     ownerRoot?.getAttribute("data-composition-src") ??
+    sourceFromCompositionId(ownerRoot) ??
     activeCompositionPath ??
     "index.html";
 
@@ -163,7 +170,7 @@ export function normalizeTimelineCompositionSource(value: string | undefined): s
 
 // ─── CSS escaping ─────────────────────────────────────────────────────────────
 
-export function escapeCssIdentifier(value: string): string {
+function escapeCssIdentifier(value: string): string {
   const css = globalThis.CSS as { escape?: (input: string) => string } | undefined;
   if (typeof css?.escape === "function") return css.escape(value);
 
@@ -214,7 +221,7 @@ export function querySelectorAllSafely(doc: Document, selector: string): Element
   }
 }
 
-export function humanizeIdentifier(value: string): string {
+function humanizeIdentifier(value: string): string {
   return (
     value
       .replace(/\.html$/i, "")
@@ -234,10 +241,16 @@ export function buildStableSelector(el: HTMLElement): string | undefined {
   const compositionId = el.getAttribute("data-composition-id");
   if (compositionId) return `[data-composition-id="${escapeCssString(compositionId)}"]`;
 
+  // Group wrappers carry no id/class; their data-hf-group value is the unique,
+  // stable handle the source mutations write — use it so the wrapper is
+  // selectable, patchable (move/scale), and addressable for ungroup.
+  const group = el.getAttribute("data-hf-group");
+  if (group) return `[data-hf-group="${escapeCssString(group)}"]`;
+
   return getPreferredClassSelector(el);
 }
 
-export function getPreferredClassSelector(el: HTMLElement): string | undefined {
+function getPreferredClassSelector(el: HTMLElement): string | undefined {
   const classes = Array.from(el.classList)
     .map((value) => value.trim())
     .filter(Boolean);
@@ -245,6 +258,34 @@ export function getPreferredClassSelector(el: HTMLElement): string | undefined {
   const preferred =
     classes.find((value) => value !== "clip" && !value.startsWith("__hf-")) ?? classes[0];
   return preferred ? `.${escapeCssIdentifier(preferred)}` : undefined;
+}
+
+// fallow-ignore-next-line complexity
+export function buildElementLabel(el: HTMLElement): string {
+  const compositionId = el.getAttribute("data-composition-id");
+  if (compositionId && compositionId !== "main") {
+    return humanizeIdentifier(compositionId);
+  }
+
+  const compositionSrc =
+    el.getAttribute("data-composition-src") ?? el.getAttribute("data-composition-file");
+  if (compositionSrc) {
+    return humanizeIdentifier(compositionSrc);
+  }
+
+  const group = el.getAttribute("data-hf-group");
+  if (group) return group;
+
+  if (el.id) return humanizeIdentifier(el.id);
+
+  const preferredClass = getPreferredClassSelector(el);
+  if (preferredClass) {
+    return humanizeIdentifier(preferredClass.replace(/^\./, ""));
+  }
+
+  const text = (el.textContent ?? "").trim().replace(/\s+/g, " ");
+  if (text) return text.length > 40 ? `${text.slice(0, 39)}…` : text;
+  return el.tagName.toLowerCase();
 }
 
 export function getSelectorIndex(
@@ -256,11 +297,9 @@ export function getSelectorIndex(
 ): number | undefined {
   if (!selector?.startsWith(".")) return undefined;
 
-  const candidates = querySelectorAllSafely(doc, selector).filter(
-    (candidate): candidate is HTMLElement =>
-      isHtmlElement(candidate) &&
-      getSourceFileForElement(candidate, activeCompositionPath).sourceFile === sourceFile,
+  return getSourceScopedSelectorIndex(doc, el, selector, sourceFile, (candidate) =>
+    isHtmlElement(candidate)
+      ? getSourceFileForElement(candidate, activeCompositionPath).sourceFile
+      : undefined,
   );
-  const index = candidates.indexOf(el);
-  return index >= 0 ? index : undefined;
 }

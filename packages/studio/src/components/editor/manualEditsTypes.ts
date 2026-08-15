@@ -1,19 +1,33 @@
 /* ── Public constants ──────────────────────────────────────────────── */
-export const STUDIO_OFFSET_X_PROP = "--hf-studio-offset-x";
-export const STUDIO_OFFSET_Y_PROP = "--hf-studio-offset-y";
-export const STUDIO_WIDTH_PROP = "--hf-studio-width";
-export const STUDIO_HEIGHT_PROP = "--hf-studio-height";
+export {
+  STUDIO_OFFSET_X_PROP,
+  STUDIO_OFFSET_Y_PROP,
+  STUDIO_WIDTH_PROP,
+  STUDIO_HEIGHT_PROP,
+  STUDIO_MANUAL_EDIT_GESTURE_ATTR,
+} from "@hyperframes/core/editing/draft-markers";
 export const STUDIO_ROTATION_PROP = "--hf-studio-rotation";
 
 /* ── Internal DOM attribute names ─────────────────────────────────── */
 export const STUDIO_PATH_OFFSET_ATTR = "data-hf-studio-path-offset";
-export const STUDIO_MANUAL_EDIT_GESTURE_ATTR = "data-hf-studio-manual-edit-gesture";
 export const STUDIO_BOX_SIZE_ATTR = "data-hf-studio-box-size";
 export const STUDIO_ROTATION_ATTR = "data-hf-studio-rotation";
 export const STUDIO_ORIGINAL_TRANSLATE_ATTR = "data-hf-studio-original-translate";
 export const STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR = "data-hf-studio-original-inline-translate";
 export const STUDIO_ORIGINAL_WIDTH_ATTR = "data-hf-studio-original-width";
 export const STUDIO_ORIGINAL_HEIGHT_ATTR = "data-hf-studio-original-height";
+/**
+ * The element's laid-out box before a resize draft touched it, in CSS pixels.
+ *
+ * The two attributes above record the element's INLINE width and height so a
+ * reset can put them back, and are empty for the usual case of an element sized
+ * by the stylesheet. That made them useless as a measurement, and the resize
+ * intercept, which needs the original box to work out a scale, fell back to a
+ * hardcoded guess and produced a wildly wrong one. These record the measurement
+ * instead, and restore nothing.
+ */
+export const STUDIO_ORIGINAL_BOX_WIDTH_ATTR = "data-hf-studio-original-box-width";
+export const STUDIO_ORIGINAL_BOX_HEIGHT_ATTR = "data-hf-studio-original-box-height";
 export const STUDIO_ORIGINAL_MIN_WIDTH_ATTR = "data-hf-studio-original-min-width";
 export const STUDIO_ORIGINAL_MIN_HEIGHT_ATTR = "data-hf-studio-original-min-height";
 export const STUDIO_ORIGINAL_MAX_WIDTH_ATTR = "data-hf-studio-original-max-width";
@@ -68,6 +82,8 @@ export interface StudioBoxSizeSnapshot {
   marker: string | null;
   originalWidth: string | null;
   originalHeight: string | null;
+  originalBoxWidth: string | null;
+  originalBoxHeight: string | null;
   originalMinWidth: string | null;
   originalMinHeight: string | null;
   originalMaxWidth: string | null;

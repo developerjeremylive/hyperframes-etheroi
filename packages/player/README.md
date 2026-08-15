@@ -60,6 +60,7 @@ Show a static image before playback starts:
 | `height`               | number                          | 1080          | Composition height in pixels (aspect ratio)                                 |
 | `controls`             | boolean                         | false         | Show play/pause, scrubber, and time display                                 |
 | `muted`                | boolean                         | false         | Mute audio playback                                                         |
+| `audio-locked`         | boolean                         | false         | Force-mute and hide the volume controls so the viewer cannot turn sound on  |
 | `poster`               | string                          | —             | Image URL shown before playback starts                                      |
 | `playback-rate`        | number                          | 1             | Speed multiplier (0.5 = half, 2 = double)                                   |
 | `autoplay`             | boolean                         | false         | Start playing when ready                                                    |
@@ -81,6 +82,14 @@ When a composition uses `@hyperframes/shader-transitions`, the player can own pr
 ```
 
 `shader-loading="player"` shows the player-owned transition-prep overlay from shader progress messages. `composition` leaves direct composition fallback behavior alone, and `none` suppresses the loader.
+
+### Audio lock (host-mandated silent playback)
+
+`audio-locked` forces `muted` on and hides the volume controls, with no UI path for the viewer to turn sound back on. Use it when embedding in a chat host (Claude.ai, ChatGPT, etc.) where audio must stay off regardless of viewer intent. Setting `muted` directly is _not_ enough — viewers can flip it back via the controls bar.
+
+Removing `audio-locked` only unhides the controls; it does **not** auto-unmute. Callers manage `muted` explicitly after unlocking.
+
+**Host-environment fallback.** Some host renderers — notably the Claude desktop Electron client — strip unknown custom-element attributes before they reach the DOM, defeating the attribute. As a safety net, the player also self-imposes the lock when it detects such an environment via `navigator.userAgent`, so audio stays muted even if the attribute never arrives. The public `audioLocked` property still reflects only the attribute, so external consumers (e.g. host widgets that mirror state) are not affected by the fallback.
 
 ### Mobile audio
 
@@ -114,6 +123,7 @@ player.paused; // boolean (read-only)
 player.ready; // boolean (read-only)
 player.playbackRate; // number (read/write)
 player.muted; // boolean (read/write)
+player.audioLocked; // boolean (read/write) — force-mute + hide volume controls
 player.loop; // boolean (read/write)
 player.shaderCaptureScale; // number (read/write)
 player.shaderLoading; // "composition" | "player" | "none" (read/write)

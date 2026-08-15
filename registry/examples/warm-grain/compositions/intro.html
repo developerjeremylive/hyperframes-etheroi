@@ -8,9 +8,6 @@
     </div>
 
     <style>
-      /* Import a rounded humanist sans-serif font */
-      @import url("https://fonts.googleapis.com/css2?family=Outfit:wght@400;600&display=swap");
-
       [data-composition-id="intro"] .container {
         width: 100%;
         height: 100%;
@@ -18,7 +15,7 @@
         justify-content: flex-start; /* Align to left for speaker card */
         align-items: center;
         padding-left: 5%;
-        font-family: "Outfit", sans-serif;
+        font-family: "Inter", sans-serif;
         background: transparent;
       }
 
@@ -29,7 +26,6 @@
         box-shadow: 0 15px 40px rgba(0, 0, 0, 0.2);
         text-align: left;
         opacity: 0;
-        transform: translateX(-100%); /* Start off-screen left */
       }
 
       [data-composition-id="intro"] .title {
@@ -56,11 +52,15 @@
         const tl = gsap.timeline({ paused: true });
 
         // Animation: Speaker card slides in from the left
-        tl.to(
+        tl.fromTo(
           '[data-composition-id="intro"] .title-card',
           {
+            opacity: 0,
+            xPercent: -120,
+          },
+          {
             opacity: 1,
-            x: 0,
+            xPercent: 0,
             duration: 0.8,
             ease: "power2.out",
           },
@@ -71,7 +71,7 @@
         tl.to(
           '[data-composition-id="intro"] .title-card',
           {
-            x: "-120%",
+            xPercent: -120,
             opacity: 0,
             duration: 0.6,
             ease: "power2.in",

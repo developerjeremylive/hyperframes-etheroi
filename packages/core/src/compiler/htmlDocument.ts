@@ -13,9 +13,13 @@ const RUNTIME_INLINE_MARKERS = [
   "__hyperframeRuntimeBootstrapped",
   "__hyperframeRuntime",
   "__hyperframeRuntimeTeardown",
+  "__HF_EXPORT_RENDER_SEEK_CONFIG",
   "window.__player =",
-  "window.__playerReady",
-  "window.__renderReady",
+];
+
+const SIMPLE_RUNTIME_FLAG_ASSIGNMENTS = [
+  /^window\.__playerReady\s*=\s*(?:true|false)\s*;?$/,
+  /^window\.__renderReady\s*=\s*(?:true|false)\s*;?$/,
 ];
 
 /**
@@ -115,7 +119,20 @@ function shouldStripRuntimeScriptBlock(block: string): boolean {
   for (const marker of RUNTIME_INLINE_MARKERS) {
     if (block.includes(marker)) return true;
   }
+  const scriptSource = getScriptSource(block).trim();
+  for (const pattern of SIMPLE_RUNTIME_FLAG_ASSIGNMENTS) {
+    if (pattern.test(scriptSource)) return true;
+  }
   return false;
+}
+
+function getScriptSource(block: string): string {
+  const startTagEnd = findTagEnd(block, 1);
+  if (startTagEnd === -1) return "";
+  const loweredBlock = block.toLowerCase();
+  const closeTagStart = loweredBlock.lastIndexOf("</script");
+  const end = closeTagStart === -1 ? block.length : closeTagStart;
+  return block.slice(startTagEnd + 1, end);
 }
 
 function isTagBoundary(char: string): boolean {
@@ -157,16 +174,24 @@ function inlineScriptTags(scripts: readonly string[]): string {
   return scripts.map((source) => `<script>${escapeInlineScriptSource(source)}</script>`).join("\n");
 }
 
-export function injectScriptsAtHeadStart(html: string, scripts: readonly string[]): string {
-  if (scripts.length === 0) return html;
-  const headTags = inlineScriptTags(scripts);
+/**
+ * Insert raw tag markup at the very start of `<head>`, ahead of every author
+ * script (inline or external). Falls back to just before `<body>`, then to the
+ * top of the document, for fragments that carry neither.
+ */
+export function injectTagsAtHeadStart(html: string, tags: string): string {
   if (html.includes("<head")) {
-    return html.replace(/<head\b[^>]*>/i, (match) => `${match}\n${headTags}`);
+    return html.replace(/<head\b[^>]*>/i, (match) => `${match}\n${tags}`);
   }
   if (html.includes("<body")) {
-    return html.replace("<body", () => `${headTags}\n<body`);
+    return html.replace("<body", () => `${tags}\n<body`);
   }
-  return `${headTags}\n${html}`;
+  return `${tags}\n${html}`;
+}
+
+export function injectScriptsAtHeadStart(html: string, scripts: readonly string[]): string {
+  if (scripts.length === 0) return html;
+  return injectTagsAtHeadStart(html, inlineScriptTags(scripts));
 }
 
 export function injectScriptsIntoHtml(

@@ -11,5 +11,8 @@
       "target": "compositions/components/grain-overlay.html",
       "type": "hyperframes:snippet"
     }
-  ]
+  ],
+  "preview": {
+    "poster": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/components/grain-overlay.png"
+  }
 }

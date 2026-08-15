@@ -32,6 +32,11 @@ postMessage:
 - runtime -> parent events:
   - `source: "hf-preview"`
   - `type: "state"` and `type: "timeline"`
+  - `type: "ready"` — emitted once when `installRuntimeControlBridge` registers
+    the control-message listener. The parent uses it to replay current playback
+    state (`set-muted`, `set-volume`, `set-playback-rate`) so any control
+    message sent before the listener was installed isn't lost. Emitted again on
+    every iframe reload because the new runtime instance starts with no state.
 
 Determinism baseline:
 

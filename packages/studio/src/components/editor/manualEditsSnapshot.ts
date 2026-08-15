@@ -11,13 +11,14 @@ import {
   STUDIO_HEIGHT_PROP,
   STUDIO_ROTATION_PROP,
   STUDIO_PATH_OFFSET_ATTR,
-  STUDIO_MANUAL_EDIT_GESTURE_ATTR,
   STUDIO_BOX_SIZE_ATTR,
   STUDIO_ROTATION_ATTR,
   STUDIO_ORIGINAL_TRANSLATE_ATTR,
   STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR,
   STUDIO_ORIGINAL_WIDTH_ATTR,
   STUDIO_ORIGINAL_HEIGHT_ATTR,
+  STUDIO_ORIGINAL_BOX_WIDTH_ATTR,
+  STUDIO_ORIGINAL_BOX_HEIGHT_ATTR,
   STUDIO_ORIGINAL_MIN_WIDTH_ATTR,
   STUDIO_ORIGINAL_MIN_HEIGHT_ATTR,
   STUDIO_ORIGINAL_MAX_WIDTH_ATTR,
@@ -33,7 +34,6 @@ import {
   STUDIO_ORIGINAL_INLINE_ROTATE_ATTR,
   STUDIO_ORIGINAL_ROTATION_TRANSFORM_ORIGIN_ATTR,
   STUDIO_ROTATION_DRAFT_ATTR,
-  STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR,
 } from "./manualEditsTypes";
 import type {
   StudioBoxSizeSnapshot,
@@ -62,6 +62,8 @@ export function captureStudioBoxSize(element: HTMLElement): StudioBoxSizeSnapsho
     marker: element.getAttribute(STUDIO_BOX_SIZE_ATTR),
     originalWidth: element.getAttribute(STUDIO_ORIGINAL_WIDTH_ATTR),
     originalHeight: element.getAttribute(STUDIO_ORIGINAL_HEIGHT_ATTR),
+    originalBoxWidth: element.getAttribute(STUDIO_ORIGINAL_BOX_WIDTH_ATTR),
+    originalBoxHeight: element.getAttribute(STUDIO_ORIGINAL_BOX_HEIGHT_ATTR),
     originalMinWidth: element.getAttribute(STUDIO_ORIGINAL_MIN_WIDTH_ATTR),
     originalMinHeight: element.getAttribute(STUDIO_ORIGINAL_MIN_HEIGHT_ATTR),
     originalMaxWidth: element.getAttribute(STUDIO_ORIGINAL_MAX_WIDTH_ATTR),
@@ -130,6 +132,8 @@ export function restoreStudioBoxSize(element: HTMLElement, previous: StudioBoxSi
   restoreAttribute(element, STUDIO_BOX_SIZE_ATTR, previous.marker);
   restoreAttribute(element, STUDIO_ORIGINAL_WIDTH_ATTR, previous.originalWidth);
   restoreAttribute(element, STUDIO_ORIGINAL_HEIGHT_ATTR, previous.originalHeight);
+  restoreAttribute(element, STUDIO_ORIGINAL_BOX_WIDTH_ATTR, previous.originalBoxWidth);
+  restoreAttribute(element, STUDIO_ORIGINAL_BOX_HEIGHT_ATTR, previous.originalBoxHeight);
   restoreAttribute(element, STUDIO_ORIGINAL_MIN_WIDTH_ATTR, previous.originalMinWidth);
   restoreAttribute(element, STUDIO_ORIGINAL_MIN_HEIGHT_ATTR, previous.originalMinHeight);
   restoreAttribute(element, STUDIO_ORIGINAL_MAX_WIDTH_ATTR, previous.originalMaxWidth);
@@ -185,38 +189,22 @@ export function restoreStudioPathOffset(
     STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR,
     previous.originalInlineTranslate,
   );
-}
 
-/* ── DOM element collection ───────────────────────────────────────── */
-export function collectStudioManualEditElements(doc: Document): HTMLElement[] {
-  const htmlElement = doc.defaultView?.HTMLElement;
-  if (!htmlElement) return [];
-
-  const elements = [doc.documentElement, ...Array.from(doc.getElementsByTagName("*"))].filter(
-    (element): element is HTMLElement => element instanceof htmlElement,
-  );
-
-  return elements.filter(
-    (element) =>
-      element.hasAttribute(STUDIO_PATH_OFFSET_ATTR) ||
-      element.hasAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR) ||
-      element.hasAttribute(STUDIO_BOX_SIZE_ATTR) ||
-      element.hasAttribute(STUDIO_ROTATION_ATTR) ||
-      element.hasAttribute(STUDIO_ROTATION_DRAFT_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_TRANSLATE_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_INLINE_TRANSLATE_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_TRANSFORM_DISPLAY_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_MIN_WIDTH_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_FLEX_BASIS_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_SCALE_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_ROTATE_ATTR) ||
-      element.hasAttribute(STUDIO_ORIGINAL_INLINE_ROTATE_ATTR) ||
-      Boolean(element.style.getPropertyValue(STUDIO_OFFSET_X_PROP)) ||
-      Boolean(element.style.getPropertyValue(STUDIO_OFFSET_Y_PROP)) ||
-      Boolean(element.style.getPropertyValue(STUDIO_WIDTH_PROP)) ||
-      Boolean(element.style.getPropertyValue(STUDIO_HEIGHT_PROP)) ||
-      Boolean(element.style.getPropertyValue(STUDIO_ROTATION_PROP)),
-  );
+  // Restore GSAP x/y if a draft was applied via gsap.set during drag
+  const baseX = element.getAttribute("data-hf-drag-gsap-base-x");
+  const baseY = element.getAttribute("data-hf-drag-gsap-base-y");
+  if (baseX != null || baseY != null) {
+    const win = element.ownerDocument.defaultView as
+      | (Window & { gsap?: { set: (el: Element, vars: Record<string, unknown>) => void } })
+      | null;
+    if (win?.gsap) {
+      const x = Number.parseFloat(baseX ?? "0") || 0;
+      const y = Number.parseFloat(baseY ?? "0") || 0;
+      win.gsap.set(element, { x, y });
+    }
+    element.removeAttribute("data-hf-drag-gsap-base-x");
+    element.removeAttribute("data-hf-drag-gsap-base-y");
+  }
 }
 
 /* ── Clear functions ──────────────────────────────────────────────── */

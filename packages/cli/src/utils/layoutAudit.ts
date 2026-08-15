@@ -13,7 +13,32 @@ export type LayoutIssueCode =
   | "text_box_overflow"
   | "clipped_text"
   | "canvas_overflow"
-  | "container_overflow";
+  | "container_overflow"
+  | "content_overlap"
+  | "text_occluded"
+  | "text_not_painted"
+  | "caption_zone_collision"
+  | "frame_out_of_frame"
+  // Coordinate-frame findings — geometry computed in one frame, rendered in another.
+  | "escaped_container"
+  | "panel_out_of_canvas"
+  | "connector_detached"
+  // Cross-sample rotation finding — a spinning element whose bbox center drifts
+  // because it pivots about the wrong point (bad transformOrigin/svgOrigin).
+  | "rotation_pivot_drift"
+  // Hub-referenced rotation finding — a gauge/clock/radar pointer whose recovered
+  // center-of-rotation sits far from the dial's static hub (wrong pivot point).
+  | "off_pivot_rotation"
+  // Frozen-sweep guard (#U10) — a whole-run meta-finding, not a per-sample
+  // geometry observation; never persistence-tiered (see `applyPersistenceTier`).
+  | "sweep_static"
+  // Motion-verification findings (#1437) — evaluated against the seeked timeline.
+  | "motion_appears_late"
+  | "motion_out_of_order"
+  | "motion_off_frame"
+  | "motion_frozen"
+  | "motion_selector_missing"
+  | "motion_selector_ambiguous";
 
 export type LayoutIssueSeverity = "error" | "warning" | "info";
 
@@ -31,6 +56,9 @@ export interface LayoutIssue {
   rect: LayoutRect;
   containerRect?: LayoutRect;
   overflow?: LayoutOverflow;
+  /** `text_occluded` only: approximate fraction (0-1) of the occlusion probe
+   * grid that hit an opaque occluder — see layout-audit.browser.js. */
+  coveredFraction?: number;
   fixHint?: string;
 }
 
@@ -86,6 +114,18 @@ export function computeOverflow(
   return Object.keys(overflow).length > 0 ? overflow : null;
 }
 
+/**
+ * Whether a computed `overflow*` value clips its box. Mirrors the rule the
+ * browser audit (layout-audit.browser.js) uses to decide that text spilling
+ * past such an ancestor is intentionally masked (odometer/ticker reels) rather
+ * than a `text_box_overflow` defect. Kept here as the one unit-testable seam of
+ * that suppression: only `visible` (and the `clip visible` no-op) must NOT clip
+ * — every clipping value must, or real masked overflow gets reported as a bug.
+ */
+export function overflowValueClips(value: string | null | undefined): boolean {
+  return !!value && value !== "visible" && value !== "clip visible";
+}
+
 export function summarizeLayoutIssues(issues: LayoutIssue[]): LayoutSummary {
   const errorCount = issues.filter((issue) => issue.severity === "error").length;
   const warningCount = issues.filter((issue) => issue.severity === "warning").length;
@@ -131,6 +171,7 @@ export function dedupeLayoutIssues(issues: LayoutIssue[]): LayoutIssue[] {
       issue.containerSelector ?? "",
       issue.text ?? "",
       issue.overflow ? formatOverflow(issue.overflow) : "",
+      framePositionKey(issue),
     ].join("|");
     if (seen.has(key)) continue;
     seen.add(key);
@@ -140,7 +181,33 @@ export function dedupeLayoutIssues(issues: LayoutIssue[]): LayoutIssue[] {
   return result;
 }
 
-export function collapseStaticLayoutIssues(issues: LayoutIssue[]): LayoutIssue[] {
+// Persistence-tier thresholds (#U10): occurrences>=2 alone can't imply the 500ms floor under dense 8fps sampling, so content_overlap promotion requires a literal firstSeen..lastSeen span >= 500ms — stricter for sparse callers too.
+const CONTENT_OVERLAP_HELD_ERROR_MS = 500;
+const HELD_ACROSS_SAMPLES_MIN_OCCURRENCES = 2;
+
+// Tiering only applies to layout-audit.browser.js's own per-sample seek-grid
+// findings — the ones this collapse step's firstSeen/lastSeen span was built
+// to describe. `caption_zone_collision`/`frame_out_of_frame` (a different
+// script, U3) and the `motion_*`/`sweep_static` codes (evaluated once over
+// the whole run, not per grid sample) already carry their own singular
+// dedupe/severity semantics; re-interpreting their occurrence count as a
+// held-duration signal would misread it.
+const PERSISTENCE_TIERED_CODES: ReadonlySet<LayoutIssueCode> = new Set([
+  "text_box_overflow",
+  "clipped_text",
+  "canvas_overflow",
+  "container_overflow",
+  "content_overlap",
+  "text_occluded",
+  "escaped_container",
+  "panel_out_of_canvas",
+  "connector_detached",
+]);
+
+export function collapseStaticLayoutIssues(
+  issues: LayoutIssue[],
+  totalSampleCount?: number,
+): LayoutIssue[] {
   const groups = new Map<
     string,
     {
@@ -169,13 +236,81 @@ export function collapseStaticLayoutIssues(issues: LayoutIssue[]): LayoutIssue[]
     existing.occurrences += 1;
   }
 
-  return [...groups.values()].map(({ issue, firstSeen, lastSeen, occurrences }) => ({
-    ...issue,
-    time: firstSeen,
-    firstSeen,
-    lastSeen,
-    occurrences,
-  }));
+  // A run that only ever sampled one point in time can't distinguish a
+  // transient from a persistent finding — skip tiering entirely rather than
+  // guess (see `applyPersistenceTier`).
+  const sampleCount = totalSampleCount ?? new Set(issues.map((issue) => issue.time)).size;
+  const multiSampleRun = sampleCount > 1;
+
+  return [...groups.values()].map(({ issue, firstSeen, lastSeen, occurrences }) =>
+    applyPersistenceTier(
+      { ...issue, time: firstSeen, firstSeen, lastSeen, occurrences },
+      multiSampleRun,
+    ),
+  );
+}
+
+/**
+ * Held-duration severity tiering (#U10). A finding observed at only one
+ * sample among several (held 0ms) is an entrance/exit transient, not a held
+ * defect — demote to info so it stays in the data (verbose/--json output)
+ * without gating the run. Two codes re-promote once held: `content_overlap`
+ * warning->error when the collision is sustained rather than a crossfade blip
+ * (resolves the TODO in layout-audit.browser.js's `overlapIssue`), and
+ * `canvas_overflow` info->warning when the breach is held, canvas-scale
+ * (>= 5% of the short edge) AND partially visible — a fully off-canvas rect
+ * is a parked entrance, not drift. Codes without a promotion rule are left
+ * untouched when held — persistence, not the code, decides their tier.
+ */
+function applyPersistenceTier(issue: LayoutIssue, multiSampleRun: boolean): LayoutIssue {
+  if (!multiSampleRun) return issue;
+  if (!PERSISTENCE_TIERED_CODES.has(issue.code)) return issue;
+
+  const occurrences = issue.occurrences ?? 1;
+  // A single collapsed occurrence is held 0ms by construction (firstSeen ===
+  // lastSeen) — always under the ignore floor, so occurrences <= 1 is a
+  // complete (not approximate) test for "held under 250ms".
+  if (occurrences <= 1) {
+    return { ...issue, severity: "info" };
+  }
+  if (issue.code === "content_overlap" && isContentOverlapHeldLongEnough(issue, occurrences)) {
+    return { ...issue, severity: "error" };
+  }
+  if (issue.code === "canvas_overflow" && isCanvasBreachHeldLarge(issue, occurrences)) {
+    return { ...issue, severity: "warning" };
+  }
+  return issue;
+}
+
+// A held, canvas-scale, PARTIALLY visible breach is drift; a fully off-canvas rect is a parked entrance.
+function isCanvasBreachHeldLarge(issue: LayoutIssue, occurrences: number): boolean {
+  if (
+    occurrences < HELD_ACROSS_SAMPLES_MIN_OCCURRENCES ||
+    !issue.overflow ||
+    !issue.containerRect
+  ) {
+    return false;
+  }
+  const breach = Math.max(
+    ...Object.values(issue.overflow).filter((value) => typeof value === "number"),
+  );
+  if (breach < Math.min(issue.containerRect.width, issue.containerRect.height) * 0.05) return false;
+  const container = issue.containerRect;
+  const overlapX =
+    Math.min(issue.rect.right, container.right) - Math.max(issue.rect.left, container.left);
+  const overlapY =
+    Math.min(issue.rect.bottom, container.bottom) - Math.max(issue.rect.top, container.top);
+  return overlapX > 0 && overlapY > 0;
+}
+
+// Split out of applyPersistenceTier so the compound "held long enough" test reads as one boolean question.
+function isContentOverlapHeldLongEnough(issue: LayoutIssue, occurrences: number): boolean {
+  // Two samples measure a span, but under dense 8fps sampling that span must still clear the wall-clock floor.
+  if (occurrences < HELD_ACROSS_SAMPLES_MIN_OCCURRENCES) return false;
+  const firstSeen = issue.firstSeen ?? issue.time;
+  const lastSeen = issue.lastSeen ?? issue.time;
+  const heldMs = (lastSeen - firstSeen) * 1000;
+  return heldMs >= CONTENT_OVERLAP_HELD_ERROR_MS;
 }
 
 export function limitLayoutIssues(
@@ -209,12 +344,78 @@ function staticIssueKey(issue: LayoutIssue): string {
     issue.containerSelector ?? "",
     issue.text ?? "",
     issue.overflow ? formatOverflow(issue.overflow) : "",
+    framePositionKey(issue),
   ].join("|");
+}
+
+function framePositionKey(issue: LayoutIssue): string {
+  // connector_detached shares it: id-less paths collapse to one selector, so distinct lines need geometry in the key.
+  return issue.code === "frame_out_of_frame" || issue.code === "connector_detached"
+    ? `${Math.round(issue.rect.left)},${Math.round(issue.rect.top)}`
+    : "";
 }
 
 function uniqueSortedTimes(times: number[]): number[] {
   const rounded = times.map(roundTime);
   return [...new Set(rounded)].sort((a, b) => a - b);
+}
+
+export interface TransitionSampleOptions {
+  duration: number;
+  boundaries: number[];
+  /** Optional hard limit on the returned sample count. No limit when absent. */
+  cap?: number;
+}
+
+export interface TransitionSamples {
+  times: number[];
+  /** Sample times omitted because of `cap`. Always 0 when no cap is given. */
+  dropped: number;
+}
+
+/**
+ * Build sample times from tween start/end boundaries: the boundaries
+ * themselves plus the midpoint of every segment between consecutive
+ * boundaries. Boundary frames are where transient overlaps live (#1380), but
+ * sampling exactly at a boundary can land on an element at opacity 0 — the
+ * segment midpoints catch the window where both sides of a transition are
+ * partially visible. Every collected boundary is sampled unless the caller
+ * passes an explicit `cap`, in which case the result is an evenly-strided
+ * subset and `dropped` reports how many sample times were omitted.
+ */
+export function buildTransitionSampleTimes({
+  duration,
+  boundaries,
+  cap,
+}: TransitionSampleOptions): TransitionSamples {
+  if (!Number.isFinite(duration) || duration <= 0) return { times: [], dropped: 0 };
+  const inRange = uniqueSortedTimes(
+    boundaries.filter((time) => Number.isFinite(time) && time >= 0 && time <= duration),
+  );
+  const withMidpoints = [...inRange];
+  for (let i = 0; i < inRange.length - 1; i++) {
+    const current = inRange[i];
+    const next = inRange[i + 1];
+    if (current === undefined || next === undefined) continue;
+    withMidpoints.push(roundTime((current + next) / 2));
+  }
+  const merged = uniqueSortedTimes(withMidpoints);
+  if (cap === undefined || merged.length <= Math.max(2, cap)) {
+    return { times: merged, dropped: 0 };
+  }
+  const limit = Math.max(2, cap);
+  const strided: number[] = [];
+  for (let i = 0; i < limit; i++) {
+    const pick = merged[Math.floor((i * (merged.length - 1)) / (limit - 1))];
+    if (pick !== undefined) strided.push(pick);
+  }
+  const times = uniqueSortedTimes(strided);
+  return { times, dropped: merged.length - times.length };
+}
+
+/** Merge sample-time lists into one deduplicated ascending list. */
+export function mergeSampleTimes(...lists: number[][]): number[] {
+  return uniqueSortedTimes(lists.flat());
 }
 
 function formatOverflow(overflow: LayoutOverflow): string {

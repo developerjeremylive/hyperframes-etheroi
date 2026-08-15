@@ -1,76 +1,46 @@
+// fallow-ignore-file complexity
 import { useCallback, useRef } from "react";
 import type { TimelineElement } from "../player";
 import { usePlayerStore } from "../player";
-import { applyPatchByTarget, readAttributeByTarget } from "../utils/sourcePatcher";
-import {
-  buildTrackZIndexMap,
-  formatTimelineAttributeNumber,
-} from "../player/components/timelineEditing";
-import {
-  buildTimelineAssetId,
-  buildTimelineAssetInsertHtml,
-  buildTimelineFileDropPlacements,
-  getTimelineAssetKind,
-  insertTimelineAssetIntoSource,
-  resolveTimelineAssetInitialGeometry,
-  resolveTimelineAssetSrc,
-} from "../utils/timelineAssetDrop";
+import { useRazorSplit } from "./useRazorSplit";
+import { useTimelineAssetDropOps } from "./useTimelineAssetDropOps";
 import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
+import { setCompositionDurationToContent } from "../utils/timelineAssetDrop";
+import { furthestClipEndFromSource } from "../player/lib/timelineElementHelpers";
+import { getTimelineElementLabel } from "../utils/studioHelpers";
 import {
-  getTimelineElementLabel,
-  collectHtmlIds,
-  resolveDroppedAssetDuration,
-} from "../utils/studioHelpers";
-import type { EditHistoryKind } from "../utils/editHistory";
+  applyTimelineStackingReorder,
+  buildPatchTarget,
+  patchIframeDomTiming,
+  playbackStartAttributeForElement,
+  persistTimelineEdit,
+  formatTimelineAttributeNumber,
+  extendRootDurationIfNeeded,
+  buildTimelineMoveTimingPatch,
+  buildTimelineResizeTimingPatch,
+} from "./timelineEditingHelpers";
+import {
+  captureDurationRollback,
+  finishClipTimingFallback,
+  readFileContent,
+  syncPreviewContentDuration,
+} from "./timelineTimingSync";
+import type { PersistTimelineEditInput } from "./timelineEditingHelpers";
+import type { TimelineStackingReorderIntent } from "../player/components/timelineEditing";
+import {
+  useTimelineElementVisibilityEditing,
+  useTimelineTrackVisibilityEditing,
+} from "./timelineTrackVisibility";
+import { useTimelineGroupEditing } from "./useTimelineGroupEditing";
+import { serializeZLaneGesture } from "../components/nle/zLaneGesture";
+import { cutoverCommittedOrThrow, sdkTimingPersist } from "../utils/sdkCutover";
+import type { UseTimelineEditingOptions } from "./useTimelineEditingTypes";
+import { getStudioSaveErrorMessage } from "../utils/studioSaveDiagnostics";
+import { studioWriteHeaders } from "../utils/studioFileVersion";
 
-// ── Types ──
-
-interface RecordEditInput {
-  label: string;
-  kind: EditHistoryKind;
-  coalesceKey?: string;
-  files: Record<string, { before: string; after: string }>;
-}
-
-interface UseTimelineEditingOptions {
-  projectId: string | null;
-  activeCompPath: string | null;
-  timelineElements: TimelineElement[];
-  showToast: (message: string, tone?: "error" | "info") => void;
-  writeProjectFile: (path: string, content: string) => Promise<void>;
-  recordEdit: (input: RecordEditInput) => Promise<void>;
-  domEditSaveTimestampRef: React.MutableRefObject<number>;
-  reloadPreview: () => void;
-  uploadProjectFiles: (files: Iterable<File>, dir?: string) => Promise<string[]>;
-}
-
-// ── Helpers ──
-
-function buildPatchTarget(element: { domId?: string; selector?: string; selectorIndex?: number }) {
-  if (element.domId) {
-    return { id: element.domId, selector: element.selector, selectorIndex: element.selectorIndex };
-  }
-  if (element.selector) {
-    return { selector: element.selector, selectorIndex: element.selectorIndex };
-  }
-  return null;
-}
-
-async function readFileContent(projectId: string, targetPath: string): Promise<string> {
-  const response = await fetch(
-    `/api/projects/${projectId}/files/${encodeURIComponent(targetPath)}`,
-  );
-  if (!response.ok) {
-    throw new Error(`Failed to read ${targetPath}`);
-  }
-  const data = (await response.json()) as { content?: string };
-  if (typeof data.content !== "string") {
-    throw new Error(`Missing file contents for ${targetPath}`);
-  }
-  return data.content;
-}
-
-// ── Hook ──
+type TimelineMoveUpdates = Pick<TimelineElement, "start" | "track"> & {
+  stackingReorder?: TimelineStackingReorderIntent | null;
+};
 
 export function useTimelineEditing({
   projectId,
@@ -78,162 +48,354 @@ export function useTimelineEditing({
   timelineElements,
   showToast,
   writeProjectFile,
+  observeProjectFileVersion,
   recordEdit,
   domEditSaveTimestampRef,
   reloadPreview,
+  previewIframeRef,
+  pendingTimelineEditPathRef,
   uploadProjectFiles,
+  isRecordingRef,
+  sdkSession,
+  publishSdkSession,
+  forceReloadSdkSession,
+  invalidateGsapCache,
+  handleDomZIndexReorderCommitRef,
 }: UseTimelineEditingOptions) {
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
 
+  const editQueueRef = useRef(Promise.resolve());
   const lastBlockedTimelineToastAtRef = useRef(0);
 
-  const handleTimelineElementMove = useCallback(
-    async (element: TimelineElement, updates: Pick<TimelineElement, "start" | "track">) => {
+  const enqueueEdit = useCallback(
+    (
+      element: TimelineElement,
+      label: string,
+      buildPatches: PersistTimelineEditInput["buildPatches"],
+      coalesceKey?: string,
+    ): Promise<void> => {
+      if (isRecordingRef?.current) {
+        showToast("Cannot edit timeline while recording", "error");
+        return Promise.resolve();
+      }
       const pid = projectIdRef.current;
-      if (!pid) throw new Error("No active project");
-
-      const targetPath = element.sourceFile || activeCompPath || "index.html";
-      const originalContent = await readFileContent(pid, targetPath);
-
-      const patchTarget = buildPatchTarget(element);
-      if (!patchTarget) {
-        throw new Error(`Timeline element ${element.id} is missing a patchable target`);
-      }
-
-      const resolvedTargetPath = targetPath || "index.html";
-      const relevantElements = timelineElements
-        .map((te) =>
-          (te.key ?? te.id) === (element.key ?? element.id)
-            ? { ...te, start: updates.start, track: updates.track }
-            : te,
+      if (!pid) return Promise.resolve();
+      const queued = editQueueRef.current
+        .then(() =>
+          persistTimelineEdit({
+            projectId: pid,
+            element,
+            activeCompPath,
+            label,
+            buildPatches,
+            writeProjectFile,
+            recordEdit,
+            domEditSaveTimestampRef,
+            pendingTimelineEditPathRef,
+            coalesceKey,
+          }),
         )
-        .filter((te) => (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath);
-      const trackZIndices = buildTrackZIndexMap(relevantElements.map((te) => te.track));
-
-      let patchedContent = applyPatchByTarget(originalContent, patchTarget, {
-        type: "attribute",
-        property: "start",
-        value: formatTimelineAttributeNumber(updates.start),
-      });
-      patchedContent = applyPatchByTarget(patchedContent, patchTarget, {
-        type: "attribute",
-        property: "track-index",
-        value: String(updates.track),
-      });
-      for (const te of relevantElements) {
-        const elementTarget = buildPatchTarget(te);
-        if (!elementTarget) continue;
-        const nextZIndex = trackZIndices.get(te.track);
-        if (nextZIndex == null) continue;
-        patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-          type: "inline-style",
-          property: "z-index",
-          value: String(nextZIndex),
+        .then(() => {
+          forceReloadSdkSession?.();
         });
-      }
-
-      if (patchedContent === originalContent) {
-        throw new Error(`Unable to patch timeline element ${element.id} in ${targetPath}`);
-      }
-
-      domEditSaveTimestampRef.current = Date.now();
-      await saveProjectFilesWithHistory({
-        projectId: pid,
-        label: "Move timeline clip",
-        kind: "timeline",
-        files: { [targetPath]: patchedContent },
-        readFile: async () => originalContent,
-        writeFile: writeProjectFile,
-        recordEdit,
+      editQueueRef.current = queued.catch((error) => {
+        console.error(`[Timeline] Failed to persist: ${label}`, error);
       });
-
-      reloadPreview();
+      return queued;
     },
     [
       activeCompPath,
       recordEdit,
-      timelineElements,
       writeProjectFile,
       domEditSaveTimestampRef,
+      pendingTimelineEditPathRef,
+      showToast,
+      isRecordingRef,
+      forceReloadSdkSession,
+    ],
+  );
+  const groupEditing = useTimelineGroupEditing({
+    activeCompPath,
+    domEditSaveTimestampRef,
+    editQueueRef,
+    forceReloadSdkSession,
+    invalidateGsapCache,
+    isRecordingRef,
+    pendingTimelineEditPathRef,
+    previewIframeRef,
+    projectIdRef,
+    recordEdit,
+    reloadPreview,
+    sdkSession,
+    publishSdkSession,
+    showToast,
+    writeProjectFile,
+  });
+  const handleTimelineElementMove = useCallback(
+    // fallow-ignore-next-line complexity
+    (element: TimelineElement, updates: TimelineMoveUpdates) => {
+      const commitMove = () => {
+        const targetPath = element.sourceFile || activeCompPath || "index.html";
+        const startChanged = updates.start !== element.start;
+        // A vertical-only lane move arrives with start unchanged but track changed
+        // (on this single-element path the drag commit has already folded the
+        // AUTHORED persist track into updates.track). It must persist like any
+        // other move — early-returning on !startChanged alone silently dropped
+        // the file write, so the lane snapped back on reload.
+        const trackChanged = updates.track !== element.track;
+
+        if (startChanged || trackChanged) {
+          const liveAttrs: Array<[string, string]> = [];
+          if (startChanged) {
+            liveAttrs.push(["data-start", formatTimelineAttributeNumber(updates.start)]);
+          }
+          if (trackChanged) {
+            liveAttrs.push(["data-track-index", formatTimelineAttributeNumber(updates.track)]);
+          }
+          patchIframeDomTiming(previewIframeRef.current, element, liveAttrs, activeCompPath);
+        }
+
+        const reorderDone = applyTimelineStackingReorder({
+          element,
+          stackingReorder: updates.stackingReorder,
+          timelineElements,
+          iframe: previewIframeRef.current,
+          activeCompPath,
+          commit: handleDomZIndexReorderCommitRef?.current,
+        });
+
+        if (!startChanged && !trackChanged) return reorderDone;
+
+        // Snapshot the duration BEFORE the optimistic updates below so a failed
+        // persist can roll the readout + live root back (see captureDurationRollback).
+        const rollbackDuration = captureDurationRollback(previewIframeRef.current);
+        // needsExtension gates the SDK path (setTiming can't grow the root duration), so read the store BEFORE the readout sync below optimistically updates it.
+        const needsExtension = extendRootDurationIfNeeded(updates.start + element.duration);
+        // Optimistic duration readout: content-driven (grow AND shrink), from the just-patched live DOM. See syncPreviewContentDuration.
+        syncPreviewContentDuration(previewIframeRef.current);
+
+        const buildMovePatches: PersistTimelineEditInput["buildPatches"] = (original, target) => {
+          // Persist lane changes too — data-start-only writes let reload snap the lane back.
+          const track = trackChanged ? updates.track : undefined;
+          return buildTimelineMoveTimingPatch(
+            original,
+            target,
+            updates.start,
+            element.duration,
+            track,
+          );
+        };
+        const coalesceKey = `timeline-move:${element.hfId ?? element.id}`;
+        const finishMoveGsapSync = () =>
+          // Every timing writer converges the same GSAP positions after its
+          // durable clip-start commit. The SDK owns the attribute write; this
+          // sync owns only the dependent animation rewrite and preview refresh.
+          finishClipTimingFallback({
+            iframe: previewIframeRef.current,
+            reloadPreview,
+            projectId: projectIdRef.current,
+            targetPath,
+            domId: element.domId,
+            label: "Move timeline clip",
+            coalesceKey,
+            recordEdit,
+            edit: { kind: "shift", delta: updates.start - element.start },
+          }).finally(() => invalidateGsapCache?.());
+        const moveFallback = () =>
+          enqueueEdit(element, "Move timeline clip", buildMovePatches, coalesceKey).then(
+            finishMoveGsapSync,
+          );
+        return reorderDone
+          .then(() => {
+            // The SDK setTiming path writes start only — a lane change must take
+            // the fallback, whose patch builder writes data-track-index too.
+            if (sdkSession && element.hfId && !needsExtension && !trackChanged) {
+              return sdkTimingPersist(
+                element.hfId,
+                targetPath,
+                { start: updates.start },
+                sdkSession,
+                {
+                  editHistory: { recordEdit },
+                  writeProjectFile,
+                  reloadPreview,
+                  domEditSaveTimestampRef,
+                  compositionPath: activeCompPath,
+                  // Capture on-disk bytes as the undo `before` so undoing a timing move
+                  // restores the file verbatim, not a normalized full-DOM re-emit.
+                  readProjectFile: (path) => readFileContent(projectIdRef.current ?? "", path),
+                  publishSession: publishSdkSession,
+                },
+                { label: "Move timeline clip", coalesceKey, skipRefresh: true },
+              ).then((result) => {
+                if (!cutoverCommittedOrThrow(result)) return moveFallback();
+                return finishMoveGsapSync();
+              });
+            }
+            return moveFallback();
+          })
+          .catch((error) => {
+            // Failed persist: revert the optimistic duration readout + live root.
+            rollbackDuration();
+            showToast(getStudioSaveErrorMessage(error), "error");
+            throw error;
+          });
+      };
+      return updates.stackingReorder ? serializeZLaneGesture(commitMove) : commitMove();
+    },
+    [
+      previewIframeRef,
+      enqueueEdit,
+      activeCompPath,
+      sdkSession,
+      publishSdkSession,
+      recordEdit,
+      writeProjectFile,
       reloadPreview,
+      domEditSaveTimestampRef,
+      timelineElements,
+      handleDomZIndexReorderCommitRef,
+      showToast,
+      invalidateGsapCache,
     ],
   );
 
   const handleTimelineElementResize = useCallback(
-    async (
+    // fallow-ignore-next-line complexity
+    (
       element: TimelineElement,
       updates: Pick<TimelineElement, "start" | "duration" | "playbackStart">,
     ) => {
-      const pid = projectIdRef.current;
-      if (!pid) throw new Error("No active project");
-
+      const liveAttrs: Array<[string, string]> = [
+        ["data-start", formatTimelineAttributeNumber(updates.start)],
+        ["data-duration", formatTimelineAttributeNumber(updates.duration)],
+      ];
+      if (updates.playbackStart != null) {
+        const liveAttr = playbackStartAttributeForElement(element);
+        liveAttrs.push([liveAttr, formatTimelineAttributeNumber(updates.playbackStart)]);
+      }
+      patchIframeDomTiming(previewIframeRef.current, element, liveAttrs, activeCompPath);
+      // Snapshot the duration BEFORE the optimistic updates below so a failed
+      // persist can roll the readout + live root back (see captureDurationRollback).
+      const rollbackDuration = captureDurationRollback(previewIframeRef.current);
+      // needsExtension gates the SDK path (setTiming can't grow the root duration), so read the store BEFORE the readout sync below optimistically updates it.
+      const needsExtension = extendRootDurationIfNeeded(updates.start + updates.duration);
+      // Optimistic duration readout: content-driven (grow AND shrink), from the just-patched live DOM. See syncPreviewContentDuration.
+      syncPreviewContentDuration(previewIframeRef.current);
       const targetPath = element.sourceFile || activeCompPath || "index.html";
-      const originalContent = await readFileContent(pid, targetPath);
-
-      const patchTarget = buildPatchTarget(element);
-      if (!patchTarget) {
-        throw new Error(`Timeline element ${element.id} is missing a patchable target`);
-      }
-
-      const playbackStartAttrName =
-        element.playbackStartAttr === "playback-start" ? "playback-start" : "media-start";
-      const currentPlaybackStartValue =
-        readAttributeByTarget(originalContent, patchTarget, "playback-start") ??
-        readAttributeByTarget(originalContent, patchTarget, "media-start");
-      const currentPlaybackStart =
-        currentPlaybackStartValue != null ? parseFloat(currentPlaybackStartValue) : undefined;
-      const trimDelta = updates.start - element.start;
-      const fallbackPlaybackStart =
-        updates.playbackStart == null &&
-        trimDelta !== 0 &&
-        Number.isFinite(currentPlaybackStart) &&
-        currentPlaybackStart != null
-          ? Math.max(0, currentPlaybackStart + trimDelta * Math.max(element.playbackRate ?? 1, 0.1))
-          : undefined;
-      const nextPlaybackStart = updates.playbackStart ?? fallbackPlaybackStart;
-
-      let patchedContent = originalContent;
-      patchedContent = applyPatchByTarget(patchedContent, patchTarget, {
-        type: "attribute",
-        property: "start",
-        value: formatTimelineAttributeNumber(updates.start),
+      const buildResizePatches: PersistTimelineEditInput["buildPatches"] = (original, target) => {
+        return buildTimelineResizeTimingPatch(original, target, element, updates);
+      };
+      const hasPbsAdjustment =
+        updates.playbackStart != null ||
+        (updates.start !== element.start && element.playbackStart != null);
+      // Server-path fallback: after persisting the attr patch, scale GSAP tween
+      // positions/durations on the server, then soft-reload with the rewritten
+      // script (timing-only resize) — same no-flash path as move; full reload is
+      // the fallback.
+      const coalesceKey = `timeline-resize:${element.hfId ?? element.id}`;
+      const finishResizeGsapSync = () =>
+        finishClipTimingFallback({
+          iframe: previewIframeRef.current,
+          reloadPreview,
+          projectId: projectIdRef.current,
+          targetPath,
+          domId: element.domId,
+          label: "Resize timeline clip",
+          coalesceKey,
+          recordEdit,
+          edit: {
+            kind: "scale",
+            from: { start: element.start, duration: element.duration },
+            to: { start: updates.start, duration: updates.duration },
+          },
+        }).finally(() => invalidateGsapCache?.());
+      const resizeFallback = () =>
+        enqueueEdit(element, "Resize timeline clip", buildResizePatches, coalesceKey).then(
+          finishResizeGsapSync,
+        );
+      const persistDone =
+        sdkSession && element.hfId && !hasPbsAdjustment && !needsExtension
+          ? sdkTimingPersist(
+              element.hfId,
+              targetPath,
+              { start: updates.start, duration: updates.duration },
+              sdkSession,
+              {
+                editHistory: { recordEdit },
+                writeProjectFile,
+                reloadPreview,
+                domEditSaveTimestampRef,
+                compositionPath: activeCompPath,
+                // Capture on-disk bytes as the undo `before` so undoing a timing
+                // resize restores the file verbatim, not a normalized full-DOM re-emit.
+                readProjectFile: (path) => readFileContent(projectIdRef.current ?? "", path),
+                publishSession: publishSdkSession,
+              },
+              { label: "Resize timeline clip", coalesceKey, skipRefresh: true },
+            ).then((result) => {
+              if (!cutoverCommittedOrThrow(result)) return resizeFallback();
+              return finishResizeGsapSync();
+            })
+          : resizeFallback();
+      return persistDone.catch((error) => {
+        // Failed persist: revert the optimistic duration readout + live root.
+        rollbackDuration();
+        showToast(getStudioSaveErrorMessage(error), "error");
+        throw error;
       });
-      patchedContent = applyPatchByTarget(patchedContent, patchTarget, {
-        type: "attribute",
-        property: "duration",
-        value: formatTimelineAttributeNumber(updates.duration),
-      });
-      if (nextPlaybackStart != null) {
-        patchedContent = applyPatchByTarget(patchedContent, patchTarget, {
-          type: "attribute",
-          property: playbackStartAttrName,
-          value: formatTimelineAttributeNumber(nextPlaybackStart),
-        });
-      }
-
-      if (patchedContent === originalContent) {
-        throw new Error(`Unable to patch timeline element ${element.id} in ${targetPath}`);
-      }
-
-      domEditSaveTimestampRef.current = Date.now();
-      await saveProjectFilesWithHistory({
-        projectId: pid,
-        label: "Resize timeline clip",
-        kind: "timeline",
-        files: { [targetPath]: patchedContent },
-        readFile: async () => originalContent,
-        writeFile: writeProjectFile,
-        recordEdit,
-      });
-
-      reloadPreview();
     },
-    [activeCompPath, recordEdit, writeProjectFile, domEditSaveTimestampRef, reloadPreview],
+    [
+      previewIframeRef,
+      enqueueEdit,
+      activeCompPath,
+      sdkSession,
+      publishSdkSession,
+      recordEdit,
+      writeProjectFile,
+      reloadPreview,
+      domEditSaveTimestampRef,
+      showToast,
+      invalidateGsapCache,
+    ],
   );
 
+  const handleToggleTrackHidden = useTimelineTrackVisibilityEditing({
+    projectIdRef,
+    activeCompPath,
+    timelineElements,
+    showToast,
+    writeProjectFile,
+    recordEdit,
+    domEditSaveTimestampRef,
+    previewIframeRef,
+    pendingTimelineEditPathRef,
+    isRecordingRef,
+    forceReloadSdkSession,
+  });
+
+  const handleToggleElementHidden = useTimelineElementVisibilityEditing({
+    projectIdRef,
+    activeCompPath,
+    showToast,
+    writeProjectFile,
+    recordEdit,
+    domEditSaveTimestampRef,
+    previewIframeRef,
+    pendingTimelineEditPathRef,
+    isRecordingRef,
+    forceReloadSdkSession,
+  });
+
+  // fallow-ignore-next-line complexity
   const handleTimelineElementDelete = useCallback(
+    // fallow-ignore-next-line complexity
     async (element: TimelineElement) => {
+      if (isRecordingRef?.current) {
+        showToast("Cannot edit timeline while recording", "error");
+        return;
+      }
       const pid = projectIdRef.current;
       if (!pid) throw new Error("No active project");
       const label = getTimelineElementLabel(element);
@@ -247,19 +409,11 @@ export function useTimelineEditing({
           throw new Error(`Timeline element ${element.id} is missing a patchable target`);
         }
 
-        const resolvedTargetPath = targetPath || "index.html";
-        const remainingElements = timelineElements.filter(
-          (te) =>
-            (te.key ?? te.id) !== (element.key ?? element.id) &&
-            (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath,
-        );
-        const trackZIndices = buildTrackZIndexMap(remainingElements.map((te) => te.track));
-
         const removeResponse = await fetch(
           `/api/projects/${pid}/file-mutations/remove-element/${encodeURIComponent(targetPath)}`,
           {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
             body: JSON.stringify({ target: patchTarget }),
           },
         );
@@ -271,30 +425,40 @@ export function useTimelineEditing({
           changed?: boolean;
           content?: string;
         };
-        let patchedContent =
+        const removedContent =
           typeof removeData.content === "string" ? removeData.content : originalContent;
-        for (const te of remainingElements) {
-          const elementTarget = buildPatchTarget(te);
-          if (!elementTarget) continue;
-          const nextZIndex = trackZIndices.get(te.track);
-          if (nextZIndex == null) continue;
-          patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-            type: "inline-style",
-            property: "z-index",
-            value: String(nextZIndex),
-          });
+        // Content-driven duration: shrink the composition to the furthest
+        // remaining clip end, read from the post-removal SOURCE (raw
+        // data-duration), so deleting the last/longest clip removes trailing
+        // empty space. Measured from the source, not the store, whose
+        // durations are runtime-truncated.
+        const deleteContentEnd = furthestClipEndFromSource(removedContent);
+        const patchedContent = setCompositionDurationToContent(removedContent, deleteContentEnd);
+        // Optimistically reflect the shrunk length in the readout/seek bar,
+        // rolling it back if the persist below fails (see captureDurationRollback).
+        const rollbackDuration = captureDurationRollback(previewIframeRef.current);
+        if (deleteContentEnd > 0 && targetPath === (activeCompPath || "index.html")) {
+          usePlayerStore.getState().setDuration(deleteContentEnd);
         }
 
         domEditSaveTimestampRef.current = Date.now();
-        await saveProjectFilesWithHistory({
-          projectId: pid,
-          label: "Delete timeline clip",
-          kind: "timeline",
-          files: { [targetPath]: patchedContent },
-          readFile: async () => originalContent,
-          writeFile: writeProjectFile,
-          recordEdit,
-        });
+        try {
+          await saveProjectFilesWithHistory({
+            projectId: pid,
+            label: "Delete timeline clip",
+            kind: "timeline",
+            files: { [targetPath]: patchedContent },
+            readFile: async () => originalContent,
+            // remove-element already wrote the removal, so disk holds THAT — not the
+            // content read at the top. Undo still goes back to the original.
+            diskContent: { [targetPath]: removedContent },
+            writeFile: writeProjectFile,
+            recordEdit,
+          });
+        } catch (error) {
+          rollbackDuration();
+          throw error;
+        }
 
         usePlayerStore
           .getState()
@@ -302,6 +466,7 @@ export function useTimelineEditing({
             timelineElements.filter((te) => (te.key ?? te.id) !== (element.key ?? element.id)),
           );
         usePlayerStore.getState().setSelectedElementId(null);
+        forceReloadSdkSession?.();
         reloadPreview();
         showToast(`Deleted ${label}. Use Undo to restore it.`, "info");
       } catch (error) {
@@ -317,139 +482,27 @@ export function useTimelineEditing({
       writeProjectFile,
       domEditSaveTimestampRef,
       reloadPreview,
+      isRecordingRef,
+      forceReloadSdkSession,
+      previewIframeRef,
     ],
   );
 
-  const handleTimelineAssetDrop = useCallback(
-    async (
-      assetPath: string,
-      placement: Pick<TimelineElement, "start" | "track">,
-      durationOverride?: number,
-    ) => {
-      const pid = projectIdRef.current;
-      if (!pid) throw new Error("No active project");
-
-      const kind = getTimelineAssetKind(assetPath);
-      if (!kind) {
-        showToast("Only image, video, and audio assets can be dropped onto the timeline.");
-        return;
-      }
-
-      const targetPath = activeCompPath || "index.html";
-      try {
-        const originalContent = await readFileContent(pid, targetPath);
-
-        const normalizedStart = Number(formatTimelineAttributeNumber(placement.start));
-        const duration =
-          Number.isFinite(durationOverride) && durationOverride != null && durationOverride > 0
-            ? durationOverride
-            : await resolveDroppedAssetDuration(pid, assetPath, kind);
-        const normalizedDuration = Number(formatTimelineAttributeNumber(duration));
-        const newId = buildTimelineAssetId(assetPath, collectHtmlIds(originalContent));
-        const resolvedAssetSrc = resolveTimelineAssetSrc(targetPath, assetPath);
-
-        const resolvedTargetPath = targetPath || "index.html";
-        const relevantElements = timelineElements.filter(
-          (te) => (te.sourceFile || activeCompPath || "index.html") === resolvedTargetPath,
-        );
-        const trackZIndices = buildTrackZIndexMap([
-          ...relevantElements.map((te) => te.track),
-          placement.track,
-        ]);
-
-        let patchedContent = originalContent;
-        for (const te of relevantElements) {
-          const elementTarget = buildPatchTarget(te);
-          if (!elementTarget) continue;
-          const nextZIndex = trackZIndices.get(te.track);
-          if (nextZIndex == null) continue;
-          patchedContent = applyPatchByTarget(patchedContent, elementTarget, {
-            type: "inline-style",
-            property: "z-index",
-            value: String(nextZIndex),
-          });
-        }
-
-        patchedContent = insertTimelineAssetIntoSource(
-          patchedContent,
-          buildTimelineAssetInsertHtml({
-            id: newId,
-            assetPath: resolvedAssetSrc,
-            kind,
-            start: normalizedStart,
-            duration: normalizedDuration,
-            track: placement.track,
-            zIndex: trackZIndices.get(placement.track) ?? 1,
-            geometry: resolveTimelineAssetInitialGeometry(originalContent),
-          }),
-        );
-
-        domEditSaveTimestampRef.current = Date.now();
-        await saveProjectFilesWithHistory({
-          projectId: pid,
-          label: "Add timeline asset",
-          kind: "timeline",
-          files: { [targetPath]: patchedContent },
-          readFile: async () => originalContent,
-          writeFile: writeProjectFile,
-          recordEdit,
-        });
-
-        reloadPreview();
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Failed to drop asset onto timeline";
-        showToast(message);
-      }
-    },
-    [
+  const { handleTimelineAssetDrop, handleTimelineFileDrop, handleTimelineCompositionDrop } =
+    useTimelineAssetDropOps({
+      projectIdRef,
       activeCompPath,
-      recordEdit,
-      showToast,
       timelineElements,
+      showToast,
       writeProjectFile,
+      recordEdit,
       domEditSaveTimestampRef,
       reloadPreview,
-    ],
-  );
-
-  const handleTimelineFileDrop = useCallback(
-    async (files: File[], placement?: Pick<TimelineElement, "start" | "track">) => {
-      const pid = projectIdRef.current;
-      if (!pid) return;
-      const uploaded = await uploadProjectFiles(files);
-      if (uploaded.length === 0) return;
-      const durations: number[] = [];
-      for (const assetPath of uploaded) {
-        const kind = getTimelineAssetKind(assetPath);
-        const duration = kind ? await resolveDroppedAssetDuration(pid, assetPath, kind) : 0;
-        durations.push(Number(formatTimelineAttributeNumber(duration)));
-      }
-      const placements = buildTimelineFileDropPlacements(
-        placement ?? { start: 0, track: 0 },
-        durations,
-        timelineElements
-          .filter(
-            (te) =>
-              (te.sourceFile || activeCompPath || "index.html") ===
-              (activeCompPath || "index.html"),
-          )
-          .map((te) => ({
-            start: te.start,
-            duration: te.duration,
-            track: te.track,
-          })),
-      );
-      for (const [index, assetPath] of uploaded.entries()) {
-        await handleTimelineAssetDrop(
-          assetPath,
-          placements[index] ?? placements[0],
-          durations[index],
-        );
-      }
-    },
-    [activeCompPath, handleTimelineAssetDrop, timelineElements, uploadProjectFiles],
-  );
+      uploadProjectFiles,
+      isRecordingRef,
+      forceReloadSdkSession,
+      observeProjectFileVersion,
+    });
 
   const handleBlockedTimelineEdit = useCallback(
     (_element: TimelineElement) => {
@@ -461,12 +514,32 @@ export function useTimelineEditing({
     [showToast],
   );
 
+  const { handleRazorSplit, handleRazorSplitAll } = useRazorSplit({
+    projectId,
+    activeCompPath,
+    showToast,
+    writeProjectFile,
+    observeProjectFileVersion,
+    recordEdit,
+    domEditSaveTimestampRef,
+    reloadPreview,
+    isRecordingRef,
+    forceReloadSdkSession,
+  });
+
   return {
     handleTimelineElementMove,
     handleTimelineElementResize,
+    handleToggleTrackHidden,
+    handleToggleElementHidden,
     handleTimelineElementDelete,
+    handleTimelineElementSplit: handleRazorSplit,
+    handleRazorSplit,
+    handleRazorSplitAll,
     handleTimelineAssetDrop,
     handleTimelineFileDrop,
+    handleTimelineCompositionDrop,
     handleBlockedTimelineEdit,
+    ...groupEditing,
   };
 }

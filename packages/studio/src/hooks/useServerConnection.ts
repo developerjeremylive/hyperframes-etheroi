@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { buildProjectHash, parseProjectIdFromHash } from "../utils/projectRouting";
 import { useMountEffect } from "./useMountEffect";
 
@@ -26,7 +26,10 @@ export function useServerConnection(): ServerConnectionState {
   useMountEffect(() => {
     const hashProjectId = parseProjectIdFromHash(window.location.hash);
     let cancelled = false;
-    let retryTimer: ReturnType<typeof window.setTimeout> | null = null;
+    // Explicitly `number` (the DOM return of window.setTimeout) rather than
+    // ReturnType<typeof window.setTimeout> — with @types/node present, that infers
+    // NodeJS.Timeout and clashes with the DOM number the call actually returns.
+    let retryTimer: number | null = null;
 
     function scheduleRetry() {
       setWaitingForServer(true);
@@ -66,6 +69,16 @@ export function useServerConnection(): ServerConnectionState {
       if (retryTimer !== null) clearTimeout(retryTimer);
     };
   });
+
+  // eslint-disable-next-line no-restricted-syntax
+  useEffect(() => {
+    const onHashChange = () => {
+      const next = parseProjectIdFromHash(window.location.hash);
+      if (next && next !== projectId) setProjectId(next);
+    };
+    window.addEventListener("hashchange", onHashChange);
+    return () => window.removeEventListener("hashchange", onHashChange);
+  }, [projectId]);
 
   return { projectId, resolving, waitingForServer };
 }

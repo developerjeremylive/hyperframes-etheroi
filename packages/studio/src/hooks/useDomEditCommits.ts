@@ -1,66 +1,53 @@
-import { useCallback } from "react";
-import { usePlayerStore } from "../player";
+import { useCallback, useRef } from "react";
+import { findUnsafeDomPatchValues } from "@hyperframes/core/studio-api/finite-mutation";
 import { FONT_EXT } from "../utils/mediaTypes";
-import { applyPatchByTarget } from "../utils/sourcePatcher";
-import { saveProjectFilesWithHistory } from "../utils/studioFileHistory";
+
+import { trackStudioEvent } from "../utils/studioTelemetry";
 import { primaryFontFamilyValue } from "../utils/studioFontHelpers";
-import { getDomEditTargetKey, type DomEditSelection } from "../components/editor/domEditing";
 import {
-  applyStudioPathOffset,
-  applyStudioBoxSize,
-  applyStudioRotation,
-  clearStudioPathOffset,
-  clearStudioBoxSize,
-  clearStudioRotation,
-} from "../components/editor/manualEdits";
-import {
-  buildPathOffsetPatches,
-  buildBoxSizePatches,
-  buildRotationPatches,
-  buildClearPathOffsetPatches,
-  buildClearBoxSizePatches,
-  buildClearRotationPatches,
-  buildMotionPatches,
-  buildClearMotionPatches,
-} from "../components/editor/manualEditsDom";
-import {
-  writeStudioMotionToElement,
-  clearStudioMotionFromElement,
-  applyStudioMotionFromDom,
-  type StudioGsapMotion,
-} from "../components/editor/studioMotion";
+  createStudioSaveHttpError,
+  StudioSaveHttpError,
+  trackStudioSaveFailure,
+} from "../utils/studioSaveDiagnostics";
+import { buildDomEditPatchTarget, type DomEditSelection } from "../components/editor/domEditing";
 import { fontFamilyFromAssetPath, type ImportedFontAsset } from "../components/editor/fontAssets";
-import type { DomEditGroupPathOffsetCommit } from "../components/editor/DomEditOverlay";
 import type { EditHistoryKind } from "../utils/editHistory";
+import type { CommitDomEditPatchBatches, PersistDomEditOperations } from "./domEditCommitTypes";
+import type { PatchOperation } from "../utils/sourcePatcher";
+import {
+  DomEditPersistUnsafeValueError,
+  DomEditPersistUnresolvableError,
+  warnDomEditPersistNoOp,
+} from "./domEditPersistFailure";
+import { useDomEditPositionPatchCommit } from "./useDomEditPositionPatchCommit";
 import { useDomEditTextCommits } from "./useDomEditTextCommits";
-
-// ── Types ──
-
+import { useDomGeometryCommits } from "./useDomGeometryCommits";
+import { useElementLifecycleOps } from "./useElementLifecycleOps";
+import {
+  AtomicElementPatchConvergenceError,
+  batchesAreInlineStyleOnly,
+  formatPatchRejectionMessage,
+  formatUnsafeFieldList,
+  getErrorDetail,
+  patchElementBatches,
+  readErrorResponseBody,
+} from "./useDomEditCommitsHelpers";
+import { cutoverCommittedOrThrow, type CutoverResult } from "../utils/sdkCutover";
+import { studioWriteHeaders } from "../utils/studioFileVersion";
 interface RecordEditInput {
   label: string;
   kind: EditHistoryKind;
   coalesceKey?: string;
+  coalesceMs?: number;
   files: Record<string, { before: string; after: string }>;
 }
-
-export type PersistDomEditOperations = (
-  selection: DomEditSelection,
-  operations: Parameters<typeof applyPatchByTarget>[2][],
-  options?: {
-    label?: string;
-    coalesceKey?: string;
-    skipRefresh?: boolean;
-    prepareContent?: (html: string, sourceFile: string) => string;
-    shouldSave?: () => boolean;
-  },
-) => Promise<void>;
 
 export interface UseDomEditCommitsParams {
   activeCompPath: string | null;
   previewIframeRef: React.MutableRefObject<HTMLIFrameElement | null>;
   showToast: (message: string, tone?: "error" | "info") => void;
-  queueDomEditSave: (save: () => Promise<void>) => Promise<void>;
-  writeProjectFile: (path: string, content: string) => Promise<void>;
+  queueDomEditSave: <T>(save: () => Promise<T>) => Promise<T>;
+  writeProjectFile: (path: string, content: string, expectedContent?: string) => Promise<void>;
   domEditSaveTimestampRef: React.MutableRefObject<number>;
   editHistory: { recordEdit: (entry: RecordEditInput) => Promise<void> };
   fileTree: string[];
@@ -80,10 +67,28 @@ export interface UseDomEditCommitsParams {
   buildDomSelectionFromTarget: (
     target: HTMLElement,
     options?: { preferClipAncestor?: boolean },
-  ) => DomEditSelection | null;
+  ) => Promise<DomEditSelection | null>;
+  /** Resync the in-memory SDK session after a SERVER-side write (NOT the SDK
+   * path, whose session is already current) so a later SDK edit doesn't
+   * serialize the pre-write doc and revert the server's change. */
+  forceReloadSdkSession?: () => void;
+  /** Stage 7 Step 3c: called before the server-side patch path. */
+  onTrySdkPersist?: (
+    selection: DomEditSelection,
+    operations: PatchOperation[],
+    originalContent: string,
+    targetPath: string,
+    options?: { label?: string; coalesceKey?: string; skipRefresh?: boolean },
+  ) => Promise<CutoverResult>;
+  /** Stage 7 §3.1: called before the server-side delete path. */
+  onTrySdkDelete?: (
+    hfId: string,
+    originalContent: string,
+    targetPath: string,
+  ) => Promise<CutoverResult>;
+  /** Resolver-shadow tripwire for z-index reorder targets (telemetry-only, decoupled from cutover). */
+  onReorderShadow?: (targets: string[]) => void;
 }
-
-// ── Hook ──
 
 export function useDomEditCommits({
   activeCompPath,
@@ -103,6 +108,10 @@ export function useDomEditCommits({
   clearDomSelection,
   refreshDomEditSelectionFromPreview,
   buildDomSelectionFromTarget,
+  forceReloadSdkSession,
+  onTrySdkPersist,
+  onTrySdkDelete,
+  onReorderShadow,
 }: UseDomEditCommitsParams) {
   const resolveImportedFontAsset = useCallback(
     (fontFamilyValue: string): ImportedFontAsset | null => {
@@ -127,61 +136,236 @@ export function useDomEditCommits({
     [fileTree, projectId, importedFontAssetsRef],
   );
 
+  const reportedUnresolvableRef = useRef(new Set<string>());
+
+  // fallow-ignore-next-line complexity
   const persistDomEditOperations: PersistDomEditOperations = useCallback(
+    // fallow-ignore-next-line complexity
     async (selection, operations, options) => {
       const pid = projectIdRef.current;
       if (!pid) throw new Error("No active project");
       if (options?.shouldSave && !options.shouldSave()) return;
 
       const targetPath = selection.sourceFile || activeCompPath || "index.html";
-      const response = await fetch(`/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`);
-      if (!response.ok) {
-        throw new Error(`Failed to read ${targetPath}`);
-      }
 
-      const data = (await response.json()) as { content?: string };
-      const originalContent = data.content;
+      const readResponse = await fetch(
+        `/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`,
+      );
+      if (!readResponse.ok) {
+        throw await createStudioSaveHttpError(readResponse, `Failed to read ${targetPath}`);
+      }
+      const readData = (await readResponse.json()) as { content?: string };
+      const originalContent = readData.content;
       if (typeof originalContent !== "string") {
         throw new Error(`Missing file contents for ${targetPath}`);
       }
 
-      let patchedContent = originalContent;
-      for (const operation of operations) {
-        patchedContent = applyPatchByTarget(patchedContent, selection, operation);
-      }
-      if (options?.prepareContent) {
-        patchedContent = options.prepareContent(patchedContent, targetPath);
-      }
       if (options?.shouldSave && !options.shouldSave()) return;
 
-      if (patchedContent === originalContent) {
-        throw new Error(`Unable to patch ${selection.selector ?? selection.id ?? "selection"}`);
+      // Validate layout values BEFORE any persist path runs. The SDK cutover
+      // path (onTrySdkPersist) returns early on success, so leaving this check
+      // after it let invalid numeric values bypass the guard whenever the
+      // cutover flag was on.
+      const patchTarget = buildDomEditPatchTarget(selection);
+      const patchBody = { target: patchTarget, operations };
+      const unsafeFields = findUnsafeDomPatchValues(patchBody);
+      if (unsafeFields.length > 0) {
+        const fields = formatUnsafeFieldList(unsafeFields);
+        showToast("Couldn't save edit because it contains invalid layout values", "error");
+        throw new DomEditPersistUnsafeValueError(`DOM patch contains unsafe values: ${fields}`, {
+          alreadyToasted: true,
+        });
       }
 
-      await saveProjectFilesWithHistory({
-        projectId: pid,
+      // Skip the SDK path when prepareContent is set (e.g. @font-face injection
+      // for a custom font): sdkCutoverPersist serializes only the patched DOM
+      // and would drop the injected content. Let the server path run prepareContent.
+      if (onTrySdkPersist && !options?.prepareContent) {
+        const cutover = await onTrySdkPersist(selection, operations, originalContent, targetPath, {
+          label: options?.label,
+          coalesceKey: options?.coalesceKey,
+          skipRefresh: options?.skipRefresh,
+        });
+        if (cutoverCommittedOrThrow(cutover)) {
+          // SDK handled it — its in-memory doc is already current, so do NOT
+          // forceReload (that would echo-reload the session we just wrote).
+          return;
+        }
+      }
+
+      // Mark the save timestamp before the file write so the SSE file-change
+      // handler suppresses the reload even if the event arrives before the
+      // response (the server writes the file and emits SSE during the fetch).
+      domEditSaveTimestampRef.current = Date.now();
+
+      const patchResponse = await fetch(
+        `/api/projects/${pid}/file-mutations/patch-element/${encodeURIComponent(targetPath)}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...studioWriteHeaders() },
+          body: JSON.stringify(patchBody),
+        },
+      );
+      if (!patchResponse.ok) {
+        showToast(formatPatchRejectionMessage(await readErrorResponseBody(patchResponse)), "error");
+        throw await createStudioSaveHttpError(patchResponse, `Failed to patch ${targetPath}`, {
+          alreadyToasted: true,
+        });
+      }
+
+      const patchData = (await patchResponse.json()) as {
+        ok?: boolean;
+        changed?: boolean;
+        matched?: boolean;
+        content?: string;
+      };
+
+      if (!patchData.changed) {
+        if (patchData.matched === false) {
+          const targetKey = selection.selector ?? selection.id ?? "selection";
+          if (!reportedUnresolvableRef.current.has(targetKey)) {
+            reportedUnresolvableRef.current.add(targetKey);
+            trackStudioEvent("save_skipped_unresolvable", {
+              target_id: selection.id ?? undefined,
+              target_selector: selection.selector ?? undefined,
+              target_source_file: selection.sourceFile ?? undefined,
+              composition: activeCompPath ?? undefined,
+            });
+          }
+          throw new DomEditPersistUnresolvableError(targetPath);
+        }
+        warnDomEditPersistNoOp(selection, operations);
+        return;
+      }
+
+      const patchedContent =
+        typeof patchData.content === "string" ? patchData.content : originalContent;
+
+      let finalContent = patchedContent;
+      if (options?.prepareContent) {
+        const preparedContent = options.prepareContent(patchedContent, targetPath);
+        if (preparedContent !== patchedContent) {
+          try {
+            await writeProjectFile(targetPath, preparedContent, patchedContent);
+            finalContent = preparedContent;
+          } catch (error) {
+            // The patch above already landed on disk — only the prepareContent
+            // embellishment (e.g. an injected @font-face) failed to write. Keep
+            // the already-persisted patchedContent instead of throwing, which
+            // would otherwise revert a change the server already committed.
+            showToast(
+              `Saved, but couldn't finish updating ${targetPath}: ${getErrorDetail(error)}`,
+              "error",
+            );
+          }
+        }
+      }
+
+      await editHistory.recordEdit({
         label: options?.label ?? "Edit layer",
         kind: "manual",
         coalesceKey: options?.coalesceKey,
-        files: { [targetPath]: patchedContent },
-        readFile: async () => originalContent,
-        writeFile: writeProjectFile,
-        recordEdit: editHistory.recordEdit,
+        coalesceMs: options?.coalesceMs,
+        files: { [targetPath]: { before: originalContent, after: finalContent } },
       });
+      forceReloadSdkSession?.();
 
-      if (options?.skipRefresh) {
-        domEditSaveTimestampRef.current = Date.now();
-      } else {
+      if (!options?.skipRefresh) {
         reloadPreview();
       }
     },
     [
       activeCompPath,
-      editHistory.recordEdit,
+      editHistory,
       writeProjectFile,
       projectIdRef,
       domEditSaveTimestampRef,
       reloadPreview,
+      showToast,
+      forceReloadSdkSession,
+      onTrySdkPersist,
+    ],
+  );
+
+  const commitDomEditPatchBatches: CommitDomEditPatchBatches = useCallback(
+    (batches, options) =>
+      queueDomEditSave(
+        // One queued transaction owns validation, persistence, history, reload,
+        // and its durable result; splitting those phases risks partial commits.
+        // fallow-ignore-next-line complexity
+        async () => {
+          const pid = projectIdRef.current;
+          if (!pid) throw new Error("No active project");
+          const unsafeFields = batches.flatMap((batch) =>
+            batch.patches.flatMap((patch) => findUnsafeDomPatchValues(patch)),
+          );
+          if (unsafeFields.length > 0) {
+            showToast("Couldn't save edit because it contains invalid layout values", "error");
+            throw new DomEditPersistUnsafeValueError(
+              `DOM patch contains unsafe values: ${formatUnsafeFieldList(unsafeFields)}`,
+              { alreadyToasted: true },
+            );
+          }
+
+          domEditSaveTimestampRef.current = Date.now();
+          const atomicResult = await patchElementBatches(pid, batches);
+          const allMatched =
+            atomicResult.durable && atomicResult.files.every((result) => result.allMatched);
+          const files = Object.fromEntries(
+            atomicResult.files
+              .filter((result) => result.changed)
+              .map((result) => [result.sourceFile, { before: result.before, after: result.after }]),
+          );
+          const changed = Object.keys(files).length > 0;
+          if (changed) {
+            await editHistory.recordEdit({
+              label: options.label,
+              kind: "manual",
+              coalesceKey: options.coalesceKey,
+              coalesceMs: options.coalesceMs,
+              files,
+            });
+            forceReloadSdkSession?.();
+          }
+          const durable = allMatched;
+          // A z-only reorder already applied its inline styles to the live iframe
+          // DOM (and the store) synchronously, so remounting the iframe here only
+          // produces a visible blink. Skip the reload when the caller asked for it
+          // AND the persist is provably in sync: style-only ops, every target
+          // matched. Any unmatched patch means the live DOM now shows state disk
+          // doesn't hold — reload so the preview reconverges. (The SSE/file-watcher
+          // reload is independently suppressed by domEditSaveTimestampRef above.)
+          const skipSafe =
+            options.skipReload === true && batchesAreInlineStyleOnly(batches) && durable;
+          if (!durable || (changed && !skipSafe)) reloadPreview();
+          return { durable, allMatched, changed };
+        },
+      ).catch((error) => {
+        if (error instanceof AtomicElementPatchConvergenceError) reloadPreview();
+        const alreadyToasted =
+          (error instanceof StudioSaveHttpError ||
+            error instanceof DomEditPersistUnsafeValueError) &&
+          error.alreadyToasted;
+        if (!alreadyToasted) {
+          showToast(error instanceof Error ? error.message : "Failed to reorder layers", "error");
+        }
+        trackStudioSaveFailure({
+          source: "dom_edit",
+          error,
+          filePath: batches.map((batch) => batch.sourceFile).join(","),
+          mutationType: "z-reorder",
+          label: options.label,
+        });
+        throw error;
+      }),
+    [
+      domEditSaveTimestampRef,
+      editHistory,
+      forceReloadSdkSession,
+      projectIdRef,
+      queueDomEditSave,
+      reloadPreview,
+      showToast,
     ],
   );
 
@@ -189,7 +373,13 @@ export function useDomEditCommits({
 
   const {
     handleDomStyleCommit,
+    handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
+    handleDomAttributeQuietCommit,
+    handleDomHtmlAttributeCommit,
+    handleDomAttributesCommit,
     handleDomTextCommit,
+    handleDomRichTextCommit,
     commitDomTextFields,
     handleDomTextFieldStyleCommit,
     handleDomAddTextField,
@@ -203,252 +393,67 @@ export function useDomEditCommits({
     buildDomSelectionFromTarget,
     persistDomEditOperations,
     resolveImportedFontAsset,
+    showToast,
   });
 
-  // ── Position patch helper ──
+  // ── Position patch helper (shared by geometry + lifecycle hooks) ──
 
-  const commitPositionPatchToHtml = useCallback(
-    (
-      selection: DomEditSelection,
-      patches: Parameters<typeof applyPatchByTarget>[2][],
-      options: { label: string; coalesceKey: string; skipRefresh?: boolean },
-    ) => {
-      void queueDomEditSave(async () => {
-        await persistDomEditOperations(selection, patches, {
-          label: options.label,
-          coalesceKey: options.coalesceKey,
-          skipRefresh: options.skipRefresh ?? true,
-        });
-      }).catch((error) => {
-        const message = error instanceof Error ? error.message : "Failed to save position";
-        showToast(message);
-      });
-    },
-    [persistDomEditOperations, queueDomEditSave, showToast],
-  );
+  const commitPositionPatchToHtml = useDomEditPositionPatchCommit({
+    activeCompPath,
+    persistDomEditOperations,
+    queueDomEditSave,
+    showToast,
+  });
 
-  // ── Position commits ──
+  // ── Geometry commits (path offset, box size, rotation) ──
 
-  const handleDomPathOffsetCommit = useCallback(
-    (selection: DomEditSelection, next: { x: number; y: number }) => {
-      applyStudioPathOffset(selection.element, next);
-      commitPositionPatchToHtml(selection, buildPathOffsetPatches(selection.element), {
-        label: "Move layer",
-        coalesceKey: `path-offset:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
+  const {
+    handleDomPathOffsetCommit,
+    handleDomBoxSizeCommit,
+    handleDomRotationCommit,
+    handleDomManualEditsReset,
+  } = useDomGeometryCommits({
+    previewIframeRef,
+    showToast,
+    commitPositionPatchToHtml,
+  });
 
-  const handleDomGroupPathOffsetCommit = useCallback(
-    (updates: DomEditGroupPathOffsetCommit[]) => {
-      if (updates.length === 0) return;
-      const coalesceKey = updates
-        .map((u) => getDomEditTargetKey(u.selection))
-        .sort()
-        .join(":");
-      for (const { selection, next } of updates) {
-        applyStudioPathOffset(selection.element, next);
-        commitPositionPatchToHtml(selection, buildPathOffsetPatches(selection.element), {
-          label: `Move ${updates.length} layers`,
-          coalesceKey: `group-path-offset:${coalesceKey}`,
-        });
-      }
-    },
-    [commitPositionPatchToHtml],
-  );
+  // ── Element lifecycle (delete, z-index reorder) ──
 
-  const handleDomBoxSizeCommit = useCallback(
-    (selection: DomEditSelection, next: { width: number; height: number }) => {
-      applyStudioBoxSize(selection.element, next);
-      commitPositionPatchToHtml(selection, buildBoxSizePatches(selection.element), {
-        label: "Resize layer box",
-        coalesceKey: `box-size:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  const handleDomRotationCommit = useCallback(
-    (selection: DomEditSelection, next: { angle: number }) => {
-      applyStudioRotation(selection.element, next);
-      commitPositionPatchToHtml(selection, buildRotationPatches(selection.element), {
-        label: "Rotate layer",
-        coalesceKey: `rotation:${getDomEditTargetKey(selection)}`,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  const handleDomManualEditsReset = useCallback(
-    (selection: DomEditSelection) => {
-      const element = selection.element;
-      const clearPatches = [
-        ...buildClearPathOffsetPatches(element),
-        ...buildClearBoxSizePatches(element),
-        ...buildClearRotationPatches(element),
-      ];
-      clearStudioPathOffset(element);
-      clearStudioBoxSize(element);
-      clearStudioRotation(element);
-      // skipRefresh:false triggers reloadPreview() which re-syncs selection on load
-      commitPositionPatchToHtml(selection, clearPatches, {
-        label: "Reset layer edits",
-        coalesceKey: `manual-reset:${getDomEditTargetKey(selection)}`,
-        skipRefresh: false,
-      });
-    },
-    [commitPositionPatchToHtml],
-  );
-
-  // ── Motion commits (HTML-attribute–backed) ──
-
-  const handleDomMotionCommit = useCallback(
-    (
-      selection: DomEditSelection,
-      motion: Omit<StudioGsapMotion, "kind" | "target" | "updatedAt">,
-    ) => {
-      // 1. Write motion data as JSON attribute on the element
-      writeStudioMotionToElement(selection.element, motion);
-      // 2. Apply the GSAP timeline from DOM attributes
-      let doc: Document | null = null;
-      try {
-        doc = previewIframeRef.current?.contentDocument ?? null;
-      } catch {
-        // cross-origin guard
-      }
-      if (doc) applyStudioMotionFromDom(doc);
-      // 3. Build patches and persist to HTML
-      const patches = buildMotionPatches(selection.element);
-      commitPositionPatchToHtml(selection, patches, {
-        label: "Set GSAP motion",
-        coalesceKey: `motion:${getDomEditTargetKey(selection)}`,
-      });
-      refreshDomEditSelectionFromPreview(selection);
-    },
-    [commitPositionPatchToHtml, previewIframeRef, refreshDomEditSelectionFromPreview],
-  );
-
-  const handleDomMotionClear = useCallback(
-    (selection: DomEditSelection) => {
-      const clearPatches = buildClearMotionPatches(selection.element);
-      // Get gsap from the preview window for proper cleanup
-      let gsap: { set?: (target: HTMLElement, vars: Record<string, unknown>) => void } | undefined;
-      try {
-        gsap = (previewIframeRef.current?.contentWindow as { gsap?: typeof gsap })?.gsap;
-      } catch {
-        // cross-origin guard
-      }
-      clearStudioMotionFromElement(selection.element, gsap);
-      let doc: Document | null = null;
-      try {
-        doc = previewIframeRef.current?.contentDocument ?? null;
-      } catch {
-        // cross-origin guard
-      }
-      if (doc) applyStudioMotionFromDom(doc);
-      commitPositionPatchToHtml(selection, clearPatches, {
-        label: "Clear GSAP motion",
-        coalesceKey: `motion:${getDomEditTargetKey(selection)}`,
-        skipRefresh: false,
-      });
-      refreshDomEditSelectionFromPreview(selection);
-    },
-    [commitPositionPatchToHtml, previewIframeRef, refreshDomEditSelectionFromPreview],
-  );
-
-  const handleDomEditElementDelete = useCallback(
-    async (selection: DomEditSelection) => {
-      const pid = projectIdRef.current;
-      if (!pid) return;
-      const label = selection.label || selection.id || selection.selector || selection.tagName;
-
-      const targetPath = selection.sourceFile || activeCompPath || "index.html";
-      try {
-        const response = await fetch(
-          `/api/projects/${pid}/files/${encodeURIComponent(targetPath)}`,
-        );
-        if (!response.ok) throw new Error(`Failed to read ${targetPath}`);
-
-        const data = (await response.json()) as { content?: string };
-        const originalContent = data.content;
-        if (typeof originalContent !== "string")
-          throw new Error(`Missing file contents for ${targetPath}`);
-
-        const patchTarget: { id?: string; selector?: string; selectorIndex?: number } = selection.id
-          ? {
-              id: selection.id,
-              selector: selection.selector,
-              selectorIndex: selection.selectorIndex,
-            }
-          : selection.selector
-            ? { selector: selection.selector, selectorIndex: selection.selectorIndex }
-            : ({} as never);
-        if (!patchTarget.id && !patchTarget.selector) {
-          throw new Error("Selected element has no patchable target");
-        }
-
-        const removeResponse = await fetch(
-          `/api/projects/${pid}/file-mutations/remove-element/${encodeURIComponent(targetPath)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ target: patchTarget }),
-          },
-        );
-        if (!removeResponse.ok) throw new Error(`Failed to delete element from ${targetPath}`);
-
-        const removeData = (await removeResponse.json()) as { changed?: boolean; content?: string };
-        const patchedContent =
-          typeof removeData.content === "string" ? removeData.content : originalContent;
-
-        domEditSaveTimestampRef.current = Date.now();
-        await saveProjectFilesWithHistory({
-          projectId: pid,
-          label: "Delete element",
-          kind: "timeline",
-          files: { [targetPath]: patchedContent },
-          readFile: async () => originalContent,
-          writeFile: writeProjectFile,
-          recordEdit: editHistory.recordEdit,
-        });
-
-        clearDomSelection();
-        usePlayerStore.getState().setSelectedElementId(null);
-        reloadPreview();
-        showToast(`Deleted ${label}. Use Undo to restore it.`, "info");
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Failed to delete element";
-        showToast(message);
-      }
-    },
-    [
-      activeCompPath,
-      clearDomSelection,
-      domEditSaveTimestampRef,
-      editHistory.recordEdit,
-      projectIdRef,
-      reloadPreview,
-      showToast,
-      writeProjectFile,
-    ],
-  );
+  const { handleDomEditElementDelete, handleDomZIndexReorderCommit } = useElementLifecycleOps({
+    activeCompPath,
+    showToast,
+    writeProjectFile,
+    domEditSaveTimestampRef,
+    editHistory,
+    projectIdRef,
+    reloadPreview,
+    clearDomSelection,
+    onTrySdkDelete,
+    onReorderShadow,
+    forceReloadSdkSession,
+    commitDomEditPatchBatches,
+  });
 
   return {
     resolveImportedFontAsset,
     handleDomStyleCommit,
+    handleDomAttributeCommit,
+    handleDomAttributeLiveCommit,
+    handleDomAttributeQuietCommit,
+    handleDomHtmlAttributeCommit,
+    handleDomAttributesCommit,
     handleDomTextCommit,
+    handleDomRichTextCommit,
     commitDomTextFields,
     handleDomTextFieldStyleCommit,
     handleDomAddTextField,
     handleDomRemoveTextField,
     handleDomPathOffsetCommit,
-    handleDomGroupPathOffsetCommit,
     handleDomBoxSizeCommit,
     handleDomRotationCommit,
     handleDomManualEditsReset,
-    handleDomMotionCommit,
-    handleDomMotionClear,
     handleDomEditElementDelete,
+    handleDomZIndexReorderCommit,
   };
 }

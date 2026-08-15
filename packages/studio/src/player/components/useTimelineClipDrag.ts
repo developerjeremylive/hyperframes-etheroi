@@ -1,48 +1,45 @@
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useMemo, useEffect } from "react";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import {
-  resolveTimelineMove,
-  resolveTimelineResize,
-  resolveTimelineAutoScroll,
-  type BlockedTimelineEditIntent,
+  applyTimelineAutoScrollStep,
+  resolveTimelineAutoScrollLoopAction,
 } from "./timelineEditing";
 import { usePlayerStore } from "../store/playerStore";
 import type { TimelineElement } from "../store/playerStore";
-import { TRACK_H } from "./timelineLayout";
+import { mergeUserBeats } from "../../utils/beatEditing";
+import {
+  buildTimelineGroupResizeMembers,
+  type TimelineGroupResizeSession,
+} from "./timelineGroupEditing";
+import { collectTimelineSnapTargets, type TimelineSnapTarget } from "./timelineSnapping";
+import type { StackingPatch } from "./timelineStackingSync";
+import type { TimelineEditCallbacks } from "./timelineCallbacks";
+import {
+  computeDragPreview,
+  computeResizePreview,
+  previewGroupResize,
+  type ResizePreviewResult,
+} from "./timelineClipDragPreview";
+import type {
+  DraggedClipState,
+  ResizingClipState,
+  BlockedClipState,
+} from "./timelineClipDragTypes";
+import { getTimelineElementIndexes } from "../lib/timelineElementIndexes";
+import type { TimelineRowGeometry } from "./timelineLayout";
+import {
+  mountTimelineClipDragGestureLifecycle,
+  type TimelineGestureKind,
+  type TimelineGestureLifecycle,
+} from "./timelineClipDragGestureLifecycle";
 
-/* ── Shared state types ─────────────────────────────────────────── */
-export interface DraggedClipState {
-  element: TimelineElement;
-  originClientX: number;
-  originClientY: number;
-  originScrollLeft: number;
-  originScrollTop: number;
-  pointerClientX: number;
-  pointerClientY: number;
-  pointerOffsetX: number;
-  pointerOffsetY: number;
-  previewStart: number;
-  previewTrack: number;
-  started: boolean;
-}
+export type {
+  DraggedClipState,
+  ResizingClipState,
+  BlockedClipState,
+} from "./timelineClipDragTypes";
 
-export interface ResizingClipState {
-  element: TimelineElement;
-  edge: "start" | "end";
-  originClientX: number;
-  previewStart: number;
-  previewDuration: number;
-  previewPlaybackStart?: number;
-  started: boolean;
-}
-
-export interface BlockedClipState {
-  element: TimelineElement;
-  intent: BlockedTimelineEditIntent;
-  originClientX: number;
-  originClientY: number;
-  started: boolean;
-}
+const EMPTY_BEAT_TIMES: number[] = [];
 
 /* ── Hook ───────────────────────────────────────────────────────── */
 interface UseTimelineClipDragInput {
@@ -50,18 +47,38 @@ interface UseTimelineClipDragInput {
   ppsRef: React.RefObject<number>;
   durationRef: React.RefObject<number>;
   trackOrderRef: React.RefObject<number[]>;
+  rowGeometryRef?: React.RefObject<TimelineRowGeometry>;
   onMoveElement?: (
     element: TimelineElement,
     updates: Pick<TimelineElement, "start" | "track">,
+  ) => Promise<void> | void;
+  onMoveElements?: (
+    edits: Array<{
+      element: TimelineElement;
+      updates: Pick<TimelineElement, "start" | "track">;
+    }>,
   ) => Promise<void> | void;
   onResizeElement?: (
     element: TimelineElement,
     updates: Pick<TimelineElement, "start" | "duration" | "playbackStart">,
   ) => Promise<void> | void;
-  onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedTimelineEditIntent) => void;
+  onResizeElements?: NonNullable<TimelineEditCallbacks["onResizeElements"]>;
+  onBlockedEditAttempt?: (element: TimelineElement, intent: BlockedClipState["intent"]) => void;
   setShowPopover: (show: boolean) => void;
   /** Stable ref to the range selection setter — wired after mount to break circular dependency. */
   setRangeSelectionRef: React.RefObject<((sel: null) => void) | null>;
+  /**
+   * Lane ↔ stacking unification (see research/STAGE3-NEEDED-WIRING.md). When both
+   * are supplied and a lane-change drag commits, the edited clip(s) get z-index
+   * patches so their stacking matches lane order relative to time-overlapping
+   * clips. Provisioned by the timeline layer (Timeline.tsx) from the preview
+   * iframe + the canvas z-order persist path; forwarded straight to
+   * commitDraggedClipMove. Both optional → absent = no-op (backward compatible).
+   */
+  readZIndex?: (element: TimelineElement) => number;
+  onStackingPatches?: (patches: StackingPatch[]) => Promise<unknown> | void;
+  refreshAfterLaneMove?: () => void;
+  sessionEpoch?: number;
 }
 
 export function useTimelineClipDrag({
@@ -69,66 +86,251 @@ export function useTimelineClipDrag({
   ppsRef,
   durationRef,
   trackOrderRef,
+  rowGeometryRef,
   onMoveElement,
+  onMoveElements,
   onResizeElement,
+  onResizeElements,
   onBlockedEditAttempt,
   setShowPopover,
   setRangeSelectionRef,
+  readZIndex,
+  onStackingPatches,
+  refreshAfterLaneMove,
+  sessionEpoch = 0,
 }: UseTimelineClipDragInput) {
   const updateElement = usePlayerStore((s) => s.updateElement);
+  const rawBeatTimes = usePlayerStore((s) => s.beatAnalysis?.beatTimes ?? EMPTY_BEAT_TIMES);
+  const rawBeatStrengths = usePlayerStore((s) => s.beatAnalysis?.beatStrengths ?? EMPTY_BEAT_TIMES);
+  const beatEdits = usePlayerStore((s) => s.beatEdits);
+  const musicElement = usePlayerStore((s) => getTimelineElementIndexes(s.elements).musicElement);
+  const musicStart = musicElement?.start ?? 0;
+  const musicPlaybackStart = musicElement?.playbackStart ?? 0;
+  const musicDuration = musicElement?.duration ?? 0;
+  const musicSrc = musicElement?.src ?? null;
 
-  const [draggedClip, setDraggedClip] = useState<DraggedClipState | null>(null);
+  const adjustedBeatTimes = useMemo(() => {
+    if (rawBeatTimes === EMPTY_BEAT_TIMES || musicDuration === 0) return EMPTY_BEAT_TIMES;
+    const merged = mergeUserBeats(rawBeatTimes, rawBeatStrengths, beatEdits, musicSrc);
+    const clipEnd = musicPlaybackStart + musicDuration;
+    const offset = musicStart - musicPlaybackStart;
+    return merged.times
+      .filter((t) => t >= musicPlaybackStart && t <= clipEnd)
+      .map((t) => Math.round((t + offset) * 1000) / 1000);
+  }, [
+    rawBeatTimes,
+    rawBeatStrengths,
+    beatEdits,
+    musicSrc,
+    musicStart,
+    musicPlaybackStart,
+    musicDuration,
+  ]);
+
+  const elements = usePlayerStore((s) => s.elements);
+  const timelineSnapEnabled = usePlayerStore((s) => s.timelineSnapEnabled);
+  const snapContextRef = useRef<{ beatTimes: number[]; enabled: boolean }>({
+    beatTimes: [],
+    enabled: true,
+  });
+  snapContextRef.current = {
+    beatTimes: adjustedBeatTimes,
+    enabled: timelineSnapEnabled,
+  };
+  const elementsRef = useRef(elements);
+  elementsRef.current = elements;
+
+  // Perf (frozen-per-gesture): the snap-target set and the audio-track set are
+  // fixed for the duration of one drag/resize (the store is not re-authored mid
+  // gesture), so build each ONCE and reuse it across every pointermove and every
+  // auto-scroll frame. Both caches are cleared at gesture teardown
+  // (stopClipDragAutoScroll), so the next gesture rebuilds against fresh state.
+  const snapTargetsCacheRef = useRef<Map<string, TimelineSnapTarget[]>>(new Map());
+  const dragAudioTracksRef = useRef<ReadonlySet<number> | null>(null);
+
+  const buildSnapTargets = useCallback(
+    (excludeElementKey: string | null, includeBeats: boolean): TimelineSnapTarget[] => {
+      // Magnet off ⇒ no targets and no scan; do NOT cache so a mid-gesture toggle
+      // back on starts scanning immediately (preserves the existing skip).
+      if (!snapContextRef.current.enabled) return [];
+      const cacheKey = `${excludeElementKey ?? ""}|${includeBeats ? 1 : 0}`;
+      const cached = snapTargetsCacheRef.current.get(cacheKey);
+      if (cached) return cached;
+      const targets = collectTimelineSnapTargets({
+        elements: elementsRef.current,
+        playheadTime: usePlayerStore.getState().currentTime,
+        beatTimes: includeBeats ? snapContextRef.current.beatTimes : [],
+        excludeElementKey,
+      });
+      snapTargetsCacheRef.current.set(cacheKey, targets);
+      return targets;
+    },
+    [],
+  );
+
+  const [draggedClip, setDraggedClipState] = useState<DraggedClipState | null>(null);
   const draggedClipRef = useRef<DraggedClipState | null>(null);
-  draggedClipRef.current = draggedClip;
+  const publishDraggedClip = useCallback((next: DraggedClipState | null) => {
+    draggedClipRef.current = next;
+    setDraggedClipState(next);
+  }, []);
 
-  const [resizingClip, setResizingClip] = useState<ResizingClipState | null>(null);
+  const [resizingClip, setResizingClipState] = useState<ResizingClipState | null>(null);
   const resizingClipRef = useRef<ResizingClipState | null>(null);
-  resizingClipRef.current = resizingClip;
+  const publishResizingClip = useCallback((next: ResizingClipState | null) => {
+    resizingClipRef.current = next;
+    setResizingClipState(next);
+  }, []);
+
+  const lifecycleRef = useRef<TimelineGestureLifecycle>({
+    kind: null,
+    phase: "complete",
+    pointerId: null,
+    sessionEpoch,
+  });
+  const sessionEpochRef = useRef(sessionEpoch);
+  sessionEpochRef.current = sessionEpoch;
+  const gestureSelectedKeysRef = useRef<ReadonlySet<string>>(new Set());
+  const cancelGestureRef = useRef<
+    (options?: { updateReact?: boolean; suppressClick?: boolean }) => boolean
+  >(() => false);
+  const beginGesture = useCallback((kind: TimelineGestureKind, pointerId: number) => {
+    if (lifecycleRef.current.phase === "active") cancelGestureRef.current();
+    lifecycleRef.current = {
+      kind,
+      phase: "active",
+      pointerId,
+      sessionEpoch: sessionEpochRef.current,
+    };
+    gestureSelectedKeysRef.current = new Set(usePlayerStore.getState().selectedElementIds);
+  }, []);
+  const setDraggedClip = useCallback(
+    (next: DraggedClipState | null) => {
+      if (!next) {
+        cancelGestureRef.current();
+        return;
+      }
+      beginGesture("drag", next.pointerId);
+      publishDraggedClip(next);
+    },
+    [beginGesture, publishDraggedClip],
+  );
+  const setResizingClip = useCallback(
+    (next: ResizingClipState | null) => {
+      if (!next) {
+        cancelGestureRef.current();
+        return;
+      }
+      beginGesture("resize", next.pointerId);
+      publishResizingClip(next);
+    },
+    [beginGesture, publishResizingClip],
+  );
 
   const blockedClipRef = useRef<BlockedClipState | null>(null);
   const suppressClickRef = useRef(false);
 
+  // Active multi-select group-resize session, created lazily on first movement.
+  // It owns a projection only; canonical store timing changes at commit.
+  const groupResizeRef = useRef<TimelineGroupResizeSession | null>(null);
+
   const onMoveElementRef = useRef(onMoveElement);
   onMoveElementRef.current = onMoveElement;
+  const onMoveElementsRef = useRef(onMoveElements);
+  onMoveElementsRef.current = onMoveElements;
+  const onBlockedEditAttemptRef = useRef(onBlockedEditAttempt);
+  onBlockedEditAttemptRef.current = onBlockedEditAttempt;
   const onResizeElementRef = useRef(onResizeElement);
   onResizeElementRef.current = onResizeElement;
+  const onResizeElementsRef = useRef(onResizeElements);
+  onResizeElementsRef.current = onResizeElements;
+  const readZIndexRef = useRef(readZIndex);
+  readZIndexRef.current = readZIndex;
+  const onStackingPatchesRef = useRef(onStackingPatches);
+  onStackingPatchesRef.current = onStackingPatches;
+  const refreshAfterLaneMoveRef = useRef(refreshAfterLaneMove);
+  refreshAfterLaneMoveRef.current = refreshAfterLaneMove;
 
   const clipDragScrollRaf = useRef(0);
-  const clipDragPointerRef = useRef<{ clientX: number; clientY: number } | null>(null);
+  const clipDragPointerRef = useRef<{
+    clientX: number;
+    clientY: number;
+  } | null>(null);
 
+  // Recompute the dragged-clip preview for a pointer position. The heavy lifting
+  // (move + snap + group clamp + drop placement) is a tested pure function so
+  // what runs here is what's verified — see timelineClipDragPreview.
   const updateDraggedClipPreview = useCallback(
     (drag: DraggedClipState, clientX: number, clientY: number): DraggedClipState => {
-      const scroll = scrollRef.current;
-      const nextMove = resolveTimelineMove(
-        {
-          start: drag.element.start,
-          track: drag.element.track,
-          duration: drag.element.duration,
-          originClientX: drag.originClientX,
-          originClientY: drag.originClientY,
-          originScrollLeft: drag.originScrollLeft,
-          originScrollTop: drag.originScrollTop,
-          currentScrollLeft: scroll?.scrollLeft ?? drag.originScrollLeft,
-          currentScrollTop: scroll?.scrollTop ?? drag.originScrollTop,
-          pixelsPerSecond: ppsRef.current,
-          trackHeight: TRACK_H,
-          maxStart: Math.max(0, durationRef.current - drag.element.duration),
-          trackOrder: trackOrderRef.current,
-        },
-        clientX,
-        clientY,
-      );
-      return {
-        ...drag,
-        started: true,
-        pointerClientX: clientX,
-        pointerClientY: clientY,
-        previewStart: nextMove.start,
-        previewTrack: nextMove.track,
-      };
+      // Build the audio-track set once per gesture (see snapTargetsCacheRef): it
+      // only feeds zone-aware drop placement and is frozen while dragging.
+      if (!dragAudioTracksRef.current) {
+        dragAudioTracksRef.current = getTimelineElementIndexes(elementsRef.current).audioTracks;
+      }
+      return computeDragPreview(drag, clientX, clientY, {
+        scroll: scrollRef.current,
+        pps: ppsRef.current,
+        duration: durationRef.current,
+        trackOrder: trackOrderRef.current,
+        rowHeights: rowGeometryRef?.current.rowHeights,
+        elements: elementsRef.current,
+        selectedKeys: gestureSelectedKeysRef.current,
+        buildSnapTargets,
+        audioTracks: dragAudioTracksRef.current,
+      });
     },
-    [scrollRef, ppsRef, durationRef, trackOrderRef],
+    [scrollRef, ppsRef, durationRef, trackOrderRef, rowGeometryRef, buildSnapTargets],
   );
+
+  // Recompute the trim preview for a pointer x. Shared by the pointermove resize
+  // branch and the edge auto-scroll stepper (re-runs as content scrolls under a
+  // stationary pointer). computeResizePreview is pure; here we only apply state.
+  const applyResizePointer = useCallback(
+    (resize: ResizingClipState, clientX: number) => {
+      const next = computeResizePreview(resize, clientX, {
+        scroll: scrollRef.current,
+        pps: ppsRef.current,
+        buildSnapTargets,
+      });
+      const setResizeState = (v: ResizePreviewResult) =>
+        publishResizingClip(
+          resizingClipRef.current ? { ...resizingClipRef.current, started: true, ...v } : null,
+        );
+
+      // Group resize: a capability-clean multi-selection resizes rigidly by one
+      // shared, member-clamped delta (legacy main 36413da7f). The grabbed clip
+      // drives the raw delta; every member renders from the coordinator projection.
+      const grabbedKey = resize.element.key ?? resize.element.id;
+      let session = groupResizeRef.current;
+      if (!session || session.grabbedKey !== grabbedKey || session.edge !== resize.edge) {
+        const members = buildTimelineGroupResizeMembers(
+          elementsRef.current,
+          gestureSelectedKeysRef.current,
+          grabbedKey,
+          resize.edge,
+        );
+        session = members
+          ? {
+              grabbedKey,
+              edge: resize.edge,
+              members,
+              changes: [],
+              hasChanged: false,
+            }
+          : null;
+        groupResizeRef.current = session;
+      }
+
+      if (!session) {
+        setResizeState(next);
+        return;
+      }
+      previewGroupResize(session, next, setResizeState);
+    },
+    [scrollRef, ppsRef, buildSnapTargets, publishResizingClip],
+  );
+  const applyResizePointerRef = useRef(applyResizePointer);
+  applyResizePointerRef.current = applyResizePointer;
 
   const stopClipDragAutoScroll = useCallback(() => {
     clipDragPointerRef.current = null;
@@ -136,48 +338,43 @@ export function useTimelineClipDrag({
       cancelAnimationFrame(clipDragScrollRaf.current);
       clipDragScrollRaf.current = 0;
     }
+    // Gesture teardown: drop frozen caches so the next gesture reads fresh state.
+    snapTargetsCacheRef.current.clear();
+    dragAudioTracksRef.current = null;
   }, []);
 
   const stepClipDragAutoScroll = useCallback(() => {
     clipDragScrollRaf.current = 0;
     const drag = draggedClipRef.current;
+    const resize = resizingClipRef.current;
     const pointer = clipDragPointerRef.current;
     const scroll = scrollRef.current;
-    if (!drag || !pointer || !scroll) return;
+    if ((!drag && !resize) || !pointer || !scroll) return;
+    if (!applyTimelineAutoScrollStep(scroll, pointer.clientX, pointer.clientY)) return;
 
-    const rect = scroll.getBoundingClientRect();
-    const delta = resolveTimelineAutoScroll(rect, pointer.clientX, pointer.clientY);
-    if (delta.x === 0 && delta.y === 0) return;
-
-    const maxScrollLeft = Math.max(0, scroll.scrollWidth - scroll.clientWidth);
-    const maxScrollTop = Math.max(0, scroll.scrollHeight - scroll.clientHeight);
-    const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, scroll.scrollLeft + delta.x));
-    const nextScrollTop = Math.max(0, Math.min(maxScrollTop, scroll.scrollTop + delta.y));
-    if (nextScrollLeft === scroll.scrollLeft && nextScrollTop === scroll.scrollTop) return;
-
-    scroll.scrollLeft = nextScrollLeft;
-    scroll.scrollTop = nextScrollTop;
-    setDraggedClip((prev) =>
-      prev ? updateDraggedClipPreview(prev, pointer.clientX, pointer.clientY) : prev,
-    );
+    if (drag) {
+      publishDraggedClip(updateDraggedClipPreview(drag, pointer.clientX, pointer.clientY));
+    } else if (resize) {
+      // Re-run the trim preview so the edge keeps tracking while the content
+      // scrolls under the stationary pointer (scroll-compensated pointer x).
+      applyResizePointerRef.current(resize, pointer.clientX);
+    }
     clipDragScrollRaf.current = requestAnimationFrame(stepClipDragAutoScroll);
-  }, [scrollRef, updateDraggedClipPreview]);
+  }, [publishDraggedClip, scrollRef, updateDraggedClipPreview]);
 
   const syncClipDragAutoScroll = useCallback(
     (clientX: number, clientY: number) => {
       clipDragPointerRef.current = { clientX, clientY };
-      const scroll = scrollRef.current;
-      if (!scroll) return;
-      const rect = scroll.getBoundingClientRect();
-      const delta = resolveTimelineAutoScroll(rect, clientX, clientY);
-      if (delta.x === 0 && delta.y === 0) {
-        if (clipDragScrollRaf.current) {
-          cancelAnimationFrame(clipDragScrollRaf.current);
-          clipDragScrollRaf.current = 0;
-        }
-        return;
-      }
-      if (!clipDragScrollRaf.current) {
+      const action = resolveTimelineAutoScrollLoopAction(
+        scrollRef.current,
+        clientX,
+        clientY,
+        clipDragScrollRaf.current !== 0,
+      );
+      if (action === "stop") {
+        cancelAnimationFrame(clipDragScrollRaf.current);
+        clipDragScrollRaf.current = 0;
+      } else if (action === "start") {
         clipDragScrollRaf.current = requestAnimationFrame(stepClipDragAutoScroll);
       }
     },
@@ -191,189 +388,44 @@ export function useTimelineClipDrag({
   const stopClipDragAutoScrollRef = useRef(stopClipDragAutoScroll);
   stopClipDragAutoScrollRef.current = stopClipDragAutoScroll;
 
-  useMountEffect(() => {
-    const clearSuppressedClick = () => {
-      requestAnimationFrame(() => {
-        suppressClickRef.current = false;
-      });
-    };
+  useMountEffect(() =>
+    mountTimelineClipDragGestureLifecycle({
+      onStackingPatchesRef,
+      refreshAfterLaneMoveRef,
+      readZIndexRef,
+      onBlockedEditAttemptRef,
+      onResizeElementsRef,
+      onResizeElementRef,
+      onMoveElementsRef,
+      onMoveElementRef,
+      updateElement,
+      publishDraggedClip,
+      updateDraggedClipPreviewRef,
+      stopClipDragAutoScrollRef,
+      syncClipDragAutoScrollRef,
+      applyResizePointerRef,
+      setRangeSelectionRef,
+      setShowPopover,
+      setResizingClipState,
+      setDraggedClipState,
+      trackOrderRef,
+      elementsRef,
+      gestureSelectedKeysRef,
+      suppressClickRef,
+      groupResizeRef,
+      blockedClipRef,
+      resizingClipRef,
+      draggedClipRef,
+      scrollRef,
+      cancelGestureRef,
+      sessionEpochRef,
+      lifecycleRef,
+    }),
+  );
 
-    const handleWindowPointerMove = (e: PointerEvent) => {
-      const drag = draggedClipRef.current;
-      const resize = resizingClipRef.current;
-      const blocked = blockedClipRef.current;
-
-      if (resize) {
-        const distance = Math.abs(e.clientX - resize.originClientX);
-        if (!resize.started && distance < 2) return;
-
-        setShowPopover(false);
-        setRangeSelectionRef.current?.(null);
-
-        const sourceRemaining =
-          resize.element.sourceDuration != null
-            ? Math.max(
-                0,
-                (resize.element.sourceDuration - (resize.element.playbackStart ?? 0)) /
-                  Math.max(resize.element.playbackRate ?? 1, 0.1),
-              )
-            : Number.POSITIVE_INFINITY;
-        const normalizedTag = resize.element.tag.toLowerCase();
-        const canSeedPlaybackStart = normalizedTag === "audio" || normalizedTag === "video";
-        const nextResize = resolveTimelineResize(
-          {
-            start: resize.element.start,
-            duration: resize.element.duration,
-            originClientX: resize.originClientX,
-            pixelsPerSecond: ppsRef.current,
-            minStart: 0,
-            maxEnd: Math.min(durationRef.current, resize.element.start + sourceRemaining),
-            playbackStart:
-              resize.edge === "start" && canSeedPlaybackStart
-                ? (resize.element.playbackStart ?? 0)
-                : resize.element.playbackStart,
-            playbackRate: resize.element.playbackRate,
-          },
-          resize.edge,
-          e.clientX,
-        );
-
-        setResizingClip((prev) =>
-          prev
-            ? {
-                ...prev,
-                started: true,
-                previewStart: nextResize.start,
-                previewDuration: nextResize.duration,
-                previewPlaybackStart: nextResize.playbackStart,
-              }
-            : prev,
-        );
-        return;
-      }
-
-      if (blocked) {
-        const distance = Math.hypot(
-          e.clientX - blocked.originClientX,
-          e.clientY - blocked.originClientY,
-        );
-        const threshold = blocked.intent === "move" ? 4 : 2;
-        if (!blocked.started && distance < threshold) return;
-        if (!blocked.started) {
-          blocked.started = true;
-          blockedClipRef.current = blocked;
-          suppressClickRef.current = true;
-          setShowPopover(false);
-          setRangeSelectionRef.current?.(null);
-          onBlockedEditAttempt?.(blocked.element, blocked.intent);
-        }
-        return;
-      }
-
-      if (!drag) return;
-      const distance = Math.hypot(e.clientX - drag.originClientX, e.clientY - drag.originClientY);
-      if (!drag.started && distance < 4) return;
-
-      setShowPopover(false);
-      setRangeSelectionRef.current?.(null);
-
-      setDraggedClip((prev) =>
-        prev ? updateDraggedClipPreviewRef.current(prev, e.clientX, e.clientY) : prev,
-      );
-      syncClipDragAutoScrollRef.current(e.clientX, e.clientY);
-    };
-
-    const handleWindowPointerUp = () => {
-      stopClipDragAutoScrollRef.current();
-
-      const resize = resizingClipRef.current;
-      if (resize) {
-        resizingClipRef.current = null;
-        setResizingClip(null);
-        if (!resize.started) return;
-
-        suppressClickRef.current = true;
-        clearSuppressedClick();
-
-        const hasChanged =
-          resize.previewStart !== resize.element.start ||
-          resize.previewDuration !== resize.element.duration ||
-          resize.previewPlaybackStart !== resize.element.playbackStart;
-        if (!hasChanged) return;
-
-        updateElement(resize.element.key ?? resize.element.id, {
-          start: resize.previewStart,
-          duration: resize.previewDuration,
-          playbackStart: resize.previewPlaybackStart,
-        });
-
-        Promise.resolve(
-          onResizeElementRef.current?.(resize.element, {
-            start: resize.previewStart,
-            duration: resize.previewDuration,
-            playbackStart: resize.previewPlaybackStart,
-          }),
-        ).catch((error) => {
-          updateElement(resize.element.key ?? resize.element.id, {
-            start: resize.element.start,
-            duration: resize.element.duration,
-            playbackStart: resize.element.playbackStart,
-          });
-          console.error("[Timeline] Failed to persist clip resize", error);
-        });
-        return;
-      }
-
-      const blocked = blockedClipRef.current;
-      if (blocked) {
-        blockedClipRef.current = null;
-        if (!blocked.started) return;
-        clearSuppressedClick();
-        return;
-      }
-
-      const drag = draggedClipRef.current;
-      if (!drag) return;
-      draggedClipRef.current = null;
-      setDraggedClip(null);
-      if (!drag.started) return;
-
-      suppressClickRef.current = true;
-      clearSuppressedClick();
-
-      const hasChanged =
-        drag.previewStart !== drag.element.start || drag.previewTrack !== drag.element.track;
-      if (!hasChanged) return;
-
-      updateElement(drag.element.key ?? drag.element.id, {
-        start: drag.previewStart,
-        track: drag.previewTrack,
-      });
-
-      Promise.resolve(
-        onMoveElementRef.current?.(drag.element, {
-          start: drag.previewStart,
-          track: drag.previewTrack,
-        }),
-      ).catch((error) => {
-        updateElement(drag.element.key ?? drag.element.id, {
-          start: drag.element.start,
-          track: drag.element.track,
-        });
-        console.error("[Timeline] Failed to persist clip move", error);
-      });
-    };
-
-    window.addEventListener("pointermove", handleWindowPointerMove);
-    window.addEventListener("pointerup", handleWindowPointerUp);
-    window.addEventListener("pointercancel", handleWindowPointerUp);
-    return () => {
-      stopClipDragAutoScrollRef.current();
-      window.removeEventListener("pointermove", handleWindowPointerMove);
-      window.removeEventListener("pointerup", handleWindowPointerUp);
-      window.removeEventListener("pointercancel", handleWindowPointerUp);
-    };
-  });
+  useEffect(() => {
+    cancelGestureRef.current();
+  }, [sessionEpoch]);
 
   return {
     draggedClip,
@@ -382,7 +434,6 @@ export function useTimelineClipDrag({
     setResizingClip,
     blockedClipRef,
     suppressClickRef,
-    syncClipDragAutoScroll,
     stopClipDragAutoScroll,
   };
 }

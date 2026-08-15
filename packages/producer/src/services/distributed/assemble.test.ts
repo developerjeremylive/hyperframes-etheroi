@@ -19,8 +19,15 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  PROVENANCE_RENDERER_NAME,
+  PROVENANCE_VERSION,
+  readRenderProvenance,
+  renderProvenanceArgs,
+} from "@hyperframes/engine";
 import type { ChunkSliceJson } from "../render/stages/freezePlan.js";
 import { assemble } from "./assemble.js";
+import type { DistributedFormat } from "./shared.js";
 
 let runRoot: string;
 let hasFfmpeg = false;
@@ -37,15 +44,16 @@ afterAll(() => {
 /**
  * Build a synthetic planDir whose `meta/chunks.json` declares N chunks of
  * `framesPerChunk` frames each. Does NOT materialize compiled/, video-frames/,
- * audio.aac — assemble only reads `plan.json` + `meta/chunks.json`, and we
+ * audio.m4a — assemble only reads `plan.json` + `meta/chunks.json`, and we
  * pass chunk paths explicitly. Keeping the dir lean speeds up the test
  * loop.
  */
 function buildPlanDir(
-  format: "mp4" | "png-sequence",
+  format: DistributedFormat,
   chunks: ChunkSliceJson[],
   totalFrames: number,
   hasAudio: boolean,
+  encoder: "libx264-software" | "libx265-software" = "libx264-software",
 ): string {
   const planDir = mkdtempSync(join(runRoot, `plan-${format}-`));
   mkdirSync(join(planDir, "meta"), { recursive: true });
@@ -60,6 +68,10 @@ function buildPlanDir(
     "utf-8",
   );
   writeFileSync(join(planDir, "meta", "chunks.json"), JSON.stringify(chunks), "utf-8");
+  // Minimal encoder.json — assemble reads this when cfr=true to detect h265
+  // chunks (the cfr re-encode hardcodes libx264 and would silently transcode
+  // h265). Tests default to libx264 to match the in-production default.
+  writeFileSync(join(planDir, "meta", "encoder.json"), JSON.stringify({ encoder }), "utf-8");
   return planDir;
 }
 
@@ -105,6 +117,57 @@ function makeMp4Chunk(outputPath: string, frameCount: number): void {
   }
 }
 
+/**
+ * Encode a tiny provenance-tagged chunk in `format`, mirroring what the chunk
+ * encoder writes. mov uses libx264 rather than production's ProRes: container
+ * metadata handling belongs to the muxer, not the codec, and h264-in-mov keeps
+ * the test fast and portable across CI ffmpeg builds.
+ */
+function makeTaggedChunk(outputPath: string, frameCount: number, format: "mov" | "webm"): void {
+  const codec =
+    format === "webm"
+      ? ["-c:v", "libvpx-vp9", "-b:v", "200k"]
+      : ["-c:v", "libx264", "-preset", "ultrafast"];
+  const args = [
+    "-v",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    `testsrc=size=160x120:rate=30:duration=${frameCount / 30}`,
+    ...codec,
+    "-g",
+    String(frameCount),
+    "-keyint_min",
+    String(frameCount),
+    "-pix_fmt",
+    "yuv420p",
+    "-vframes",
+    String(frameCount),
+    ...renderProvenanceArgs(outputPath),
+    "-y",
+    outputPath,
+  ];
+  const result = spawnSync("ffmpeg", args, { stdio: "pipe" });
+  if (result.status !== 0) {
+    throw new Error(`ffmpeg ${format} chunk failed: ${result.stderr.toString().slice(-400)}`);
+  }
+}
+
+/** Read the provenance tags ffprobe actually reports for `outputPath`. */
+function probeProvenance(outputPath: string): { renderer: string; version: string } | null {
+  const result = spawnSync(
+    "ffprobe",
+    ["-v", "error", "-show_entries", "format_tags", "-of", "json", "--", outputPath],
+    { stdio: "pipe" },
+  );
+  if (result.status !== 0) return null;
+  const parsed = JSON.parse(result.stdout.toString()) as {
+    format?: { tags?: Record<string, string> };
+  };
+  return readRenderProvenance(parsed.format?.tags ?? {});
+}
+
 /** Generate an AAC audio file of `durationSeconds` of silence. */
 function makeAacAudio(outputPath: string, durationSeconds: number): void {
   const result = spawnSync("ffmpeg", [
@@ -141,10 +204,11 @@ function probeStream(
       "-select_streams",
       streamSelector,
       "-show_entries",
-      "stream=duration,nb_frames,nb_read_packets,codec_name,r_frame_rate",
+      "stream=start_time,duration,nb_frames,nb_read_packets,codec_name,r_frame_rate",
       "-count_packets",
       "-of",
       "json",
+      "--",
       outputPath,
     ],
     { stdio: "pipe" },
@@ -195,6 +259,17 @@ describe("assemble()", () => {
       const probedFrames = Number(videoStream?.nb_read_packets ?? videoStream?.nb_frames);
       expect(probedFrames).toBe(10);
 
+      // ── ffprobe: exact framerate + duration equivalence ────────────────
+      // The container's `r_frame_rate` must match the planDir's exact
+      // rational (30/1 here) — not a PTS-averaged fraction like
+      // `360000/12001`. This guards the `-r` flag on the concat /
+      // mux / faststart steps from regressing.
+      expect(videoStream?.r_frame_rate).toBe("30/1");
+      // Duration must equal `totalFrames * fpsDen / fpsNum` within 1ms.
+      const expectedDuration = (10 * 1) / 30;
+      const probedDuration = Number(videoStream?.duration ?? 0);
+      expect(Math.abs(probedDuration - expectedDuration)).toBeLessThan(0.001);
+
       // ── faststart applied ──────────────────────────────────────────────
       // Bun.file is async; resolve before asserting.
       const buf = await Bun.file(outputPath).arrayBuffer();
@@ -227,7 +302,50 @@ describe("assemble()", () => {
   );
 
   it(
-    "muxes audio with frame-count-derived duration when audio.aac is present",
+    "single-chunk render stamps exact r_frame_rate on the output container",
+    async () => {
+      if (!hasFfmpeg) {
+        console.warn(
+          "[assemble.test] skipping single-chunk r_frame_rate test — ffmpeg not available on this host",
+        );
+        return;
+      }
+
+      // Reproducer for the single-chunk pass-through regression: when
+      // `chunkPaths.length === 1`, assemble must still stamp an exact
+      // `r_frame_rate` matching the planDir's rational (here 30/1), not
+      // a PTS-derived fraction like `359/12`. Multi-chunk renders go
+      // through the concat demuxer; single-chunk renders skip it and
+      // need the `-r <fps>` flag on a direct remux step.
+      const chunks: ChunkSliceJson[] = [{ index: 0, startFrame: 0, endFrame: 10 }];
+      const planDir = buildPlanDir("mp4", chunks, 10, false);
+
+      const chunkPath = join(planDir, "chunk-0.mp4");
+      makeMp4Chunk(chunkPath, 10);
+
+      const outputPath = join(planDir, "output-single-chunk.mp4");
+      const result = await assemble(planDir, [chunkPath], null, outputPath);
+
+      expect(result.outputPath).toBe(outputPath);
+      expect(existsSync(outputPath)).toBe(true);
+      expect(result.framesEncoded).toBe(10);
+
+      const videoStream = probeStream(outputPath, "v:0");
+      expect(videoStream).toBeDefined();
+      expect(videoStream?.codec_name).toBe("h264");
+      // The exact-rational assertion — the regression hole that this
+      // test closes. Before the single-chunk -r fix, this came back as
+      // a PTS-derived fraction (e.g. `359/12`) on 1-chunk renders.
+      expect(videoStream?.r_frame_rate).toBe("30/1");
+      const expectedDuration = 10 / 30;
+      const probedDuration = Number(videoStream?.duration ?? 0);
+      expect(Math.abs(probedDuration - expectedDuration)).toBeLessThan(0.001);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "muxes audio with frame-count-derived duration when audio.m4a is present",
     async () => {
       if (!hasFfmpeg) return;
 
@@ -241,7 +359,7 @@ describe("assemble()", () => {
 
       const chunkAPath = join(planDir, "chunk-0.mp4");
       const chunkBPath = join(planDir, "chunk-1.mp4");
-      const audioPath = join(planDir, "audio.aac");
+      const audioPath = join(planDir, "audio.m4a");
       makeMp4Chunk(chunkAPath, 6);
       makeMp4Chunk(chunkBPath, 6);
       // Audio is half a second longer than the video — `padOrTrimAudioToVideoFrameCount`
@@ -257,12 +375,233 @@ describe("assemble()", () => {
       const audioStream = probeStream(outputPath, "a:0");
       expect(audioStream).toBeDefined();
       expect(audioStream?.codec_name).toBe("aac");
+      const videoStream = probeStream(outputPath, "v:0");
+      expect(videoStream).toBeDefined();
+      expect(Number(videoStream?.start_time ?? NaN)).toBeLessThan(0.001);
+      expect(Number(audioStream?.start_time ?? NaN)).toBeLessThan(0.001);
       // Audio duration should be within ~25ms of `totalFrames / fps` after
       // pad/trim. The 25ms tolerance absorbs AAC frame quantization (1024
       // samples @ 48kHz = ~21ms).
       const audioDuration = Number(audioStream?.duration ?? 0);
       const expected = totalFrames / fps;
       expect(Math.abs(audioDuration - expected)).toBeLessThan(0.05);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "muxes padded short audio without shifting the first video frame",
+    async () => {
+      if (!hasFfmpeg) return;
+
+      const chunks: ChunkSliceJson[] = [
+        { index: 0, startFrame: 0, endFrame: 6 },
+        { index: 1, startFrame: 6, endFrame: 12 },
+      ];
+      const totalFrames = 12;
+      const fps = 30;
+      const planDir = buildPlanDir("mp4", chunks, totalFrames, true);
+
+      const chunkAPath = join(planDir, "chunk-0.mp4");
+      const chunkBPath = join(planDir, "chunk-1.mp4");
+      const audioPath = join(planDir, "audio.m4a");
+      makeMp4Chunk(chunkAPath, 6);
+      makeMp4Chunk(chunkBPath, 6);
+      // Audio is shorter than the video, forcing the distributed pad branch.
+      makeAacAudio(audioPath, totalFrames / fps - 0.2);
+
+      const outputPath = join(planDir, "output-audio-padded.mp4");
+      const result = await assemble(planDir, [chunkAPath, chunkBPath], audioPath, outputPath);
+
+      expect(existsSync(outputPath)).toBe(true);
+      expect(result.framesEncoded).toBe(totalFrames);
+
+      const audioStream = probeStream(outputPath, "a:0");
+      expect(audioStream).toBeDefined();
+      expect(audioStream?.codec_name).toBe("aac");
+      const videoStream = probeStream(outputPath, "v:0");
+      expect(videoStream).toBeDefined();
+      expect(Number(videoStream?.start_time ?? NaN)).toBeLessThan(0.001);
+      expect(Number(audioStream?.start_time ?? NaN)).toBeLessThan(0.001);
+
+      const audioDuration = Number(audioStream?.duration ?? 0);
+      const expected = totalFrames / fps;
+      expect(Math.abs(audioDuration - expected)).toBeLessThan(0.05);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "cfr:true re-encodes for exact avg_frame_rate matching r_frame_rate",
+    async () => {
+      if (!hasFfmpeg) {
+        console.warn("[assemble.test] skipping cfr test — ffmpeg not available on this host");
+        return;
+      }
+
+      // Opt-in CFR: the re-encode pass with `-fps_mode cfr -r <fps>` must
+      // land the stream's `avg_frame_rate` on the requested rational
+      // exactly, not a PTS-derived fraction. Default `cfr=false` path is
+      // covered by the existing concat-copy tests above.
+      const chunks: ChunkSliceJson[] = [
+        { index: 0, startFrame: 0, endFrame: 5 },
+        { index: 1, startFrame: 5, endFrame: 10 },
+      ];
+      const planDir = buildPlanDir("mp4", chunks, 10, false);
+
+      const chunkAPath = join(planDir, "chunk-0.mp4");
+      const chunkBPath = join(planDir, "chunk-1.mp4");
+      makeMp4Chunk(chunkAPath, 5);
+      makeMp4Chunk(chunkBPath, 5);
+
+      const outputPath = join(planDir, "output-cfr.mp4");
+      const result = await assemble(planDir, [chunkAPath, chunkBPath], null, outputPath, {
+        cfr: true,
+      });
+
+      expect(result.outputPath).toBe(outputPath);
+      expect(existsSync(outputPath)).toBe(true);
+      expect(result.framesEncoded).toBe(10);
+
+      // ffprobe both r_frame_rate AND avg_frame_rate — the CFR re-encode's
+      // contract is that they're equal and both exactly match the
+      // requested rate.
+      const probe = spawnSync(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "stream=r_frame_rate,avg_frame_rate,duration",
+          "-of",
+          "json",
+          "--",
+          outputPath,
+        ],
+        { stdio: "pipe" },
+      );
+      expect(probe.status).toBe(0);
+      const parsed = JSON.parse(probe.stdout.toString()) as {
+        streams?: Array<{ r_frame_rate?: string; avg_frame_rate?: string; duration?: string }>;
+      };
+      const stream = parsed.streams?.[0];
+      expect(stream).toBeDefined();
+      expect(stream?.r_frame_rate).toBe("30/1");
+      expect(stream?.avg_frame_rate).toBe("30/1");
+      const expectedDuration = 10 / 30;
+      const probedDuration = Number(stream?.duration ?? 0);
+      expect(Math.abs(probedDuration - expectedDuration)).toBeLessThan(0.001);
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "cfr:true rejects non-mp4 formats with a clear error",
+    async () => {
+      const chunks: ChunkSliceJson[] = [{ index: 0, startFrame: 0, endFrame: 5 }];
+      // png-sequence path short-circuits before the cfr check; webm/mov
+      // would hit the runtime guard. We rebuild plan.json with a non-mp4
+      // format manually so this test runs without a webm encoder.
+      const planDir = mkdtempSync(join(runRoot, "plan-webm-cfr-"));
+      mkdirSync(join(planDir, "meta"), { recursive: true });
+      writeFileSync(
+        join(planDir, "plan.json"),
+        JSON.stringify({
+          planHash: "fake",
+          totalFrames: 5,
+          hasAudio: false,
+          dimensions: { fpsNum: 30, fpsDen: 1, width: 160, height: 120, format: "webm" },
+        }),
+        "utf-8",
+      );
+      writeFileSync(join(planDir, "meta", "chunks.json"), JSON.stringify(chunks), "utf-8");
+      // Fabricate a placeholder file so the existence check passes — the
+      // cfr-guard error fires before we actually run the concat invocation
+      // in the multi-chunk branch; the single-chunk remux path runs first
+      // here, then we hit the cfr guard. Since the remux is real, only
+      // run this test when ffmpeg is present.
+      if (!hasFfmpeg) {
+        console.warn("[assemble.test] skipping cfr-non-mp4 test — ffmpeg not available");
+        return;
+      }
+      const chunkPath = join(planDir, "chunk-0.webm");
+      // Build a real 5-frame webm chunk so the concat step succeeds and
+      // the cfr guard is what actually trips.
+      const buildResult = spawnSync("ffmpeg", [
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=160x120:rate=30:duration=0.166666",
+        "-c:v",
+        "libvpx-vp9",
+        "-row-mt",
+        "1",
+        "-deadline",
+        "realtime",
+        "-cpu-used",
+        "8",
+        "-g",
+        "5",
+        "-keyint_min",
+        "5",
+        "-pix_fmt",
+        "yuv420p",
+        "-vframes",
+        "5",
+        "-y",
+        chunkPath,
+      ]);
+      if (buildResult.status !== 0) {
+        console.warn(
+          "[assemble.test] skipping cfr-non-mp4 test — libvpx-vp9 not available on this host",
+        );
+        return;
+      }
+      let caught: unknown;
+      try {
+        await assemble(planDir, [chunkPath], null, join(planDir, "out.webm"), { cfr: true });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expect((caught as Error).message).toContain("cfr=true is only supported");
+    },
+    TIMEOUT_MS,
+  );
+
+  it(
+    "cfr:true rejects h265 chunks with a clear error",
+    async () => {
+      if (!hasFfmpeg) {
+        console.warn("[assemble.test] skipping cfr-h265 test — ffmpeg not available");
+        return;
+      }
+      // The cfr re-encode hardcodes `-c:v libx264`; pairing it with h265
+      // chunks would silently transcode them to h264. Assemble must throw
+      // a typed error instead of producing a wrong-codec deliverable. We
+      // stage a plan whose `meta/encoder.json` reports `libx265-software`
+      // and chunks built with libx264 (the bytes don't matter — the guard
+      // trips on the encoder discriminant before the re-encode runs).
+      const chunks: ChunkSliceJson[] = [{ index: 0, startFrame: 0, endFrame: 5 }];
+      const planDir = buildPlanDir("mp4", chunks, 5, false, "libx265-software");
+
+      const chunkPath = join(planDir, "chunk-0.mp4");
+      makeMp4Chunk(chunkPath, 5);
+
+      let caught: unknown;
+      try {
+        await assemble(planDir, [chunkPath], null, join(planDir, "out.mp4"), { cfr: true });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expect((caught as Error).message).toContain(
+        `cfr=true is not yet supported with codec: "h265"`,
+      );
     },
     TIMEOUT_MS,
   );
@@ -320,6 +659,48 @@ describe("assemble()", () => {
           "frame_000006.png",
           "frame_000007.png",
         ]);
+      });
+    },
+    TIMEOUT_MS,
+  );
+
+  // Regression: a distributed render with NO audio skips the mux entirely, and
+  // applyFaststart only copies mov/webm rather than re-running ffmpeg. That
+  // leaves the concat step as the last container write, and the concat demuxer
+  // does not carry the chunks' container metadata through — so before the
+  // provenance args were added here, both formats shipped with no tags at all
+  // while mp4 was silently rescued by faststart's re-mux. Asserting on the
+  // assembled file rather than the argv is the point: ffmpeg accepts the
+  // metadata flags either way and simply drops the keys.
+  it.each(["mov", "webm"] as const)(
+    "keeps render provenance on a no-audio %s render",
+    async (format) => {
+      if (!hasFfmpeg) {
+        console.warn(`[assemble.test] skipping ${format} provenance test — ffmpeg not available`);
+        return;
+      }
+
+      const chunks: ChunkSliceJson[] = [
+        { index: 0, startFrame: 0, endFrame: 5 },
+        { index: 1, startFrame: 5, endFrame: 10 },
+      ];
+      const planDir = buildPlanDir(format, chunks, 10, false);
+
+      const chunkAPath = join(planDir, `chunk-0.${format}`);
+      const chunkBPath = join(planDir, `chunk-1.${format}`);
+      makeTaggedChunk(chunkAPath, 5, format);
+      makeTaggedChunk(chunkBPath, 5, format);
+      // The chunks really are tagged, so a failure below is the assemble step
+      // dropping them rather than the fixture never having had them.
+      expect(probeProvenance(chunkAPath)).not.toBeNull();
+
+      const outputPath = join(planDir, `output.${format}`);
+      const result = await assemble(planDir, [chunkAPath, chunkBPath], null, outputPath);
+
+      expect(existsSync(result.outputPath)).toBe(true);
+      expect(probeProvenance(outputPath)).toEqual({
+        renderer: PROVENANCE_RENDERER_NAME,
+        version: PROVENANCE_VERSION,
       });
     },
     TIMEOUT_MS,

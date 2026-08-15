@@ -31,7 +31,7 @@ See [sequencing.md](sequencing.md) for nesting and stagger details.
 | ------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
 | `<Sequence from={F} durationInFrames={D}>` | `<div data-start="<F/fps>" data-duration="<D/fps>" data-track-index="N">`                                 |
 | `<Series>` + `<Series.Sequence>`           | siblings with sequential `data-start` values                                                              |
-| `<Loop durationInFrames={D}>`              | not a primitive — emit a custom GSAP `repeat: -1` loop with manual offset math                            |
+| `<Loop durationInFrames={D}>`              | not a primitive — emit a bounded GSAP repeat from the available duration                                  |
 | `<Freeze frame={F}>`                       | drop the wrapper; HF doesn't have running animation outside the seek-driven timeline so freeze is a no-op |
 
 ## Timing
@@ -79,11 +79,11 @@ See [transitions.md](transitions.md).
 
 See [lottie.md](lottie.md).
 
-| Remotion                        | HyperFrames                                                                                               |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `<Lottie animationData={data}>` | `<div id="lottie-N">` + `<script>lottie.loadAnimation(...).then(a => window.__hfLottie.push(a))</script>` |
-| `loop` / `playbackRate` props   | translate to `loop` / lottie playback options; HF adapter seeks via `goToAndStop`                         |
-| `@remotion/lottie` runtime      | `lottie-web` from CDN — drop the React wrapper                                                            |
+| Remotion                        | HyperFrames                                                                                                       |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| `<Lottie animationData={data}>` | `<div id="lottie-N">` + `<script>const anim = lottie.loadAnimation({...}); window.__hfLottie.push(anim)</script>` |
+| `loop` / `playbackRate` props   | translate only after checking player seek behavior; HF adapter seeks absolute time via `goToAndStop`              |
+| `@remotion/lottie` runtime      | `lottie-web` from CDN — drop the React wrapper                                                                    |
 
 ## Fonts
 

@@ -16,6 +16,7 @@ const DIST = join(CLI_ROOT, "dist");
 const STUDIO_WAIT_TIMEOUT_MS = 30_000;
 const STUDIO_POLL_INTERVAL_MS = 250;
 
+// fallow-ignore-next-line complexity
 async function waitForStudioDist(dir) {
   const deadline = Date.now() + STUDIO_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
@@ -54,6 +55,7 @@ function copyMdFiles(srcDir, destDir) {
   }
 }
 
+// fallow-ignore-next-line complexity
 async function main() {
   for (const sub of ["studio", "docs", "templates", "skills", "docker"]) {
     mkdirSync(join(DIST, sub), { recursive: true });
@@ -68,8 +70,23 @@ async function main() {
     copyDir(join(CLI_ROOT, "src", "templates", tmpl), join(DIST, "templates", tmpl));
   }
 
+  // Bundle warm-grain from the repo registry so the built CLI can scaffold it
+  // offline and CI smoke tests pick up PR-branch changes before merge to main.
+  const warmGrainSrc = join(REPO_ROOT, "registry", "examples", "warm-grain");
+  if (existsSync(warmGrainSrc)) {
+    copyDir(warmGrainSrc, join(DIST, "templates", "warm-grain"));
+  }
+
+  // Skills bundled into the published CLI. Branches don't all carry the same
+  // skills/ tree (it gets restructured), so each entry is existsSync-guarded:
+  // a missing skill dir warns + skips instead of crashing the build.
   for (const skill of ["hyperframes", "hyperframes-cli", "gsap"]) {
-    copyDir(join(REPO_ROOT, "skills", skill), join(DIST, "skills", skill));
+    const src = join(REPO_ROOT, "skills", skill);
+    if (!existsSync(src)) {
+      console.warn(`[build-copy] skill not found, skipping: skills/${skill}`);
+      continue;
+    }
+    copyDir(src, join(DIST, "skills", skill));
   }
 
   const dockerfile = join(CLI_ROOT, "src", "docker", "Dockerfile.render");
@@ -85,6 +102,32 @@ async function main() {
   const contrastAuditScript = join(CLI_ROOT, "src", "commands", "contrast-audit.browser.js");
   if (existsSync(contrastAuditScript)) {
     cpSync(contrastAuditScript, join(DIST, "commands", "contrast-audit.browser.js"));
+  }
+
+  const motionSampleScript = join(CLI_ROOT, "src", "commands", "motion-sample.browser.js");
+  if (existsSync(motionSampleScript)) {
+    cpSync(motionSampleScript, join(DIST, "commands", "motion-sample.browser.js"));
+  }
+
+  // Player bundles for the standalone browser player used by `present` and
+  // `play`. resolvePlayerPath/resolveSlideshowPath look for these alongside the
+  // built CLI (dist/<name>.global.js), so they must ship in the package — the
+  // monorepo-dev fallback paths don't exist once installed from npm. Without
+  // this, `npx hyperframes present` fails with "@hyperframes/player not found".
+  const playerDist = join(REPO_ROOT, "packages", "player", "dist");
+  const playerGlobals = [
+    [join(playerDist, "hyperframes-player.global.js"), join(DIST, "hyperframes-player.global.js")],
+    [
+      join(playerDist, "slideshow", "hyperframes-slideshow.global.js"),
+      join(DIST, "hyperframes-slideshow.global.js"),
+    ],
+  ];
+  for (const [src, dest] of playerGlobals) {
+    if (existsSync(src)) {
+      cpSync(src, dest);
+    } else {
+      console.warn(`[build-copy] player bundle not found, skipping: ${src}`);
+    }
   }
 
   copyMdFiles(join(CLI_ROOT, "src", "docs"), join(DIST, "docs"));

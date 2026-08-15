@@ -61,7 +61,7 @@ function forceSceneVisibleInClone(source: HTMLElement, cloneDoc: Document): void
   });
 }
 
-export function stabilizeTransformedBoxShadows(root: HTMLElement): void {
+function stabilizeTransformedBoxShadows(root: HTMLElement): void {
   const view = root.ownerDocument.defaultView;
   if (!view) return;
 

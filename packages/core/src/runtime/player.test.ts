@@ -11,11 +11,13 @@ function createMockTimeline(opts?: { time?: number; duration?: number }): Runtim
     pause: vi.fn(() => {
       state.paused = true;
     }),
-    seek: vi.fn((t: number) => {
-      state.time = t;
+    seek: vi.fn((t?: number) => {
+      if (t !== undefined) state.time = t;
+      return state.time;
     }),
-    totalTime: vi.fn((t: number) => {
-      state.time = t;
+    totalTime: vi.fn((t?: number) => {
+      if (t !== undefined) state.time = t;
+      return state.time;
     }),
     time: vi.fn(() => state.time),
     duration: vi.fn(() => state.duration),
@@ -64,11 +66,13 @@ function createNestedTimelineHarness() {
       pause: vi.fn(() => {
         state.paused = true;
       }),
-      seek: vi.fn((t: number) => {
-        state.time = t;
+      seek: vi.fn((t?: number) => {
+        if (t !== undefined) state.time = t;
+        return state.time;
       }),
-      totalTime: vi.fn((t: number) => {
-        state.time = t;
+      totalTime: vi.fn((t?: number) => {
+        if (t !== undefined) state.time = t;
+        return state.time;
       }),
       time: vi.fn(() => state.time),
       duration: vi.fn(() => duration),
@@ -95,14 +99,16 @@ function createNestedTimelineHarness() {
     pause: vi.fn(() => {
       masterState.paused = true;
     }),
-    seek: vi.fn((t: number) => {
+    seek: vi.fn((t?: number) => {
+      if (t === undefined) return masterState.time;
       masterState.time = t;
       for (const child of children) {
         if (child.state.paused) continue;
         child.state.time = Math.max(0, Math.min(t - child.start, child.duration));
       }
     }),
-    totalTime: vi.fn((t: number) => {
+    totalTime: vi.fn((t?: number) => {
+      if (t === undefined) return masterState.time;
       masterState.time = t;
       for (const child of children) {
         if (child.state.paused) continue;
@@ -128,6 +134,34 @@ function createNestedTimelineHarness() {
 }
 
 describe("createRuntimePlayer", () => {
+  describe("dedicated transport", () => {
+    it("keeps factory-owned methods stable and forwards the complete seek contract", () => {
+      const timeline = createMockTimeline();
+      const deps = createMockDeps(timeline);
+      const transport = {
+        play: vi.fn(),
+        pause: vi.fn(),
+        seek: vi.fn(),
+        renderSeek: vi.fn(),
+        getTime: vi.fn(() => 4),
+        getDuration: vi.fn(() => 10),
+        isPlaying: vi.fn(() => true),
+        setPlaybackRate: vi.fn(),
+        getPlaybackRate: vi.fn(() => 1.5),
+      };
+      const player = createRuntimePlayer({ ...deps, transport });
+      const seek = player.seek;
+
+      player.seek(2.5, { keepPlaying: true });
+
+      expect(player.seek).toBe(seek);
+      expect(transport.seek).toHaveBeenCalledWith(2.5, { keepPlaying: true });
+      expect(player.getTime()).toBe(4);
+      expect(player.getPlaybackRate()).toBe(1.5);
+      expect(deps.onDeterministicSeek).not.toHaveBeenCalled();
+    });
+  });
+
   describe("play", () => {
     it("does nothing without a timeline", () => {
       const deps = createMockDeps(null);
@@ -368,6 +402,91 @@ describe("createRuntimePlayer", () => {
       expect(deps.onDeterministicSeek).toHaveBeenCalledWith(8);
       expect(deps.onSyncMedia).toHaveBeenCalledWith(8, false);
     });
+
+    // Regression: A/E Jump-to-in/out shortcuts (PR #842) send
+    // `{ keepPlaying: true }` so playback survives the seek. Before this fix the
+    // runtime always called setIsPlaying(false), so the shortcut paused playback
+    // on every press in compositions backed by the `__player` runtime adapter.
+    describe("keepPlaying option", () => {
+      it("preserves play state when keepPlaying is true and playback was active", () => {
+        const timeline = createMockTimeline({ duration: 10 });
+        const deps = createMockDeps(timeline);
+        deps.getIsPlaying.mockReturnValue(true);
+        const player = createRuntimePlayer(deps);
+        player.seek(3, { keepPlaying: true });
+        expect(deps.setIsPlaying).not.toHaveBeenCalledWith(false);
+        expect(deps.onDeterministicPlay).toHaveBeenCalled();
+        expect(deps.onShowNativeVideos).toHaveBeenCalled();
+        expect(deps.onSyncMedia).toHaveBeenCalledWith(expect.any(Number), true);
+      });
+
+      it("resumes the master timeline after the deterministic seek pauses it", () => {
+        const timeline = createMockTimeline({ duration: 10 });
+        const deps = createMockDeps(timeline);
+        deps.getIsPlaying.mockReturnValue(true);
+        const player = createRuntimePlayer(deps);
+        player.seek(3, { keepPlaying: true });
+        // The helper pauses then seeks; the keep-playing branch must call
+        // play() afterwards so the timeline is left running.
+        const playMock = timeline.play as ReturnType<typeof vi.fn>;
+        const pauseMock = timeline.pause as ReturnType<typeof vi.fn>;
+        expect(playMock).toHaveBeenCalledTimes(1);
+        expect(pauseMock).toHaveBeenCalled();
+        expect(playMock.mock.invocationCallOrder[0]).toBeGreaterThan(
+          pauseMock.mock.invocationCallOrder[pauseMock.mock.invocationCallOrder.length - 1],
+        );
+      });
+
+      it("applies playbackRate to master and siblings on resume", () => {
+        const master = createMockTimeline({ duration: 10 });
+        const scene1 = createMockTimeline();
+        const deps = createMockDeps(master);
+        deps.getIsPlaying.mockReturnValue(true);
+        deps.getPlaybackRate.mockReturnValue(2);
+        const player = createRuntimePlayer({
+          ...deps,
+          getTimelineRegistry: () => ({ main: master, scene1 }),
+        });
+        player.seek(3, { keepPlaying: true });
+        expect(master.timeScale).toHaveBeenCalledWith(2);
+        expect(scene1.timeScale).toHaveBeenCalledWith(2);
+        expect(scene1.play).toHaveBeenCalled();
+      });
+
+      it("stays paused when keepPlaying is true but playback was not active", () => {
+        const timeline = createMockTimeline({ duration: 10 });
+        const deps = createMockDeps(timeline);
+        deps.getIsPlaying.mockReturnValue(false);
+        const player = createRuntimePlayer(deps);
+        player.seek(3, { keepPlaying: true });
+        expect(deps.setIsPlaying).toHaveBeenCalledWith(false);
+        expect(deps.onSyncMedia).toHaveBeenCalledWith(expect.any(Number), false);
+        expect(deps.onDeterministicPlay).not.toHaveBeenCalled();
+        expect(deps.onShowNativeVideos).not.toHaveBeenCalled();
+      });
+
+      it("pauses on seek when keepPlaying is false (explicit)", () => {
+        const timeline = createMockTimeline({ duration: 10 });
+        const deps = createMockDeps(timeline);
+        deps.getIsPlaying.mockReturnValue(true);
+        const player = createRuntimePlayer(deps);
+        player.seek(3, { keepPlaying: false });
+        expect(deps.setIsPlaying).toHaveBeenCalledWith(false);
+        expect(deps.onSyncMedia).toHaveBeenCalledWith(expect.any(Number), false);
+        expect(deps.onDeterministicPlay).not.toHaveBeenCalled();
+      });
+
+      it("pauses on seek when no options are passed (default behavior unchanged)", () => {
+        const timeline = createMockTimeline({ duration: 10 });
+        const deps = createMockDeps(timeline);
+        deps.getIsPlaying.mockReturnValue(true);
+        const player = createRuntimePlayer(deps);
+        player.seek(3);
+        expect(deps.setIsPlaying).toHaveBeenCalledWith(false);
+        expect(deps.onSyncMedia).toHaveBeenCalledWith(expect.any(Number), false);
+        expect(deps.onDeterministicPlay).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe("renderSeek", () => {
@@ -379,6 +498,20 @@ describe("createRuntimePlayer", () => {
       expect(timeline.pause).toHaveBeenCalled();
       expect(deps.setIsPlaying).toHaveBeenCalledWith(false);
       expect(deps.onRenderFrameSeek).toHaveBeenCalled();
+    });
+
+    it("can suppress timeline events during administrative render seeks", () => {
+      const timeline = createMockTimeline({ duration: 10 });
+      const deps = createMockDeps(timeline);
+      const player = createRuntimePlayer(deps);
+      const renderSeek = player.renderSeek as (
+        time: number,
+        options?: { suppressEvents?: boolean },
+      ) => void;
+
+      renderSeek(5, { suppressEvents: true });
+
+      expect(timeline.totalTime).toHaveBeenCalledWith(5, true);
     });
 
     it("renderSeek rearms paused siblings and keeps them active for export frames", () => {
@@ -400,6 +533,73 @@ describe("createRuntimePlayer", () => {
       expect(scene1.pause).toHaveBeenCalledTimes(1);
       expect(scene2.pause).toHaveBeenCalledTimes(1);
       expect(scene5.pause).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("tolerates non-conformant timeline objects", () => {
+    it("handles duration as a number property instead of a function", () => {
+      const timeline = {
+        play: vi.fn(),
+        pause: vi.fn(),
+        seek: vi.fn(),
+        totalTime: vi.fn(),
+        time: vi.fn(() => 2),
+        duration: 10,
+        add: vi.fn(),
+        paused: vi.fn(),
+        set: vi.fn(),
+      } as unknown as RuntimeTimelineLike;
+      const deps = createMockDeps(timeline);
+      const player = createRuntimePlayer(deps);
+      expect(player.getDuration()).toBe(10);
+      expect(() => player.play()).not.toThrow();
+    });
+
+    it("handles missing pause method", () => {
+      const timeline = {
+        play: vi.fn(),
+        seek: vi.fn(),
+        time: vi.fn(() => 0),
+        duration: vi.fn(() => 10),
+        add: vi.fn(),
+        paused: vi.fn(),
+        set: vi.fn(),
+      } as unknown as RuntimeTimelineLike;
+      const deps = createMockDeps(timeline);
+      const player = createRuntimePlayer(deps);
+      expect(() => player.pause()).not.toThrow();
+      expect(() => player.seek(3)).not.toThrow();
+    });
+
+    it("handles missing play method", () => {
+      const timeline = {
+        pause: vi.fn(),
+        seek: vi.fn(),
+        time: vi.fn(() => 0),
+        duration: vi.fn(() => 10),
+        add: vi.fn(),
+        paused: vi.fn(),
+        set: vi.fn(),
+      } as unknown as RuntimeTimelineLike;
+      const deps = createMockDeps(timeline);
+      const player = createRuntimePlayer(deps);
+      expect(() => player.play()).not.toThrow();
+    });
+
+    it("handles time as a number property instead of a function", () => {
+      const timeline = {
+        play: vi.fn(),
+        pause: vi.fn(),
+        seek: vi.fn(),
+        time: 5,
+        duration: vi.fn(() => 10),
+        add: vi.fn(),
+        paused: vi.fn(),
+        set: vi.fn(),
+      } as unknown as RuntimeTimelineLike;
+      const deps = createMockDeps(timeline);
+      const player = createRuntimePlayer(deps);
+      expect(player.getTime()).toBe(5);
     });
   });
 

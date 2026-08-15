@@ -24,6 +24,7 @@ const GROUPS: Group[] = [
       ["capture", "Capture a website for video production"],
       ["catalog", "Browse and install blocks and components"],
       ["preview", "Start the studio for previewing compositions"],
+      ["present", "Open a slideshow deck in presenter mode (with audience sync)"],
       ["publish", "Upload a project and get a stable public URL"],
       ["render", "Render a composition to MP4 or WebM"],
     ],
@@ -32,8 +33,24 @@ const GROUPS: Group[] = [
     title: "Project",
     commands: [
       ["lint", "Validate a composition for common mistakes"],
+      ["check", "Run lint, runtime validation, and layout inspection as one gate"],
+      [
+        "validate",
+        "Runtime-validate a composition in headless Chrome (JS errors, missing assets, contrast)",
+      ],
+      ["beats", "Detect beats in the music track and write beats/<audio>.json"],
       ["inspect", "Inspect rendered visual layout across the timeline"],
+      ["keyframes", "Inspect keyframes and render onion-shot diagnostics"],
       ["snapshot", "Capture key frames as PNG screenshots for visual verification"],
+      [
+        "media-treatment",
+        "Discover, apply, or clear deterministic media treatments on one media element",
+      ],
+      [
+        "grade-compare",
+        "Render candidate color grades onto a reference frame as one labeled comparison PNG",
+      ],
+      ["compare", "Render composition variants into one labeled comparison sheet"],
       ["info", "Print project metadata"],
       ["compositions", "List all compositions in a project"],
       ["docs", "View inline documentation in the terminal"],
@@ -52,6 +69,14 @@ const GROUPS: Group[] = [
     ],
   },
   {
+    title: "Deploy",
+    commands: [
+      ["cloud", "Render compositions on HeyGen's cloud (no local Chrome/ffmpeg)"],
+      ["lambda", "Deploy and drive distributed renders on AWS Lambda"],
+      ["cloudrun", "Deploy and drive distributed renders on Google Cloud Run"],
+    ],
+  },
+  {
     title: "AI & Integrations",
     commands: [
       ["skills", "Install HyperFrames and GSAP skills for AI coding tools"],
@@ -64,8 +89,15 @@ const GROUPS: Group[] = [
     ],
   },
   {
+    title: "Account",
+    commands: [["auth", "Sign in to HeyGen and manage credentials"]],
+  },
+  {
     title: "Settings",
-    commands: [["telemetry", "Manage anonymous usage telemetry"]],
+    commands: [
+      ["feedback", "Submit anonymous feedback about your experience"],
+      ["telemetry", "Manage anonymous usage telemetry"],
+    ],
   },
 ];
 
@@ -86,12 +118,32 @@ const ROOT_EXAMPLES: Example[] = [
 // ── Per-command examples loaded from command files ────────────────────────
 // Each command file exports `examples: Example[]`. This function dynamically
 // imports them so examples live next to the command they document.
-async function loadExamples(name: string): Promise<Example[] | undefined> {
+//
+// For nested subverbs (e.g. `cloud render`), try the parent-scoped path
+// first (`commands/cloud/render.js`) so we don't collide with the
+// top-level command of the same name (`commands/render.js`).
+// fallow-ignore-next-line complexity
+async function loadExamples(name: string, parentName?: string): Promise<Example[] | undefined> {
+  // Skip the parent-scoped lookup for the root command — `parentName`
+  // is `'hyperframes'` for every top-level subcommand and no
+  // `./commands/hyperframes/<name>.js` directory will ever exist.
+  if (parentName && parentName !== "hyperframes") {
+    const examples = await tryLoadExamples(`./commands/${parentName}/${name}.js`);
+    if (examples) return examples;
+  }
+  return await tryLoadExamples(`./commands/${name}.js`);
+}
+
+async function tryLoadExamples(modulePath: string): Promise<Example[] | undefined> {
   try {
-    const mod = await import(`./commands/${name}.js`);
+    const mod = await import(modulePath);
     return mod.examples;
-  } catch {
-    return undefined;
+  } catch (err) {
+    // Only swallow "file doesn't exist" — re-throw real load errors
+    // (syntax error, broken import, init-time throw) so a developer
+    // sees the diagnostic instead of getting silently wrong help.
+    if ((err as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND") return undefined;
+    throw err;
   }
 }
 
@@ -145,6 +197,7 @@ function formatExamples(examples: Example[]): string {
 }
 
 // ── Main showUsage override ────────────────────────────────────────────────
+// fallow-ignore-next-line complexity
 export async function showUsage(cmd: CommandDef, parent?: CommandDef): Promise<void> {
   if (!parent) {
     console.log(renderRootHelp() + "\n");
@@ -157,7 +210,9 @@ export async function showUsage(cmd: CommandDef, parent?: CommandDef): Promise<v
 
   const name = meta?.name;
   if (name) {
-    const examples = STATIC_EXAMPLES[name] ?? (await loadExamples(name));
+    const parentMeta = await (typeof parent.meta === "function" ? parent.meta() : parent.meta);
+    const parentName = parentMeta?.name;
+    const examples = STATIC_EXAMPLES[name] ?? (await loadExamples(name, parentName));
     if (examples) {
       console.log(formatExamples(examples) + "\n");
     }

@@ -1,24 +1,28 @@
-import { memo, useCallback, useEffect, useRef, useState, type Ref } from "react";
+import { memo, useCallback, useEffect, useRef, useState, type RefObject } from "react";
 import { Player } from "../../player";
 import {
   DEFAULT_PREVIEW_ZOOM,
+  canStartPreviewPan,
   clampPreviewPan,
   clampPreviewZoomPercent,
+  ownsPreviewPanTarget,
+  resolvePreviewWheelPan,
   resolvePreviewWheelZoom,
   toDomPrecision,
   type PreviewZoomState,
 } from "./previewZoom";
 import { readStudioUiPreferences, writeStudioUiPreferences } from "../../utils/studioUiPreferences";
-
 interface NLEPreviewProps {
   projectId: string;
-  iframeRef: Ref<HTMLIFrameElement>;
+  iframeRef: RefObject<HTMLIFrameElement | null>;
   onIframeLoad: () => void;
   onCompositionLoadingChange?: (loading: boolean) => void;
   portrait?: boolean;
   directUrl?: string;
-  refreshKey?: number;
   suppressLoadingOverlay?: boolean;
+  onStageRef?: (ref: React.RefObject<HTMLDivElement | null>) => void;
+  /** Reports the authored composition size measured from the loaded preview. */
+  onCompositionSizeChange?: (size: PreviewCompositionSize | null) => void;
 }
 
 export function getPreviewPlayerKey({
@@ -27,13 +31,26 @@ export function getPreviewPlayerKey({
 }: {
   projectId: string;
   directUrl?: string;
-  refreshKey?: number;
 }): string {
   return directUrl ?? projectId;
 }
 
 const ZOOM_HUD_TIMEOUT_MS = 1200;
 const ZOOM_SETTLE_MS = 200;
+const PREVIEW_STAGE_INSET_PX = 16;
+
+interface PreviewCompositionSize {
+  width: number;
+  height: number;
+}
+
+function isPreviewAtFit(state: PreviewZoomState): boolean {
+  return (
+    Math.abs(state.zoomPercent - 100) < 0.5 &&
+    Math.abs(state.panX) < 0.1 &&
+    Math.abs(state.panY) < 0.1
+  );
+}
 
 function loadInitialZoom(): PreviewZoomState {
   const stored = readStudioUiPreferences().previewZoom;
@@ -46,6 +63,59 @@ function loadInitialZoom(): PreviewZoomState {
     : DEFAULT_PREVIEW_ZOOM;
 }
 
+// fallow-ignore-next-line complexity
+function readPreviewCompositionSize(
+  iframe: HTMLIFrameElement | null,
+): PreviewCompositionSize | null {
+  try {
+    const doc = iframe?.contentDocument;
+    const root =
+      doc?.querySelector("[data-composition-id][data-width][data-height]") ??
+      doc?.querySelector("[data-width][data-height]");
+    if (!root) return null;
+    const width = Number.parseInt(root.getAttribute("data-width") ?? "", 10);
+    const height = Number.parseInt(root.getAttribute("data-height") ?? "", 10);
+    if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+      return null;
+    }
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
+export function resolvePreviewStageSize(
+  viewportWidth: number,
+  viewportHeight: number,
+  compositionSize: PreviewCompositionSize | null,
+  portrait: boolean | undefined,
+): { width: number; height: number } {
+  const availableWidth = Math.max(0, viewportWidth - PREVIEW_STAGE_INSET_PX);
+  const availableHeight = Math.max(0, viewportHeight - PREVIEW_STAGE_INSET_PX);
+  const aspectRatio =
+    compositionSize && compositionSize.width > 0 && compositionSize.height > 0
+      ? compositionSize.width / compositionSize.height
+      : portrait
+        ? 9 / 16
+        : 16 / 9;
+
+  if (availableWidth === 0 || availableHeight === 0) {
+    return { width: 0, height: 0 };
+  }
+
+  let width = availableWidth;
+  let height = width / aspectRatio;
+  if (height > availableHeight) {
+    height = availableHeight;
+    width = height * aspectRatio;
+  }
+
+  return {
+    width: toDomPrecision(width),
+    height: toDomPrecision(height),
+  };
+}
+
 export const NLEPreview = memo(function NLEPreview({
   projectId,
   iframeRef,
@@ -53,17 +123,22 @@ export const NLEPreview = memo(function NLEPreview({
   onCompositionLoadingChange,
   portrait,
   directUrl,
-  refreshKey,
   suppressLoadingOverlay,
+  onStageRef,
+  onCompositionSizeChange,
 }: NLEPreviewProps) {
-  const baseKey = getPreviewPlayerKey({ projectId, directUrl, refreshKey });
-  const prevRefreshKeyRef = useRef(refreshKey);
+  const activeKey = getPreviewPlayerKey({ projectId, directUrl });
   const viewportRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
-  const [retiringKey, setRetiringKey] = useState<string | null>(null);
-  const retiringTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const previewIframeRef = useRef<HTMLIFrameElement | null>(null);
+  useEffect(() => {
+    onStageRef?.(stageRef);
+  }, [onStageRef]);
+  const [compositionSize, setCompositionSize] = useState<PreviewCompositionSize | null>(null);
+  const [stageSize, setStageSize] = useState(() => resolvePreviewStageSize(0, 0, null, portrait));
 
   const zoomRef = useRef<PreviewZoomState>(loadInitialZoom());
+  const [settledZoom, setSettledZoom] = useState<PreviewZoomState>(() => zoomRef.current);
   const hudRef = useRef<HTMLDivElement>(null);
   const hudTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const settleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -80,9 +155,50 @@ export const NLEPreview = memo(function NLEPreview({
     return () => {
       if (settleTimerRef.current) clearTimeout(settleTimerRef.current);
       if (hudTimerRef.current) clearTimeout(hudTimerRef.current);
-      if (retiringTimerRef.current) clearTimeout(retiringTimerRef.current);
     };
   }, []);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+
+    const updateStageSize = () => {
+      const rect = viewport.getBoundingClientRect();
+      setStageSize(resolvePreviewStageSize(rect.width, rect.height, compositionSize, portrait));
+    };
+
+    updateStageSize();
+    const observer = new ResizeObserver(updateStageSize);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [compositionSize, portrait]);
+
+  const onCompositionSizeChangeRef = useRef(onCompositionSizeChange);
+  onCompositionSizeChangeRef.current = onCompositionSizeChange;
+
+  const updateCompositionSizeFromPreview = useCallback(() => {
+    const next = readPreviewCompositionSize(previewIframeRef.current);
+    // Pure updater — the parent notification happens in the effect below
+    // (updaters may run more than once under Strict Mode / concurrent React).
+    setCompositionSize((prev) =>
+      prev?.width === next?.width && prev?.height === next?.height ? prev : next,
+    );
+  }, []);
+
+  useEffect(() => {
+    onCompositionSizeChangeRef.current?.(compositionSize);
+  }, [compositionSize]);
+
+  const setPreviewIframeRef = useCallback(
+    (node: HTMLIFrameElement | null) => {
+      previewIframeRef.current = node;
+      iframeRef.current = node;
+    },
+    [iframeRef],
+  );
+
+  const stageSizeRef = useRef(stageSize);
+  stageSizeRef.current = stageSize;
 
   const writeTransform = useCallback((state: PreviewZoomState) => {
     const stage = stageRef.current;
@@ -90,12 +206,11 @@ export const NLEPreview = memo(function NLEPreview({
     const s = toDomPrecision(state.zoomPercent / 100);
     const px = toDomPrecision(state.panX);
     const py = toDomPrecision(state.panY);
-    stage.style.zoom = String(s);
-    stage.style.transform = `translate(${px}px, ${py}px)`;
+    stage.style.transform = `translate3d(${px}px, ${py}px, 0) scale(${s})`;
   }, []);
 
-  const applyZoom = useCallback(
-    (next: PreviewZoomState) => {
+  const applyTransform = useCallback(
+    (next: PreviewZoomState, showHud: boolean) => {
       const clamped: PreviewZoomState = {
         zoomPercent: clampPreviewZoomPercent(next.zoomPercent),
         panX: Number.isFinite(next.panX) ? next.panX : 0,
@@ -103,10 +218,17 @@ export const NLEPreview = memo(function NLEPreview({
       };
       zoomRef.current = clamped;
 
-      if (!zoomingRef.current) {
-        zoomingRef.current = true;
+      if (showHud) {
         const hud = hudRef.current;
-        if (hud) hud.style.opacity = "1";
+        if (hud) {
+          if (!zoomingRef.current) {
+            zoomingRef.current = true;
+            hud.style.opacity = "1";
+          }
+          // Live per-frame readout — without this the HUD shows an empty pill
+          // on the first-ever zoom and a stale percentage mid-gesture.
+          hud.textContent = isPreviewAtFit(clamped) ? "Fit" : `${Math.round(clamped.zoomPercent)}%`;
+        }
       }
 
       writeTransform(clamped);
@@ -116,50 +238,65 @@ export const NLEPreview = memo(function NLEPreview({
         zoomingRef.current = false;
         const final = zoomRef.current;
         writeStudioUiPreferences({ previewZoom: final });
-        const hud = hudRef.current;
-        if (hud) {
-          const zoomed = Math.abs(final.zoomPercent - 100) > 0.5;
-          hud.textContent = zoomed ? `${Math.round(final.zoomPercent)}%` : "Fit";
-          if (hudTimerRef.current) clearTimeout(hudTimerRef.current);
-          hudTimerRef.current = setTimeout(() => {
-            if (hudRef.current) hudRef.current.style.opacity = "0";
-          }, ZOOM_HUD_TIMEOUT_MS);
+        setSettledZoom((prev) =>
+          prev.zoomPercent === final.zoomPercent &&
+          prev.panX === final.panX &&
+          prev.panY === final.panY
+            ? prev
+            : final,
+        );
+        if (showHud) {
+          const hud = hudRef.current;
+          if (hud) {
+            hud.textContent = isPreviewAtFit(final) ? "Fit" : `${Math.round(final.zoomPercent)}%`;
+            if (hudTimerRef.current) clearTimeout(hudTimerRef.current);
+            hudTimerRef.current = setTimeout(() => {
+              if (hudRef.current) hudRef.current.style.opacity = "0";
+            }, ZOOM_HUD_TIMEOUT_MS);
+          }
         }
       }, ZOOM_SETTLE_MS);
     },
     [writeTransform],
   );
 
-  if (refreshKey !== prevRefreshKeyRef.current) {
-    const oldKey = `${baseKey}:${prevRefreshKeyRef.current ?? 0}`;
-    prevRefreshKeyRef.current = refreshKey;
-    setRetiringKey(oldKey);
-  }
+  const applyZoom = useCallback(
+    (next: PreviewZoomState) => applyTransform(next, true),
+    [applyTransform],
+  );
 
-  const activeKey = `${baseKey}:${refreshKey ?? 0}`;
+  const applyPan = useCallback(
+    (next: PreviewZoomState) => applyTransform(next, false),
+    [applyTransform],
+  );
 
   const applyInitialZoom = useCallback(() => {
     const z = zoomRef.current;
     if (Math.abs(z.zoomPercent - 100) > 0.5 || Math.abs(z.panX) > 0.1 || Math.abs(z.panY) > 0.1) {
-      writeTransform(z);
+      // A pan persisted on a large window can restore the composition mostly
+      // off-screen in a smaller one; clamp against the current viewport first.
+      const viewport = viewportRef.current;
+      const rect = viewport?.getBoundingClientRect();
+      const sz = stageSizeRef.current;
+      if (rect && rect.width > 0 && rect.height > 0 && sz.width > 0 && sz.height > 0) {
+        const pan = clampPreviewPan({
+          panX: z.panX,
+          panY: z.panY,
+          zoomPercent: z.zoomPercent,
+          viewportWidth: rect.width,
+          viewportHeight: rect.height,
+          contentWidth: sz.width,
+          contentHeight: sz.height,
+        });
+        zoomRef.current = { ...z, ...pan };
+      }
+      writeTransform(zoomRef.current);
     }
   }, [writeTransform]);
-
-  const handleNewPlayerLoad = () => {
-    onIframeLoad();
-    applyInitialZoom();
-    if (retiringTimerRef.current) clearTimeout(retiringTimerRef.current);
-    retiringTimerRef.current = setTimeout(() => {
-      setRetiringKey(null);
-      retiringTimerRef.current = null;
-    }, 160);
-  };
 
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
-
-    let lastZoomTime = 0;
 
     const handleWheel = (event: WheelEvent) => {
       const rect = viewport.getBoundingClientRect();
@@ -175,36 +312,54 @@ export const NLEPreview = memo(function NLEPreview({
       const isZoomGesture = event.ctrlKey || event.metaKey;
 
       if (isZoomGesture) {
-        lastZoomTime = Date.now();
         event.preventDefault();
         event.stopPropagation();
 
+        const sz = stageSizeRef.current;
+        const cursorX = event.clientX - (rect.left + rect.width / 2);
+        const cursorY = event.clientY - (rect.top + rect.height / 2);
         const next = resolvePreviewWheelZoom({
           state: zoomRef.current,
           deltaY: event.deltaY,
           viewportWidth: rect.width,
           viewportHeight: rect.height,
+          contentWidth: sz.width,
+          contentHeight: sz.height,
+          cursorX,
+          cursorY,
         });
         applyZoom(next);
         return;
       }
 
-      if (Date.now() - lastZoomTime < 400) {
-        event.preventDefault();
-        event.stopPropagation();
-      }
+      if (!ownsPreviewPanTarget(event.target, stageRef.current)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const sz = stageSizeRef.current;
+      const next = resolvePreviewWheelPan({
+        state: zoomRef.current,
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        viewportWidth: rect.width,
+        viewportHeight: rect.height,
+        contentWidth: sz.width,
+        contentHeight: sz.height,
+      });
+      applyPan(next);
     };
 
     document.addEventListener("wheel", handleWheel, { passive: false, capture: true });
     return () => document.removeEventListener("wheel", handleWheel, { capture: true });
-  }, [applyZoom]);
+  }, [applyZoom, applyPan]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
 
     const handleDblClick = (event: MouseEvent) => {
-      if (Math.abs(zoomRef.current.zoomPercent - 100) < 0.5) return;
+      if (isPreviewAtFit(zoomRef.current)) return;
       const rect = viewport.getBoundingClientRect();
       if (
         event.clientX < rect.left ||
@@ -221,42 +376,82 @@ export const NLEPreview = memo(function NLEPreview({
     return () => document.removeEventListener("dblclick", handleDblClick, { capture: true });
   }, [applyZoom]);
 
-  const handlePointerDown = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    if (zoomRef.current.zoomPercent <= 100 || event.button !== 0) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    dragRef.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      originX: zoomRef.current.panX,
-      originY: zoomRef.current.panY,
+  useEffect(() => {
+    const isInsideViewport = (clientX: number, clientY: number): DOMRect | null => {
+      const viewport = viewportRef.current;
+      if (!viewport) return null;
+      const rect = viewport.getBoundingClientRect();
+      if (
+        clientX < rect.left ||
+        clientX > rect.right ||
+        clientY < rect.top ||
+        clientY > rect.bottom
+      ) {
+        return null;
+      }
+      return rect;
     };
-  }, []);
 
-  const handlePointerMove = useCallback(
-    (event: React.PointerEvent<HTMLDivElement>) => {
+    const handlePointerDown = (event: PointerEvent) => {
+      const rect = isInsideViewport(event.clientX, event.clientY);
+      if (!rect) return;
+      if (!ownsPreviewPanTarget(event.target, stageRef.current)) return;
+      if (!canStartPreviewPan(event.button)) return;
+      event.preventDefault();
+      dragRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        originX: zoomRef.current.panX,
+        originY: zoomRef.current.panY,
+      };
+    };
+
+    const handlePointerMove = (event: PointerEvent) => {
       const drag = dragRef.current;
       const viewport = viewportRef.current;
       if (!drag || !viewport || drag.pointerId !== event.pointerId) return;
       event.preventDefault();
       const rect = viewport.getBoundingClientRect();
+      const sz = stageSizeRef.current;
       const pan = clampPreviewPan({
         panX: drag.originX + event.clientX - drag.startX,
         panY: drag.originY + event.clientY - drag.startY,
         zoomPercent: zoomRef.current.zoomPercent,
         viewportWidth: rect.width,
         viewportHeight: rect.height,
+        contentWidth: sz.width,
+        contentHeight: sz.height,
       });
-      applyZoom({ ...zoomRef.current, ...pan });
-    },
-    [applyZoom],
-  );
+      applyPan({ ...zoomRef.current, ...pan });
+    };
 
-  const finishDrag = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
-    if (dragRef.current?.pointerId === event.pointerId) {
-      dragRef.current = null;
-    }
-  }, []);
+    const finishDrag = (event: PointerEvent) => {
+      if (dragRef.current?.pointerId === event.pointerId) {
+        dragRef.current = null;
+      }
+    };
+
+    const handleAuxClick = (event: MouseEvent) => {
+      if (event.button !== 1) return;
+      if (!isInsideViewport(event.clientX, event.clientY)) return;
+      if (!ownsPreviewPanTarget(event.target, stageRef.current)) return;
+      event.preventDefault();
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown, { capture: true });
+    document.addEventListener("pointermove", handlePointerMove, { capture: true });
+    document.addEventListener("pointerup", finishDrag, { capture: true });
+    document.addEventListener("pointercancel", finishDrag, { capture: true });
+    document.addEventListener("auxclick", handleAuxClick, { capture: true });
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown, { capture: true });
+      document.removeEventListener("pointermove", handlePointerMove, { capture: true });
+      document.removeEventListener("pointerup", finishDrag, { capture: true });
+      document.removeEventListener("pointercancel", finishDrag, { capture: true });
+      document.removeEventListener("auxclick", handleAuxClick, { capture: true });
+    };
+  }, [applyPan]);
 
   const initial = zoomRef.current;
 
@@ -264,59 +459,71 @@ export const NLEPreview = memo(function NLEPreview({
     <div className="flex flex-col h-full min-h-0">
       <div
         ref={viewportRef}
-        className="relative flex-1 flex items-center justify-center p-2 overflow-hidden min-h-0 outline-none focus:ring-1 focus:ring-studio-accent/40 bg-neutral-700"
+        className="relative flex-1 flex items-center justify-center p-2 overflow-hidden min-h-0 outline-none focus:ring-1 focus:ring-studio-accent/40 bg-neutral-950"
         tabIndex={0}
         aria-label="Composition preview"
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={finishDrag}
-        onPointerCancel={finishDrag}
       >
-        <div
-          ref={stageRef}
-          className="absolute inset-2"
-          style={{
-            zoom: toDomPrecision(initial.zoomPercent / 100),
-            transform: `translate(${toDomPrecision(initial.panX)}px, ${toDomPrecision(initial.panY)}px)`,
-            transformOrigin: "0 0",
-          }}
-          data-testid="preview-zoom-stage"
-        >
-          {retiringKey && (
+        <div className="absolute inset-2 flex items-center justify-center pointer-events-none">
+          <div
+            ref={stageRef}
+            className="relative shrink-0 pointer-events-auto"
+            style={{
+              width: `${stageSize.width}px`,
+              height: `${stageSize.height}px`,
+              transform: `translate3d(${toDomPrecision(initial.panX)}px, ${toDomPrecision(initial.panY)}px, 0) scale(${toDomPrecision(initial.zoomPercent / 100)})`,
+              // resolvePreviewWheelZoom cursor math assumes center-center pivot
+              transformOrigin: "center center",
+            }}
+            data-testid="preview-zoom-stage"
+          >
+            {directUrl?.includes("/components/") && (
+              <Player
+                key={`backdrop-${projectId}`}
+                projectId={projectId}
+                onLoad={() => {}}
+                portrait={portrait}
+                suppressLoadingOverlay
+                style={{ position: "absolute", inset: 0, zIndex: 0 }}
+              />
+            )}
             <Player
-              key={retiringKey}
+              key={activeKey}
+              ref={setPreviewIframeRef}
               projectId={directUrl ? undefined : projectId}
               directUrl={directUrl}
-              onLoad={() => {}}
+              onLoad={() => {
+                updateCompositionSizeFromPreview();
+                onIframeLoad();
+                applyInitialZoom();
+              }}
+              onCompositionLoadingChange={onCompositionLoadingChange}
               portrait={portrait}
-              style={{ position: "absolute", inset: 0, zIndex: 0, opacity: 1 }}
+              suppressLoadingOverlay={suppressLoadingOverlay}
+              style={
+                directUrl?.includes("/components/")
+                  ? { position: "absolute", inset: 0, zIndex: 1 }
+                  : undefined
+              }
             />
-          )}
-          <Player
-            key={activeKey}
-            ref={iframeRef}
-            projectId={directUrl ? undefined : projectId}
-            directUrl={directUrl}
-            onLoad={
-              retiringKey
-                ? handleNewPlayerLoad
-                : () => {
-                    onIframeLoad();
-                    applyInitialZoom();
-                  }
-            }
-            onCompositionLoadingChange={onCompositionLoadingChange}
-            portrait={portrait}
-            style={retiringKey ? { position: "absolute", inset: 0, zIndex: 1 } : undefined}
-            suppressLoadingOverlay={suppressLoadingOverlay}
-          />
+          </div>
         </div>
         <div
           ref={hudRef}
           className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-50 rounded-lg px-4 py-2 text-sm font-mono tabular-nums text-white/90 bg-black/60 backdrop-blur-sm shadow-lg"
-          style={{ opacity: 0, transition: "opacity 300ms ease-out" }}
+          style={{ opacity: 0, transition: "opacity 200ms ease-in" }}
           aria-live="polite"
         />
+        {!isPreviewAtFit(settledZoom) && (
+          <button
+            type="button"
+            className="absolute bottom-3 right-3 z-50 rounded-md px-2.5 py-1 text-xs font-medium text-white/80 bg-black/50 backdrop-blur-sm hover:bg-black/70 hover:text-white transition-colors"
+            onClick={() => applyZoom(DEFAULT_PREVIEW_ZOOM)}
+            aria-label="Reset zoom to fit"
+            data-testid="preview-reset-zoom"
+          >
+            {Math.round(settledZoom.zoomPercent)}% — Reset
+          </button>
+        )}
       </div>
     </div>
   );

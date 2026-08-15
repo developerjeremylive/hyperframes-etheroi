@@ -40,23 +40,65 @@ export type {
   CaptureResult,
   CaptureBufferResult,
   CapturePerfSummary,
+  CaptureWarning,
+  CaptureWarningCode,
+  SubTimelineWaitOutcome,
 } from "./types.js";
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-export { resolveConfig, DEFAULT_CONFIG, type EngineConfig } from "./config.js";
+export {
+  resolveConfig,
+  validateEngineConfigSnapshot,
+  DEFAULT_CONFIG,
+  scaleProtocolTimeoutForComposition,
+  shouldClampToScreenshotForConcreteGpu,
+  applyConcreteGpuScreenshotClamp,
+  explainDrawElementDisabled,
+  resolveExtractCacheDir,
+  defaultExtractCacheDir,
+  EXTRACT_CACHE_DIR_DISABLED_ALIASES,
+  type EngineConfig,
+  type ExtractCacheDirResolution,
+} from "./config.js";
+export {
+  DEFAULT_VP9_CPU_USED,
+  MAX_VP9_CPU_USED,
+  MIN_VP9_CPU_USED,
+  normalizeVp9CpuUsed,
+} from "./services/vp9Options.js";
+export {
+  getCgroupMemoryLimitMb,
+  getSystemTotalMb,
+  isLowMemorySystem,
+  LOW_MEMORY_TOTAL_MB_THRESHOLD,
+} from "./services/systemMemory.js";
 
 // ── Browser management ─────────────────────────────────────────────────────────
 export {
   acquireBrowser,
   releaseBrowser,
+  drainBrowserPool,
   resolveHeadlessShellPath,
   resolveBrowserGpuMode,
   buildChromeArgs,
   ENABLE_BROWSER_POOL,
+  BrowserLeasePool,
   type BuildChromeArgsOptions,
+  type BrowserLaunchFingerprint,
+  type BrowserLease,
+  type BrowserPoolState,
   type CaptureMode,
   type AcquiredBrowser,
 } from "./services/browserManager.js";
+export {
+  augmentProtocolTimeoutError,
+  isProtocolTimeoutError,
+} from "./services/protocolTimeoutErrorHint.js";
+export {
+  augmentPageNavigationTimeoutError,
+  isPageNavigationTimeoutError,
+  type NavigationTimeoutHintContext,
+} from "./services/pageNavigationTimeoutErrorHint.js";
 
 // ── Frame capture pipeline ──────────────────────────────────────────────────────
 export {
@@ -65,14 +107,34 @@ export {
   closeCaptureSession,
   captureFrame,
   captureFrameToBuffer,
+  captureFrameToBufferPipelined,
+  captureFramesBatchPipelined,
+  DrawElementVerificationError,
+  isDrawElementVerificationError,
+  getDrawElementVerificationDetails,
+  type DrawElementVerificationDetails,
+  recaptureDrawElementFrameForVerify,
+  completeDeferredDrawElementInit,
+  writeCapturedFrame,
   discardWarmupCapture,
   getCompositionDuration,
   getCapturePerfSummary,
+  percentileOf,
   prepareCaptureSessionForReuse,
+  deriveBeginFrameProbeTimeTicks,
   type CaptureSession,
+  isTransientBrowserError,
+  isMemoryExhaustionError,
   type BeforeCaptureHook,
   type DiscardWarmupInnerCapture,
 } from "./services/frameCapture.js";
+export {
+  CaptureFailure,
+  classifyCaptureFailure,
+  isFatalCaptureFailure,
+  type CaptureFailureKind,
+  type CaptureWorkerDiagnostic,
+} from "./services/captureFailure.js";
 
 // ── Screenshot (BeginFrame) ─────────────────────────────────────────────────────
 export {
@@ -82,6 +144,7 @@ export {
   injectVideoFramesBatch,
   syncVideoFrameVisibility,
   cdpSessionCache,
+  probeBeginFrameLiveness,
   initTransparentBackground,
   captureAlphaPng,
   applyDomLayerMask,
@@ -92,6 +155,7 @@ export {
 
 // ── Encoding ───────────────────────────────────────────────────────────────────
 export {
+  buildEncoderArgs,
   encodeFramesFromDir,
   encodeFramesChunkedConcat,
   muxVideoWithAudio,
@@ -118,32 +182,68 @@ export {
   parseImageElements,
   extractVideoFramesRange,
   extractAllVideoFrames,
+  resolveTimelineExtractionWindow,
+  resolveVideoExtractionWindow,
+  resolveFinalFrameExtractionWindow,
+  resolveVideoExtractionDuration,
+  resolvePlayableVideoDuration,
+  extractionFrameCountForDuration,
   resolveProjectRelativeSrc,
   getFrameAtTime,
   createFrameLookupTable,
   FrameLookupTable,
+  analyzeClipMediaFit,
+  classifyVideoExtractionError,
+  isVideoSourceExtractionError,
+  runVideoExtractionWithRetry,
+  VideoSourceExtractionError,
   type VideoElement,
   type ImageElement,
   type ExtractedFrames,
   type ExtractionOptions,
   type ExtractionResult,
   type ExtractionPhaseBreakdown,
+  type TimelineExtractionWindow,
+  type VideoExtractionFailure,
+  type VideoExtractionFailureKind,
+  type VideoFrameFormat,
+  VIDEO_FRAME_FORMATS,
+  isVideoFrameFormat,
 } from "./services/videoFrameExtractor.js";
 
 export { createVideoFrameInjector } from "./services/videoFrameInjector.js";
 
-export { parseAudioElements, processCompositionAudio } from "./services/audioMixer.js";
-export type { AudioElement, AudioTrack, MixResult } from "./services/audioMixer.types.js";
+export {
+  MIXED_AUDIO_FILENAME,
+  parseAudioElements,
+  processCompositionAudio,
+} from "./services/audioMixer.js";
+export { cloneCaptureWarning, cloneCaptureWarnings } from "./services/captureWarning.js";
+export type {
+  AudioElement,
+  AudioFailureReason,
+  AudioFailureStage,
+  AudioProcessingFailure,
+  AudioTrack,
+  AudioVolumeKeyframe,
+  MixResult,
+} from "./services/audioMixer.types.js";
 
 // ── Parallel rendering ─────────────────────────────────────────────────────────
 export {
   calculateOptimalWorkers,
+  computeWorkerSizing,
+  selectVerifySampleIndicesForTask,
+  verifyDiskDrawElementSamples,
   distributeFrames,
+  distributeFramesInterleaved,
   executeParallelCapture,
   mergeWorkerFrames,
   getSystemResources,
   type WorkerTask,
   type WorkerResult,
+  type WorkerSizing,
+  type WorkerSizingBound,
   type ParallelProgress,
 } from "./services/parallelCoordinator.js";
 
@@ -164,23 +264,66 @@ export {
   BROWSER_GPU_NOT_SOFTWARE,
 } from "./utils/assertSwiftShader.js";
 
+export { readWebGlVendorInfoFromCanvas } from "./utils/readWebGlVendorInfoFromCanvas.js";
+
 export {
   extractMediaMetadata,
   extractVideoMetadata,
+  extractFinalVideoFrameTimestamp,
   extractAudioMetadata,
+  probeMediaProfile,
   analyzeKeyframeIntervals,
   type VideoMetadata,
   type AudioMetadata,
+  type MediaProbeProfile,
   type KeyframeAnalysis,
 } from "./utils/ffprobe.js";
 
-export { downloadToTemp, isHttpUrl } from "./utils/urlDownloader.js";
+export {
+  NOT_MEDIA_PAYLOAD,
+  NotMediaPayloadError,
+  assertMediaPayload,
+  fingerprintElementId,
+  isNotMediaPayload,
+} from "./utils/notMediaPayload.js";
+
+export {
+  assertPublicHttpsUrl,
+  downloadToTemp,
+  fetchPublicHttpsText,
+  isHttpUrl,
+  safeDownloadUrlIdentity,
+  writeUrlDownloadTelemetry,
+  type SafeDownloadUrlIdentity,
+  type UrlDownloadOptions,
+  type UrlDownloadTelemetry,
+  type PublicHttpsTextOptions,
+} from "./utils/urlDownloader.js";
 export {
   runFfmpeg,
   formatFfmpegError,
   type RunFfmpegOptions,
   type RunFfmpegResult,
 } from "./utils/runFfmpeg.js";
+export {
+  ManagedChildProcess,
+  type ManagedChildProcessOptions,
+  type ManagedChildProcessOutcome,
+  type ManagedProcessTerminationReason,
+} from "./utils/managedChildProcess.js";
+export {
+  assertConfiguredFfmpegBinariesExist,
+  getFfmpegBinary,
+  getFfprobeBinary,
+  FFMPEG_PATH_ENV,
+  FFPROBE_PATH_ENV,
+} from "./utils/ffmpegBinaries.js";
+
+export { trackChildProcess, killTrackedProcesses } from "./utils/processTracker.js";
+
+// drawElement self-verify comparison — shared by the streaming drain
+// (producer) and the parallel disk-path verify (parallelCoordinator).
+export { psnrDb, resolveDeVerifyMinDb } from "./utils/psnr.js";
 
 export {
   decodePng,
@@ -196,6 +339,17 @@ export {
 } from "./utils/alphaBlit.js";
 
 export { groupIntoLayers, type CompositeLayer } from "./utils/layerCompositor.js";
+
+export {
+  diffGpuParityFrames,
+  diffGpuParityPngs,
+  verifyGpuParity,
+  type RgbaFrame,
+  type GpuParityDiffOptions,
+  type GpuParityDiffResult,
+  type BlackOnlyInARegion,
+  type VerifyGpuParityResult,
+} from "./utils/gpuParityDiff.js";
 
 // ── Shader transitions ────────────────────────────────────────────────────────
 export {
@@ -239,3 +393,13 @@ export {
   type HdrMasteringMetadata,
 } from "./utils/hdr.js";
 export type { VideoColorSpace } from "./utils/ffprobe.js";
+export {
+  renderProvenanceArgs,
+  appendRenderProvenanceArgs,
+  readRenderProvenance,
+  PROVENANCE_RENDERER_TAG,
+  PROVENANCE_VERSION_TAG,
+  PROVENANCE_RENDERER_NAME,
+  PROVENANCE_VERSION,
+  type RenderProvenance,
+} from "./utils/renderProvenance.js";

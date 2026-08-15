@@ -9,11 +9,10 @@ describe("createRuntimeState", () => {
     expect(state.canonicalFps).toBe(30);
     expect(state.playbackRate).toBe(1);
     expect(state.bridgeMuted).toBe(false);
+    expect(state.nativeMediaSyncDisabled).toBe(false);
+    expect(state.webAudioMediaDisabled).toBe(false);
     expect(state.capturedTimeline).toBeNull();
-    expect(state.rafId).toBeNull();
     expect(state.tornDown).toBe(false);
-    expect(state.maxTimelineDurationSeconds).toBe(1800);
-    expect(state.parityModeEnabled).toBe(true);
   });
 
   it("returns independent instances", () => {
@@ -41,6 +40,7 @@ describe("createRuntimeState", () => {
     expect(state.cachedVideoClips).toEqual([]);
     expect(state.injectedCompStyles).toEqual([]);
     expect(state.injectedCompScripts).toEqual([]);
+    expect(state.injectedCompLinks).toEqual([]);
     expect(state.deterministicAdapters).toEqual([]);
   });
 

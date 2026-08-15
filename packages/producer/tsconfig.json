@@ -12,8 +12,20 @@
     "declaration": true,
     "declarationMap": true,
     "sourceMap": true,
-    "types": ["@webgpu/types"]
+    "types": ["@webgpu/types"],
+    "baseUrl": ".",
+    "paths": {
+      "@hyperframes/producer": ["./src/index.ts"],
+      "@hyperframes/producer/distributed": ["./src/distributed.ts"]
+    }
   },
   "include": ["src/**/*"],
-  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/**/__test_utils__/**"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/**/*.test.ts",
+    "src/**/__test_utils__/**",
+    "src/regression-harness-lambda-local.ts",
+    "src/plan-parity-lambda-local-driver.ts"
+  ]
 }

@@ -26,6 +26,15 @@ describe("applyPatchByTarget", () => {
     );
   });
 
+  it("removes a boolean data attribute by selector", () => {
+    const html = `<div class="headline clip" data-start="0" data-hidden></div>`;
+    const op: PatchOperation = { type: "attribute", property: "hidden", value: null };
+
+    expect(applyPatchByTarget(html, { selector: ".headline" }, op)).toBe(
+      `<div class="headline clip" data-start="0"></div>`,
+    );
+  });
+
   it("updates inline z-index by selector when the clip has no DOM id", () => {
     const html = `<div class="headline clip" style="position: absolute; opacity: 1" data-start="0"></div>`;
     const op: PatchOperation = { type: "inline-style", property: "z-index", value: "3" };
@@ -33,6 +42,28 @@ describe("applyPatchByTarget", () => {
     expect(applyPatchByTarget(html, { selector: ".headline" }, op)).toContain(
       'style="position: absolute; opacity: 1; z-index: 3"',
     );
+  });
+
+  it("adds inline style to a self-closing void element without malforming it", () => {
+    const html = `<img id="gif-img" class="clip" data-start="1" src="earth.gif" alt="earth" />`;
+    const op: PatchOperation = { type: "inline-style", property: "z-index", value: "3" };
+
+    const result = applyPatch(html, "gif-img", op);
+    expect(result).toBe(
+      `<img id="gif-img" class="clip" data-start="1" src="earth.gif" alt="earth" style="z-index: 3" />`,
+    );
+    expect(result).not.toContain("/ style");
+  });
+
+  it("adds inline style to a self-closing void element matched by selector", () => {
+    const html = `<img class="clip hero" data-start="0" src="bg.png" alt="" />`;
+    const op: PatchOperation = { type: "inline-style", property: "opacity", value: "0.5" };
+
+    const result = applyPatchByTarget(html, { selector: ".hero" }, op);
+    expect(result).toBe(
+      `<img class="clip hero" data-start="0" src="bg.png" alt="" style="opacity: 0.5" />`,
+    );
+    expect(result).not.toContain("/ style");
   });
 
   it("patches inline move styles by target", () => {
@@ -344,6 +375,7 @@ describe("motion attribute round-trip via sourcePatcher", () => {
       duration: 0.6,
       ease: "power2.out",
       from: { autoAlpha: 0, y: 32 },
+      // fallow-ignore-next-line code-duplication
       to: { autoAlpha: 1, y: 0 },
     };
 
@@ -398,6 +430,7 @@ describe("motion attribute round-trip via sourcePatcher", () => {
       duration: 1,
       ease: "none",
       from: { opacity: 0 },
+      // fallow-ignore-next-line code-duplication
       to: { opacity: 1 },
     };
 
@@ -492,5 +525,91 @@ describe("motion attribute round-trip via sourcePatcher", () => {
     );
     expect(readBack).toBeDefined();
     expect(JSON.parse(readBack!)).toEqual(motion);
+  });
+});
+
+// T3 — id-based targeting (R1).
+describe("T3 — hfId targeting (spec for R1)", () => {
+  it("updates inline style by data-hf-id", () => {
+    const html = `<h1 data-hf-id="hf-x7k2" style="color: red">Hello</h1>`;
+    const result = applyPatchByTarget(
+      html,
+      { hfId: "hf-x7k2" },
+      {
+        type: "inline-style",
+        property: "color",
+        value: "blue",
+      },
+    );
+    expect(result).toContain("color: blue");
+    expect(result).toContain('data-hf-id="hf-x7k2"');
+  });
+
+  it("updates text content by data-hf-id", () => {
+    const html = `<p data-hf-id="hf-a1b2">Old text</p>`;
+    const result = applyPatchByTarget(
+      html,
+      { hfId: "hf-a1b2" },
+      {
+        type: "text-content",
+        property: "",
+        value: "New text",
+      },
+    );
+    expect(result).toContain(">New text<");
+  });
+
+  it("updates attribute by data-hf-id", () => {
+    const html = `<div data-hf-id="hf-c3d4" data-start="0"></div>`;
+    const result = applyPatchByTarget(
+      html,
+      { hfId: "hf-c3d4" },
+      {
+        type: "attribute",
+        property: "start",
+        value: "2.5",
+      },
+    );
+    expect(result).toContain('data-start="2.5"');
+  });
+
+  it("data-hf-id attribute is preserved after a style patch", () => {
+    const html = `<h1 data-hf-id="hf-x7k2" style="color: red">Hello</h1>`;
+    const patched = applyPatchByTarget(
+      html,
+      { hfId: "hf-x7k2" },
+      {
+        type: "inline-style",
+        property: "color",
+        value: "blue",
+      },
+    );
+    expect(readAttributeByTarget(patched, { hfId: "hf-x7k2" }, "data-hf-id")).toBe("hf-x7k2");
+  });
+
+  it("hfId lookup falls through to selector when hfId not found", () => {
+    const html = `<h1 class="headline" style="color: red">Hello</h1>`;
+    const result = applyPatchByTarget(
+      html,
+      { hfId: "hf-missing", selector: ".headline" },
+      { type: "inline-style", property: "color", value: "blue" },
+    );
+    expect(result).toContain("color: blue");
+  });
+
+  it("hfId match is authoritative — selector is not used as a narrowing filter", () => {
+    // hfId matches h1; selector points at h2. hfId wins — patch lands on h1, h2 untouched.
+    const html = `<h1 data-hf-id="hf-x7k2" class="a">A</h1><h2 class="b">B</h2>`;
+    const result = applyPatchByTarget(
+      html,
+      { hfId: "hf-x7k2", selector: ".b" },
+      { type: "inline-style", property: "color", value: "blue" },
+    );
+    expect(result).toContain('data-hf-id="hf-x7k2"');
+    const h1End = result.indexOf("</h1>");
+    const bluePos = result.indexOf("color: blue");
+    expect(bluePos).toBeGreaterThan(-1);
+    expect(bluePos).toBeLessThan(h1End);
+    expect(result).toContain('<h2 class="b">B</h2>');
   });
 });

@@ -39,6 +39,66 @@ describe("@hyperframes/core public API exports", () => {
       expect(core.normalizeResolutionFlag(undefined)).toBeUndefined();
     });
 
+    it("exports isAspectAgnosticResolutionAlias for tier-only aliases", () => {
+      // Tier-only aliases → true (orientation follows the composition).
+      expect(core.isAspectAgnosticResolutionAlias("1080p")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("hd")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("4k")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("uhd")).toBe(true);
+      // Case-insensitive.
+      expect(core.isAspectAgnosticResolutionAlias("1080P")).toBe(true);
+      expect(core.isAspectAgnosticResolutionAlias("UHD")).toBe(true);
+      // Orientation-suffixed aliases → false (user picked an orientation).
+      expect(core.isAspectAgnosticResolutionAlias("1080p-portrait")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("portrait-1080p")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("4k-square")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("1080p-square")).toBe(false);
+      // Canonical presets → false.
+      expect(core.isAspectAgnosticResolutionAlias("landscape")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("portrait")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("landscape-4k")).toBe(false);
+      // Unknown / empty / undefined → false.
+      expect(core.isAspectAgnosticResolutionAlias("8k")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias("")).toBe(false);
+      expect(core.isAspectAgnosticResolutionAlias(undefined)).toBe(false);
+    });
+
+    it("exports resolveResolutionFlagPair — the pair every distributed entrypoint must forward", () => {
+      // The single source of truth every distributed adapter reads
+      // (`hyperframes cloudrun render`, `hyperframes lambda render`,
+      // `hyperframes lambda render-batch`). Divergent copies across those
+      // callers is what shipped the portrait-1080p failure this helper
+      // exists to prevent (PR #2529). Case-insensitive on the raw input.
+      expect(core.resolveResolutionFlagPair("1080p")).toEqual({
+        outputResolution: "landscape",
+        outputResolutionAspectAgnostic: true,
+      });
+      expect(core.resolveResolutionFlagPair("4K")).toEqual({
+        outputResolution: "landscape-4k",
+        outputResolutionAspectAgnostic: true,
+      });
+      // Canonical preset — aspect-agnostic stays false.
+      expect(core.resolveResolutionFlagPair("portrait")).toEqual({
+        outputResolution: "portrait",
+        outputResolutionAspectAgnostic: false,
+      });
+      // Orientation-suffixed alias — aspect-agnostic stays false.
+      expect(core.resolveResolutionFlagPair("1080p-portrait")).toEqual({
+        outputResolution: "portrait",
+        outputResolutionAspectAgnostic: false,
+      });
+      // Unknown / empty / undefined → both fields degrade cleanly so
+      // callers can produce their own "invalid" UX.
+      expect(core.resolveResolutionFlagPair("8k")).toEqual({
+        outputResolution: undefined,
+        outputResolutionAspectAgnostic: false,
+      });
+      expect(core.resolveResolutionFlagPair(undefined)).toEqual({
+        outputResolution: undefined,
+        outputResolutionAspectAgnostic: false,
+      });
+    });
+
     it("exports TIMELINE_COLORS", () => {
       expect(core.TIMELINE_COLORS).toBeDefined();
       expect(core.TIMELINE_COLORS.video).toBeDefined();
@@ -67,14 +127,6 @@ describe("@hyperframes/core public API exports", () => {
       expect(zoom.focusX).toBe(960);
       expect(zoom.focusY).toBe(540);
     });
-
-    it("exports composition variable type guards", () => {
-      expect(typeof core.isStringVariable).toBe("function");
-      expect(typeof core.isNumberVariable).toBe("function");
-      expect(typeof core.isColorVariable).toBe("function");
-      expect(typeof core.isBooleanVariable).toBe("function");
-      expect(typeof core.isEnumVariable).toBe("function");
-    });
   });
 
   describe("template exports", () => {
@@ -97,23 +149,14 @@ describe("@hyperframes/core public API exports", () => {
   });
 
   describe("parser exports", () => {
-    it("exports GSAP parser functions", () => {
-      expect(typeof core.parseGsapScript).toBe("function");
-      expect(typeof core.serializeGsapAnimations).toBe("function");
-      expect(typeof core.updateAnimationInScript).toBe("function");
-      expect(typeof core.addAnimationToScript).toBe("function");
-      expect(typeof core.removeAnimationFromScript).toBe("function");
-      expect(typeof core.getAnimationsForElement).toBe("function");
-      expect(typeof core.validateCompositionGsap).toBe("function");
-      expect(typeof core.keyframesToGsapAnimations).toBe("function");
-      expect(typeof core.gsapAnimationsToKeyframes).toBe("function");
+    it("does NOT re-export GSAP parser functions from barrel (available via gsap-parser subpath)", () => {
+      // GSAP AST parser functions are not re-exported from the barrel —
+      // use the acorn parser (gsapParserAcorn) or writer (gsapWriterAcorn) directly.
+      expect(typeof (core as Record<string, unknown>).parseGsapScript).toBe("undefined");
     });
 
-    it("exports GSAP constants", () => {
-      expect(core.SUPPORTED_PROPS).toBeDefined();
-      expect(Array.isArray(core.SUPPORTED_PROPS)).toBe(true);
-      expect(core.SUPPORTED_EASES).toBeDefined();
-      expect(Array.isArray(core.SUPPORTED_EASES)).toBe(true);
+    it("does NOT re-export GSAP constants from barrel (available via gsap-constants subpath)", () => {
+      expect((core as Record<string, unknown>).SUPPORTED_PROPS).toBeUndefined();
     });
 
     it("exports HTML parser functions", () => {
@@ -141,12 +184,23 @@ describe("@hyperframes/core public API exports", () => {
       expect(typeof core.extractResolvedMedia).toBe("function");
       expect(typeof core.clampDurations).toBe("function");
       expect(typeof core.shouldClampMediaDuration).toBe("function");
+      expect(typeof core.shouldClampResolvedMediaDuration).toBe("function");
     });
   });
 
   describe("lint exports", () => {
-    it("exports lintHyperframeHtml", () => {
-      expect(typeof core.lintHyperframeHtml).toBe("function");
+    it("exposes lintHyperframeHtml via the @hyperframes/core/lint back-compat stub", async () => {
+      // Lint moved to @hyperframes/lint; core's main entry no longer re-exports
+      // it (that would cycle through the lint package). The subpath stub keeps
+      // existing @hyperframes/core/lint imports working.
+      const lint = await import("./lint/index.js");
+      expect(typeof lint.lintHyperframeHtml).toBe("function");
+    });
+  });
+
+  describe("media exports", () => {
+    it("exports parseAnimatedGifMetadata", () => {
+      expect(typeof core.parseAnimatedGifMetadata).toBe("function");
     });
   });
 

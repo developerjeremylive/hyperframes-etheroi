@@ -14,6 +14,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join, relative, resolve } from "node:path";
 
 import type { Fps } from "@hyperframes/core";
+import { PLAN_PROTOCOL_V1 } from "../../distributed/planProtocol.js";
 import {
   canonicalJsonStringify,
   computePlanHash,
@@ -36,7 +37,12 @@ export interface LockedRenderConfig {
   warmupTicks: number;
 
   // Encode
-  encoder: "libx264-software" | "libx265-software" | "prores-software" | "png-sequence";
+  encoder:
+    | "libx264-software"
+    | "libx265-software"
+    | "libvpx-vp9-software"
+    | "prores-software"
+    | "png-sequence";
   /**
    * Caller-supplied quality enum, persisted so chunk workers can rebuild
    * the matching `getEncoderPreset(quality, format, …)` instead of
@@ -48,6 +54,14 @@ export interface LockedRenderConfig {
   preset: string;
   crf?: number;
   bitrate?: string;
+  /**
+   * VP9-only: new WebM plans persist the resolved libvpx-vp9 `-cpu-used`
+   * value so distributed workers reproduce the controller's speed/quality
+   * choice. Omitted for non-VP9 plans to avoid shifting unrelated planHash
+   * baselines. Optional for compatibility with older WebM planDirs; workers
+   * replay those with the historical distributed VP9 value.
+   */
+  vp9CpuUsed?: number;
   /** Equal to chunkSize for closed-GOP concat-copy. */
   gopSize: number;
   closedGop: true;
@@ -60,6 +74,25 @@ export interface LockedRenderConfig {
 
   /** Snapshot of `PRODUCER_RUNTIME_*` env vars at plan time. */
   runtimeEnv: Record<string, string>;
+
+  /**
+   * Render-time variable overrides snapshotted at plan time. Chunk workers
+   * re-inject these into the page as `window.__hfVariables` before the
+   * first capture, so every chunk sees the same `getVariables()` resolution
+   * the controller used to size the plan.
+   *
+   * Folded into the canonical encoder.json bytes that feed `planHash` —
+   * two plans with different variables produce different hashes (the
+   * intended behavior: different variables can produce different rendered
+   * frames). Two plans with the same variables produce identical hashes
+   * because canonical-JSON sorts object keys.
+   *
+   * Optional: omitted (undefined) when the caller doesn't pass variables;
+   * stripped from the canonical JSON via the same `stripUndefined` pass
+   * that handles `crf`/`bitrate`, so an absent value hashes the same as
+   * before this field existed.
+   */
+  variables?: Record<string, unknown>;
 }
 
 export interface CompositionMetadataJson {
@@ -81,7 +114,7 @@ export interface ChunkSliceJson {
 
 /**
  * Inputs to `freezePlan`. `planDir` already contains `compiled/`,
- * `video-frames/`, and (optionally) `audio.aac` by the time freezePlan
+ * `video-frames/`, and (optionally) the mixed audio by the time freezePlan
  * runs — those are materialized by the upstream compile/probe/extract/audio
  * stages composed in `services/distributed/plan.ts`.
  */
@@ -99,7 +132,7 @@ export interface FreezePlanInput {
   durationSeconds: number;
   /** Total frame count, separately materialized for callers that read `plan.json` without parsing chunks.json. */
   totalFrames: number;
-  /** Whether `<planDir>/audio.aac` was produced. */
+  /** Whether the plan's mixed-audio artifact was produced. */
   hasAudio: boolean;
 }
 
@@ -116,7 +149,6 @@ export interface FreezePlanResult {
  * `../runtimeEnvSnapshot.ts` — chunk workers re-apply the snapshot during
  * boot, so it needs to be importable without dragging in the freeze pipeline.
  */
-export { RUNTIME_ENV_PREFIXES, snapshotRuntimeEnv } from "../runtimeEnvSnapshot.js";
 
 /** The relative path inside `<planDir>/` to the compiled HTML. */
 const COMPILED_INDEX_RELATIVE_PATH = "compiled/index.html";
@@ -324,6 +356,7 @@ export async function freezePlan(input: FreezePlanInput): Promise<FreezePlanResu
   });
 
   const planJson = {
+    protocol: PLAN_PROTOCOL_V1,
     planHash,
     producerVersion,
     ffmpegVersion: encoder.ffmpegVersion,

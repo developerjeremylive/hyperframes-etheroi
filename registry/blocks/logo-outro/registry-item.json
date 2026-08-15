@@ -16,5 +16,23 @@
       "target": "compositions/logo-outro.html",
       "type": "hyperframes:composition"
     }
+  ],
+  "preview": {
+    "video": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/logo-outro.mp4",
+    "poster": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/logo-outro.png"
+  },
+  "params": [
+    {
+      "key": "--bg-color",
+      "label": "Background",
+      "type": "color",
+      "default": "#0a0a0f"
+    },
+    {
+      "key": "--accent-color",
+      "label": "Accent",
+      "type": "color",
+      "default": "#1a1a1f"
+    }
   ]
 }

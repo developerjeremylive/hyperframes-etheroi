@@ -106,6 +106,28 @@ describe("readTimelineDurationFromDocument", () => {
 
     expect(readTimelineDurationFromDocument(doc)).toBe(5.5);
   });
+
+  it("reads data-hf-authored-duration when data-duration is stripped", () => {
+    const doc = createDocument(`
+      <div data-composition-id="main">
+        <div data-composition-id="sub-a" data-start="0" data-hf-authored-duration="8"></div>
+        <div data-composition-id="sub-b" data-start="60" data-hf-authored-duration="10"></div>
+      </div>
+    `);
+
+    expect(readTimelineDurationFromDocument(doc)).toBe(70);
+  });
+
+  it("picks the larger of data-duration and data-hf-authored-duration children", () => {
+    const doc = createDocument(`
+      <div data-composition-id="main">
+        <div data-start="0" data-duration="5"></div>
+        <div data-composition-id="ext" data-start="74" data-hf-authored-duration="8"></div>
+      </div>
+    `);
+
+    expect(readTimelineDurationFromDocument(doc)).toBe(82);
+  });
 });
 
 describe("createStaticSeekPlaybackAdapter", () => {
@@ -153,6 +175,62 @@ describe("createStaticSeekPlaybackAdapter", () => {
     expect(renderedTimes).toEqual([2]);
     expect(adapter.getTime()).toBe(2);
   });
+
+  it("works with a seek-only adapter (no renderSeek)", () => {
+    const clock = createManualAnimationClock();
+    const seekedTimes: number[] = [];
+    const adapter = createStaticSeekPlaybackAdapter(
+      {
+        getTime: () => 0,
+        seek: (time: number) => {
+          seekedTimes.push(time);
+        },
+      },
+      82,
+      clock,
+    );
+
+    adapter.seek(77);
+    expect(seekedTimes).toEqual([77]);
+    expect(adapter.getTime()).toBe(77);
+    expect(adapter.getDuration()).toBe(82);
+  });
+
+  it("clamps time at the duration boundary during RAF tick", () => {
+    const clock = createManualAnimationClock();
+    const renderedTimes: number[] = [];
+    const adapter = createStaticSeekPlaybackAdapter(
+      {
+        getTime: () => 0,
+        renderSeek: (time: number) => {
+          renderedTimes.push(time);
+        },
+      },
+      2,
+      clock,
+    );
+
+    adapter.seek(0);
+    adapter.play();
+    clock.step(3_000);
+
+    expect(adapter.getTime()).toBe(2);
+    expect(adapter.isPlaying()).toBe(false);
+    expect(renderedTimes).toEqual([0, 2]);
+  });
+
+  it("pauses old adapter before replacing with new duration", () => {
+    const clock = createManualAnimationClock();
+    const adapter = createStaticSeekPlaybackAdapter(
+      { getTime: () => 0, renderSeek: () => {} },
+      10,
+      clock,
+    );
+    adapter.play();
+    expect(adapter.isPlaying()).toBe(true);
+    adapter.pause();
+    expect(adapter.isPlaying()).toBe(false);
+  });
 });
 
 describe("buildStandaloneRootTimelineElement", () => {
@@ -165,7 +243,10 @@ describe("buildStandaloneRootTimelineElement", () => {
         iframeSrc: "http://127.0.0.1:4173/api/projects/demo/preview/comp/scenes/hero.html?_t=123",
         selector: '[data-composition-id="hero"]',
       }),
-    ).toEqual({
+      // toMatchObject (not toEqual): asserts the selector/source metadata this
+      // test is about, without re-pinning the full element shape (stacking
+      // metadata like hasExplicitZIndex is covered in timelineDOM.test.ts).
+    ).toMatchObject({
       id: "hero",
       label: "hero",
       key: 'scenes/hero.html:[data-composition-id="hero"]:0',
@@ -356,12 +437,19 @@ describe("anonymous timeline identity", () => {
 });
 
 describe("mergeTimelineElementsPreservingDowngrades", () => {
-  it("preserves missing current elements when a shorter manifest arrives", () => {
+  it("preserves missing sub-composition elements when a shorter manifest arrives", () => {
     expect(
       mergeTimelineElementsPreservingDowngrades(
         [
           { id: "hero", tag: "div", start: 0, duration: 4, track: 0 },
-          { id: "cta", tag: "div", start: 4, duration: 2, track: 1 },
+          {
+            id: "cta",
+            tag: "div",
+            start: 4,
+            duration: 2,
+            track: 1,
+            compositionSrc: "scenes/cta.html",
+          },
         ],
         [{ id: "hero", tag: "div", start: 0, duration: 4, track: 0 }],
         8,
@@ -369,8 +457,29 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
       ),
     ).toEqual([
       { id: "hero", tag: "div", start: 0, duration: 4, track: 0 },
-      { id: "cta", tag: "div", start: 4, duration: 2, track: 1 },
+      {
+        id: "cta",
+        tag: "div",
+        start: 4,
+        duration: 2,
+        track: 1,
+        compositionSrc: "scenes/cta.html",
+      },
     ]);
+  });
+
+  it("drops missing top-level elements so undo does not leave ghost clips", () => {
+    expect(
+      mergeTimelineElementsPreservingDowngrades(
+        [
+          { id: "hero", tag: "div", start: 0, duration: 4, track: 0 },
+          { id: "split-clone", tag: "div", start: 4, duration: 2, track: 1 },
+        ],
+        [{ id: "hero", tag: "div", start: 0, duration: 4, track: 0 }],
+        8,
+        8,
+      ),
+    ).toEqual([{ id: "hero", tag: "div", start: 0, duration: 4, track: 0 }]);
   });
 
   it("accepts longer-duration or same-size updates as authoritative", () => {
@@ -396,6 +505,7 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
             start: 0,
             duration: 3,
             track: 0,
+            compositionSrc: "scenes/cards.html",
           },
           {
             id: "Card",
@@ -405,6 +515,7 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
             start: 3,
             duration: 3,
             track: 1,
+            compositionSrc: "scenes/cards.html",
           },
         ],
         [
@@ -416,6 +527,7 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
             start: 0,
             duration: 3,
             track: 0,
+            compositionSrc: "scenes/cards.html",
           },
         ],
         8,
@@ -430,6 +542,7 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
         start: 0,
         duration: 3,
         track: 0,
+        compositionSrc: "scenes/cards.html",
       },
       {
         id: "Card",
@@ -439,6 +552,7 @@ describe("mergeTimelineElementsPreservingDowngrades", () => {
         start: 3,
         duration: 3,
         track: 1,
+        compositionSrc: "scenes/cards.html",
       },
     ]);
   });

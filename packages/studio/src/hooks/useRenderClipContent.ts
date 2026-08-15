@@ -2,8 +2,96 @@ import { useCallback, type ReactNode } from "react";
 import { createElement } from "react";
 import { CompositionThumbnail, VideoThumbnail } from "../player";
 import type { TimelineElement } from "../player";
+import type { TimelineClipRenderContext } from "../player/components/TimelineTypes";
 import { AudioWaveform } from "../player/components/AudioWaveform";
-import { getTimelineElementLabel } from "../utils/studioHelpers";
+import { ImageThumbnail } from "../player/components/ImageThumbnail";
+import { encodePreviewPath, resolveMediaPreviewUrl } from "../player/components/thumbnailUtils";
+import { usePlayerStore } from "../player/store/playerStore";
+import { effectiveThumbnailMode } from "../player/lib/thumbnailPolicy";
+
+export function normalizeCompositionSrc(
+  compSrc: string,
+  projectId: string,
+  origin: string,
+): string {
+  try {
+    const parsed = new URL(compSrc, origin);
+    const previewPrefix = `/api/projects/${projectId}/preview/`;
+    if (parsed.pathname.startsWith(previewPrefix)) {
+      return parsed.pathname.slice(previewPrefix.length);
+    }
+  } catch {
+    // already relative
+  }
+  return compSrc;
+}
+
+/** Resolve a media src to its project-relative preview path, or null. */
+function resolvePreviewRelative(
+  src: string | undefined,
+  pid: string,
+  origin: string,
+): string | null {
+  if (!src) return null;
+  try {
+    const parsed = new URL(src, origin);
+    const base = new URL(`/api/projects/${pid}/preview/`, origin).pathname;
+    return parsed.pathname.startsWith(base)
+      ? decodeURIComponent(parsed.pathname.slice(base.length))
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The trimmed source slice as start/end fractions (0–1) of the source, so the
+ * waveform can window its peaks to the clip edges. Undefined when the source
+ * length is unknown (renders full).
+ */
+function trimFractions(el: TimelineElement): { start?: number; end?: number } {
+  const sourceDur = el.sourceDuration;
+  if (sourceDur == null || sourceDur <= 0) return {};
+  const mediaStart = el.playbackStart ?? 0;
+  const rate = el.playbackRate ?? 1;
+  const start = Math.max(0, Math.min(1, mediaStart / sourceDur));
+  const end = Math.max(start, Math.min(1, (mediaStart + el.duration * rate) / sourceDur));
+  return { start, end };
+}
+
+/**
+ * Build the waveform element for an audio clip, windowing the rendered peaks to
+ * the trimmed source slice so the bars track the clip edges.
+ */
+function renderAudioClip(
+  el: TimelineElement,
+  pid: string,
+  sessionEpoch: number,
+  labelColor: string,
+  context: TimelineClipRenderContext,
+): ReactNode {
+  const audioUrl = resolveMediaPreviewUrl(el.src ?? "", pid, window.location.origin);
+  const srcRelative = resolvePreviewRelative(audioUrl, pid, window.location.origin);
+  // Encode each path segment (spaces, parens, U+202F, unicode) so the URL matches
+  // what the assets panel loads — a raw segment 404s. resolvePreviewRelative
+  // returns the DECODED path, so it must be re-encoded here.
+  const encodedRelative = srcRelative ? encodePreviewPath(srcRelative) : null;
+  const waveformUrl = encodedRelative
+    ? `/api/projects/${pid}/waveform/${encodedRelative}`
+    : undefined;
+  const { start, end } = trimFractions(el);
+  return createElement(AudioWaveform, {
+    audioUrl,
+    waveformUrl,
+    label: "",
+    labelColor,
+    trimStartFraction: start,
+    trimEndFraction: end,
+    projectId: pid,
+    sessionEpoch,
+    priority: context.priority,
+  });
+}
 
 interface UseRenderClipContentOptions {
   projectIdRef: { current: string | null };
@@ -18,13 +106,33 @@ export function useRenderClipContent({
   activePreviewUrl,
   effectiveTimelineDuration,
 }: UseRenderClipContentOptions) {
+  // Self-sourced so the adaptive policy gates thumbnail generation without App plumbing.
+  const thumbnailMode = usePlayerStore((s) => s.thumbnailMode);
+  const effectiveMode = effectiveThumbnailMode(thumbnailMode);
+  const sessionEpoch = usePlayerStore((s) => s.timelineSessionEpoch);
   return useCallback(
-    (el: TimelineElement, style: { clip: string; label: string }): ReactNode => {
+    // Pre-existing clip-content dispatcher; reduced by extracting renderAudioClip.
+    // fallow-ignore-next-line complexity
+    (
+      el: TimelineElement,
+      style: { clip: string; label: string },
+      context: TimelineClipRenderContext = { priority: "visible", rich: false },
+    ): ReactNode => {
       const pid = projectIdRef.current;
       if (!pid) return null;
 
-      // Resolve composition source path using the compIdToSrc map
+      // Thumbnail generation disabled (perf) -> plain clip bars. Audio still shows
+      // its waveform (cheap, not a frame thumbnail). Toggle: timeline toolbar.
+      if (effectiveMode === "hidden") {
+        return el.tag === "audio"
+          ? renderAudioClip(el, pid, sessionEpoch, style.label, context)
+          : null;
+      }
+
       let compSrc = el.compositionSrc;
+      if (compSrc) {
+        compSrc = normalizeCompositionSrc(compSrc, pid, window.location.origin);
+      }
       if (compSrc && compIdToSrc.size > 0) {
         const resolved =
           compIdToSrc.get(el.id) ||
@@ -37,13 +145,24 @@ export function useRenderClipContent({
       // instead of capturing the master at a time when the comp is fading in.
       if (compSrc) {
         return createElement(CompositionThumbnail, {
-          previewUrl: `/api/projects/${pid}/preview/comp/${compSrc}`,
-          label: getTimelineElementLabel(el),
+          previewUrl: `/api/projects/${pid}/preview/comp/${encodePreviewPath(compSrc)}`,
+          label: "",
           labelColor: style.label,
-          accentColor: style.clip,
+
           seekTime: 0,
           duration: el.duration,
+          projectId: pid,
+          sessionEpoch,
+          priority: context.priority,
+          rich: context.rich,
         });
+      }
+
+      // Audio clips — waveform visualization. Resolve these before the generic
+      // activePreviewUrl thumbnail branch; audio rows need waveform data, not a
+      // captured frame from the currently drilled composition preview.
+      if (el.tag === "audio") {
+        return renderAudioClip(el, pid, sessionEpoch, style.label, context);
       }
 
       // When drilled into a composition, render all inner elements via
@@ -51,13 +170,17 @@ export function useRenderClipContent({
       if (activePreviewUrl && el.duration > 0) {
         return createElement(CompositionThumbnail, {
           previewUrl: activePreviewUrl,
-          label: getTimelineElementLabel(el),
+          label: "",
           labelColor: style.label,
-          accentColor: style.clip,
+
           selector: el.selector,
           selectorIndex: el.selectorIndex,
           seekTime: el.start,
           duration: el.duration,
+          projectId: pid,
+          sessionEpoch,
+          priority: context.priority,
+          rich: context.rich,
         });
       }
 
@@ -67,58 +190,62 @@ export function useRenderClipContent({
         el.duration < effectiveTimelineDuration * 0.92 &&
         !/(backdrop|background|overlay|scrim|mask)/i.test(el.id);
 
-      // Audio clips — waveform visualization
-      if (el.tag === "audio") {
-        const previewBase = `/api/projects/${pid}/preview/`;
-        const previewIdx = el.src?.startsWith("http") ? el.src.indexOf(previewBase) : -1;
-        const srcRelative = el.src
-          ? previewIdx !== -1
-            ? decodeURIComponent(el.src.slice(previewIdx + previewBase.length))
-            : el.src.startsWith("http")
-              ? null
-              : el.src
-          : null;
-        const audioUrl = srcRelative
-          ? `/api/projects/${pid}/preview/${srcRelative}`
-          : (el.src ?? "");
-        const waveformUrl = srcRelative
-          ? `/api/projects/${pid}/waveform/${srcRelative}`
-          : undefined;
-        return createElement(AudioWaveform, {
-          audioUrl,
-          waveformUrl,
-          label: getTimelineElementLabel(el),
-          labelColor: style.label,
-        });
-      }
-
       if ((el.tag === "video" || el.tag === "img") && el.src) {
-        const mediaSrc = el.src.startsWith("http")
-          ? el.src
-          : `/api/projects/${pid}/preview/${el.src}`;
+        const mediaSrc = resolveMediaPreviewUrl(el.src, pid, window.location.origin);
+        // Still images can't be decoded by VideoThumbnail's <video> extractor
+        // (the error event fires and the shimmer never resolves) — render the
+        // image itself as the strip.
+        if (el.tag === "img") {
+          return createElement(ImageThumbnail, {
+            imageSrc: mediaSrc,
+            label: "",
+            labelColor: style.label,
+            projectId: pid,
+            sessionEpoch,
+            priority: context.priority,
+            rich: context.rich,
+          });
+        }
         return createElement(VideoThumbnail, {
           videoSrc: mediaSrc,
-          label: getTimelineElementLabel(el),
+          label: "",
           labelColor: style.label,
           duration: el.duration,
+          sourceStart: el.playbackStart,
+          sourceRangeDuration: el.duration * (el.playbackRate ?? 1),
+          projectId: pid,
+          sessionEpoch,
+          priority: context.priority,
+          rich: context.rich,
         });
       }
 
       if (htmlPreviewEligible) {
         return createElement(CompositionThumbnail, {
           previewUrl: `/api/projects/${pid}/preview`,
-          label: getTimelineElementLabel(el),
+          label: "",
           labelColor: style.label,
-          accentColor: style.clip,
+
           selector: el.selector,
           selectorIndex: el.selectorIndex,
           seekTime: el.start,
           duration: el.duration,
+          projectId: pid,
+          sessionEpoch,
+          priority: context.priority,
+          rich: context.rich,
         });
       }
 
       return null;
     },
-    [projectIdRef, compIdToSrc, activePreviewUrl, effectiveTimelineDuration],
+    [
+      projectIdRef,
+      compIdToSrc,
+      activePreviewUrl,
+      effectiveTimelineDuration,
+      effectiveMode,
+      sessionEpoch,
+    ],
   );
 }

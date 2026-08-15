@@ -9,8 +9,8 @@
  * centralized here.
  */
 
-import { rmSync } from "node:fs";
 import {
+  type BeforeCaptureHook,
   type CaptureSession,
   type ElementStackingInfo,
   applyDomLayerMask,
@@ -23,14 +23,19 @@ import {
 import type { ProducerLogger } from "../../../logger.js";
 import {
   type HdrCompositeContext,
-  type HdrPerfCollector,
   type HdrVideoFrameSource,
   type TransitionRange,
-  addHdrTiming,
   blitHdrImageLayer,
   blitHdrVideoLayer,
-  closeHdrVideoFrameSource,
-} from "../../renderOrchestrator.js";
+  selectDomLayerShowIds,
+} from "../../hdrCompositor.js";
+import { cleanupHdrVideoFrameSource } from "./captureHdrResources.js";
+import {
+  type HdrPerfCollector,
+  type HdrPerfTimingKey,
+  timeHdrPhase,
+  timeHdrPhaseAsync,
+} from "../hdrPerf.js";
 
 // ─── Hybrid path gating + partitioning ─────────────────────────────────────
 
@@ -102,6 +107,53 @@ export interface LayeredTransitionBuffers {
   output: Buffer;
 }
 
+// ─── Seek + inject + stacking query (shared across all three loop paths) ──
+
+/**
+ * Seek the page to `time` and run the optional before-capture hook.
+ * Used by `captureSceneIntoBuffer` which receives stacking info from
+ * its caller, and by `seekInjectAndQueryStacking` which appends a
+ * stacking query.
+ */
+async function seekAndInject(
+  page: CaptureSession["page"],
+  time: number,
+  beforeCaptureHook: BeforeCaptureHook | null,
+  hdrPerf: HdrPerfCollector | undefined,
+  seekKey: HdrPerfTimingKey,
+  injectKey: HdrPerfTimingKey,
+): Promise<void> {
+  await timeHdrPhaseAsync(hdrPerf, seekKey, () =>
+    page.evaluate((t: number) => {
+      if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
+    }, time),
+  );
+  if (beforeCaptureHook) {
+    await timeHdrPhaseAsync(hdrPerf, injectKey, () => beforeCaptureHook(page, time));
+  }
+}
+
+/**
+ * Seek the page to `time`, run the optional before-capture hook, then
+ * query element stacking order. Each phase is individually timed via the
+ * caller-provided perf keys so the sequential loop, hybrid worker, and
+ * per-scene transition capture each emit the correct telemetry label
+ * (`frameSeekMs` vs. `domLayerSeekMs`, etc.).
+ */
+export async function seekInjectAndQueryStacking(
+  page: CaptureSession["page"],
+  time: number,
+  beforeCaptureHook: BeforeCaptureHook | null,
+  nativeHdrIds: Set<string>,
+  hdrPerf: HdrPerfCollector | undefined,
+  seekKey: HdrPerfTimingKey,
+  injectKey: HdrPerfTimingKey,
+  stackingKey: HdrPerfTimingKey,
+): Promise<ElementStackingInfo[]> {
+  await seekAndInject(page, time, beforeCaptureHook, hdrPerf, seekKey, injectKey);
+  return timeHdrPhaseAsync(hdrPerf, stackingKey, () => queryElementStacking(page, nativeHdrIds));
+}
+
 // ─── Per-scene capture (shared by sequential transition + hybrid worker) ──
 
 export interface CaptureSceneArgs {
@@ -142,16 +194,14 @@ export async function captureSceneIntoBuffer(a: CaptureSceneArgs): Promise<void>
     log,
     frameIdx,
   } = a;
-  let timingStart = Date.now();
-  await session.page.evaluate((t: number) => {
-    if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-  }, time);
-  addHdrTiming(hdrPerf, "domLayerSeekMs", timingStart);
-  if (beforeCaptureHook) {
-    timingStart = Date.now();
-    await beforeCaptureHook(session.page, time);
-    addHdrTiming(hdrPerf, "domLayerInjectMs", timingStart);
-  }
+  await seekAndInject(
+    session.page,
+    time,
+    beforeCaptureHook,
+    hdrPerf,
+    "domLayerSeekMs",
+    "domLayerInjectMs",
+  );
   for (const el of stackingInfo) {
     if (!el.isHdr || !sceneIds.has(el.id)) continue;
     if (nativeHdrImageIds.has(el.id)) {
@@ -184,27 +234,26 @@ export async function captureSceneIntoBuffer(a: CaptureSceneArgs): Promise<void>
       );
     }
   }
-  const showIds = Array.from(sceneIds);
+  const showIds = selectDomLayerShowIds(Array.from(sceneIds), stackingInfo);
   const hideIds = stackingInfo
     .map((e) => e.id)
     .filter((id) => !sceneIds.has(id) || nativeHdrIds.has(id));
+  if (showIds.length === 0) return;
   if (hdrPerf) hdrPerf.domLayerCaptures += 1;
-  timingStart = Date.now();
-  await applyDomLayerMask(session.page, showIds, hideIds);
-  addHdrTiming(hdrPerf, "domMaskApplyMs", timingStart);
-  timingStart = Date.now();
-  const domPng = await captureAlphaPng(session.page, width, height);
-  addHdrTiming(hdrPerf, "domScreenshotMs", timingStart);
-  timingStart = Date.now();
-  await removeDomLayerMask(session.page, hideIds);
-  addHdrTiming(hdrPerf, "domMaskRemoveMs", timingStart);
+  await timeHdrPhaseAsync(hdrPerf, "domMaskApplyMs", () =>
+    applyDomLayerMask(session.page, showIds, hideIds),
+  );
+  const domPng = await timeHdrPhaseAsync(hdrPerf, "domScreenshotMs", () =>
+    captureAlphaPng(session.page, width, height),
+  );
+  await timeHdrPhaseAsync(hdrPerf, "domMaskRemoveMs", () =>
+    removeDomLayerMask(session.page, hideIds),
+  );
   try {
-    timingStart = Date.now();
-    const { data: domRgba } = decodePng(domPng);
-    addHdrTiming(hdrPerf, "domPngDecodeMs", timingStart);
-    timingStart = Date.now();
-    blitRgba8OverRgb48le(domRgba, sceneBuf, width, height, compositeTransfer);
-    addHdrTiming(hdrPerf, "domBlitMs", timingStart);
+    const { data: domRgba } = timeHdrPhase(hdrPerf, "domPngDecodeMs", () => decodePng(domPng));
+    timeHdrPhase(hdrPerf, "domBlitMs", () =>
+      blitRgba8OverRgb48le(domRgba, sceneBuf, width, height, compositeTransfer),
+    );
   } catch (err) {
     log.warn("DOM layer decode/blit failed; skipping overlay for transition scene", {
       frameIndex: frameIdx,
@@ -259,30 +308,28 @@ export async function captureTransitionFrameOnWorker(
     hdrPerf.frames += 1;
     hdrPerf.transitionFrames += 1;
   }
-  let timingStart = Date.now();
-  await session.page.evaluate((t: number) => {
-    if (window.__hf && typeof window.__hf.seek === "function") window.__hf.seek(t);
-  }, time);
-  addHdrTiming(hdrPerf, "frameSeekMs", timingStart);
-  if (beforeCaptureHook) {
-    timingStart = Date.now();
-    await beforeCaptureHook(session.page, time);
-    addHdrTiming(hdrPerf, "frameInjectMs", timingStart);
-  }
-  timingStart = Date.now();
-  const stackingInfo = await queryElementStacking(session.page, nativeHdrIds);
-  addHdrTiming(hdrPerf, "stackingQueryMs", timingStart);
+  const stackingInfo = await seekInjectAndQueryStacking(
+    session.page,
+    time,
+    beforeCaptureHook,
+    nativeHdrIds,
+    hdrPerf,
+    "frameSeekMs",
+    "frameInjectMs",
+    "stackingQueryMs",
+  );
   const sceneAIds = new Set(sceneElements[transition.fromScene] ?? []);
   const sceneBIds = new Set(sceneElements[transition.toScene] ?? []);
   buffers.bufferA.fill(0);
   buffers.bufferB.fill(0);
-  for (const [sceneBuf, sceneIds] of [
+  const sceneCaptures: [Buffer, Set<string>][] = [
     [buffers.bufferA, sceneAIds],
     [buffers.bufferB, sceneBIds],
-  ] as const) {
+  ];
+  for (const [sceneBuf, sceneIds] of sceneCaptures) {
     await captureSceneIntoBuffer({
       session,
-      sceneBuf: sceneBuf as Buffer,
+      sceneBuf,
       sceneIds,
       stackingInfo,
       time,
@@ -299,6 +346,29 @@ export async function captureTransitionFrameOnWorker(
       frameIdx,
     });
   }
+}
+
+// ─── Streaming-encoder write guard ──────────────────────────────────────────
+
+/**
+ * Streaming-encoder writes report `false` when FFmpeg is already gone.
+ * Continuing to capture into a dead encoder wastes the rest of the render,
+ * so every frame loop stops with a frame-indexed error instead.
+ *
+ * When the encoder is provided, the thrown error includes FFmpeg's own failure
+ * reason (exit code + stderr tail) — otherwise the message is just "exited
+ * before frame N", which for the frame-0 case (bad args / unsupported codec /
+ * missing binary quirk) is cryptic and unactionable.
+ */
+export function ensureFrameWritten(
+  frameWritten: boolean,
+  frameIndex: number,
+  encoder?: { getExitError: () => string | undefined },
+): void {
+  if (frameWritten) return;
+  const reason = encoder?.getExitError();
+  const base = `Streaming encoder exited before frame ${frameIndex} was written`;
+  throw new Error(reason ? `${base}: ${reason}` : base);
 }
 
 // ─── HDR video raw-frame cleanup (sequential path only) ────────────────────
@@ -331,17 +401,7 @@ export function cleanupEndedHdrVideos(args: {
       if (!stillNeeded) {
         const frameSource = hdrVideoFrameSources.get(videoId);
         if (frameSource) {
-          closeHdrVideoFrameSource(frameSource, log);
-          try {
-            rmSync(frameSource.dir, { recursive: true, force: true });
-          } catch (err) {
-            log.warn("Failed to clean up HDR raw frame directory", {
-              videoId,
-              frameDir: frameSource.dir,
-              rawPath: frameSource.rawPath,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
+          cleanupHdrVideoFrameSource(frameSource, log);
           hdrVideoFrameSources.delete(videoId);
         }
         cleanedUpVideos.add(videoId);

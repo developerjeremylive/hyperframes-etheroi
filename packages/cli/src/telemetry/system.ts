@@ -1,5 +1,15 @@
-import { cpus, totalmem, platform, release } from "node:os";
+import { cpus, freemem, platform, release } from "node:os";
 import { existsSync, readFileSync, statfsSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { getSystemTotalMb } from "@hyperframes/engine";
+import {
+  detectAgentRuntime,
+  detectAgentHints,
+  detectSandboxRuntime,
+  type AgentRuntime,
+  type SandboxRuntime,
+} from "./agent_runtime.js";
+import { detectWSL } from "./platform.js";
 
 // ---------------------------------------------------------------------------
 // System metadata collected once per CLI session and attached to all events.
@@ -23,6 +33,33 @@ export interface SystemMeta {
   ci_name: string | null;
   is_wsl: boolean;
   is_tty: boolean;
+  /**
+   * Managed sandbox runtime hosting this invocation, when one is detectable
+   * (gvisor / firecracker / docker / kvm / wsl). null on a normal dev
+   * machine. Lets us distinguish "real laptop" from "ephemeral cloud
+   * sandbox driving the CLI" without geo guesswork.
+   */
+  sandbox_runtime: SandboxRuntime;
+  /**
+   * Coding-agent vendor that spawned this process, if any (see the
+   * `AgentRuntime` union in agent_runtime.ts for the full, current set).
+   * Most rules check env-var existence only — values are never read; a few
+   * use filesystem/kernel markers (e.g. the Gemini managed-agent mount).
+   * Every rule keys on a marker with a source citation in agent_runtime.ts;
+   * unverified guesses are deliberately omitted (false-negative > guess).
+   * null when no agent is detected.
+   */
+  agent_runtime: AgentRuntime;
+  /**
+   * New-agent discovery signals for the agent_runtime=null bucket, so an agent
+   * we have no rule for surfaces on its own instead of vanishing into null.
+   * All three are null on a classified event (agent_runtime != null) and on a
+   * plain shell with no markers. See `detectAgentHints` in agent_runtime.ts for
+   * the fields and the privacy contract.
+   */
+  agent_hint: string | null;
+  term_program: string | null;
+  agent_env_hints: string | null;
 }
 
 let cached: SystemMeta | null = null;
@@ -37,17 +74,30 @@ export function getSystemMeta(): SystemMeta {
   const cpuInfo = cpus();
   const firstCpu = cpuInfo[0] ?? null;
 
+  // Only compute discovery hints for the unclassified bucket — a known agent
+  // needs no hint, and gating keeps them off the ~80%+ of classified events.
+  const agent_runtime = detectAgentRuntime();
+  const hints =
+    agent_runtime === null
+      ? detectAgentHints()
+      : { agent_hint: null, term_program: null, agent_env_hints: null };
+
   cached = {
     os_release: release(),
     cpu_count: cpuInfo.length,
     cpu_model: firstCpu?.model?.trim() ?? null,
     cpu_speed: firstCpu?.speed ?? null,
-    memory_total_mb: bytesToMb(totalmem()),
+    memory_total_mb: getSystemTotalMb(),
     is_docker: detectDocker(),
     is_ci: detectCI(),
     ci_name: getCIName(),
     is_wsl: detectWSL(),
     is_tty: Boolean(process.stdout?.isTTY),
+    sandbox_runtime: detectSandboxRuntime(),
+    agent_runtime,
+    agent_hint: hints.agent_hint,
+    term_program: hints.term_program,
+    agent_env_hints: hints.agent_env_hints,
   };
   return cached;
 }
@@ -70,42 +120,38 @@ function detectDocker(): boolean {
   return false;
 }
 
+// Named providers come first so getCIName() picks the most specific match.
+// `truthy` accepts 'true' or '1'; `presence` matches any non-null value.
+type CIProvider =
+  | { name: string | null; envVar: string; mode: "truthy" }
+  | { name: string | null; envVar: string; mode: "presence" };
+
+const CI_PROVIDERS: CIProvider[] = [
+  { name: "github_actions", envVar: "GITHUB_ACTIONS", mode: "truthy" },
+  { name: "gitlab_ci", envVar: "GITLAB_CI", mode: "truthy" },
+  { name: "circleci", envVar: "CIRCLECI", mode: "truthy" },
+  { name: "jenkins", envVar: "JENKINS_URL", mode: "presence" },
+  { name: "buildkite", envVar: "BUILDKITE", mode: "truthy" },
+  { name: "travis", envVar: "TRAVIS", mode: "truthy" },
+  { name: null, envVar: "CONTINUOUS_INTEGRATION", mode: "truthy" },
+  { name: null, envVar: "CI", mode: "truthy" },
+];
+
+function matchesProvider(p: CIProvider): boolean {
+  const v = process.env[p.envVar];
+  if (p.mode === "presence") return v != null;
+  return v === "true" || v === "1";
+}
+
 function detectCI(): boolean {
-  return (
-    process.env["CI"] === "true" ||
-    process.env["CI"] === "1" ||
-    process.env["CONTINUOUS_INTEGRATION"] === "true" ||
-    process.env["GITHUB_ACTIONS"] === "true" ||
-    process.env["GITLAB_CI"] === "true" ||
-    process.env["CIRCLECI"] === "true" ||
-    process.env["JENKINS_URL"] != null ||
-    process.env["BUILDKITE"] === "true" ||
-    process.env["TRAVIS"] === "true" ||
-    false
-  );
+  return CI_PROVIDERS.some(matchesProvider);
 }
 
 function getCIName(): string | null {
-  if (process.env["GITHUB_ACTIONS"] === "true") return "github_actions";
-  if (process.env["GITLAB_CI"] === "true") return "gitlab_ci";
-  if (process.env["CIRCLECI"] === "true") return "circleci";
-  if (process.env["JENKINS_URL"] != null) return "jenkins";
-  if (process.env["BUILDKITE"] === "true") return "buildkite";
-  if (process.env["TRAVIS"] === "true") return "travis";
-  if (detectCI()) return "unknown";
-  return null;
-}
-
-function detectWSL(): boolean {
-  if (platform() !== "linux") return false;
-  try {
-    const osRelease = release().toLowerCase();
-    if (osRelease.includes("microsoft") || osRelease.includes("wsl")) return true;
-    const procVersion = readFileSync("/proc/version", "utf-8").toLowerCase();
-    return procVersion.includes("microsoft") || procVersion.includes("wsl");
-  } catch {
-    return false;
+  for (const provider of CI_PROVIDERS) {
+    if (provider.name && matchesProvider(provider)) return provider.name;
   }
+  return detectCI() ? "unknown" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,4 +182,108 @@ export function getFreeDiskMb(path: string = "."): number | null {
   } catch {
     return null;
   }
+}
+
+export interface PowerState {
+  /** true = running on battery, false = external power, null = undetectable. */
+  on_battery: boolean | null;
+  /** macOS Low Power Mode; null off-darwin or undetectable. */
+  low_power_mode: boolean | null;
+}
+
+/**
+ * Parse `pmset -g batt` output for the power source line. Exported for tests.
+ * Example first line: `Now drawing from 'Battery Power'`.
+ */
+export function parsePmsetPowerSource(raw: string): boolean | null {
+  const m = raw.match(/Now drawing from '([^']+)'/);
+  if (!m) return null;
+  return m[1] === "Battery Power";
+}
+
+/**
+ * Sample the machine's power state. Volatile — sample at event time, never
+ * cache alongside SystemMeta.
+ *
+ * Why this exists: the DE fast path only engages on macOS + hardware GPU, so
+ * the render fleet is overwhelmingly laptops, and laptop perf is
+ * power-managed — bench sweeps on an M4 Pro showed the SAME render flipping
+ * between ~9.6 and ~17.2 ms/frame regimes with no load/thermal signal to
+ * explain it. Without a power-state dimension on render telemetry those
+ * regimes are indistinguishable noise; with it, perf distributions (and the
+ * DE parallel-router soak) can be segmented by the machine state real users
+ * actually render in.
+ */
+export function getPowerState(): PowerState {
+  if (platform() !== "darwin") {
+    // Linux laptops exist but the DE fleet is darwin; don't guess elsewhere.
+    return { on_battery: null, low_power_mode: null };
+  }
+  let on_battery: boolean | null = null;
+  let low_power_mode: boolean | null = null;
+  try {
+    on_battery = parsePmsetPowerSource(
+      execSync("pmset -g batt", { encoding: "utf-8", timeout: 2000 }),
+    );
+  } catch {
+    // pmset missing/slow — leave null rather than fail telemetry.
+  }
+  try {
+    const raw = execSync("pmset -g", { encoding: "utf-8", timeout: 2000 });
+    const m = raw.match(/lowpowermode\s+(\d)/);
+    if (m) low_power_mode = m[1] === "1";
+  } catch {
+    // Same: absence of the reading is itself acceptable.
+  }
+  return { on_battery, low_power_mode };
+}
+
+/**
+ * Get available memory in MB, accounting for OS-level page caching.
+ *
+ * `os.freemem()` on macOS returns only truly free pages — ignoring
+ * inactive/purgeable/speculative pages that the kernel reclaims on demand.
+ * On a 24 GB Mac this reports ~0.1 GB "free" when ~5 GB is actually
+ * available. Linux has a similar (milder) issue; its kernel exposes the
+ * correct value via `MemAvailable` in /proc/meminfo.
+ */
+export function getAvailableMemoryMb(): number {
+  const fallback = bytesToMb(freemem());
+
+  if (platform() === "darwin") {
+    try {
+      const raw = execSync("vm_stat", { encoding: "utf-8", timeout: 5000 });
+      const pageSize = parseInt(raw.match(/page size of (\d+)/)?.[1] ?? "0", 10);
+      if (!pageSize) return fallback;
+
+      const pages = (key: string) =>
+        parseInt(raw.match(new RegExp(`${key}:\\s+(\\d+)`))?.[1] ?? "0", 10);
+
+      const available =
+        (pages("Pages free") +
+          pages("Pages inactive") +
+          pages("Pages purgeable") +
+          pages("Pages speculative")) *
+        pageSize;
+
+      return available > 0 ? bytesToMb(available) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  if (platform() === "linux") {
+    try {
+      const meminfo = readFileSync("/proc/meminfo", "utf-8");
+      const match = meminfo.match(/MemAvailable:\s+(\d+)\s+kB/);
+      if (match) {
+        return Math.trunc(parseInt(match[1]!, 10) / 1024);
+      }
+      return fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  return fallback;
 }

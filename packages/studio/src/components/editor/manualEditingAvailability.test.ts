@@ -16,58 +16,18 @@ describe("manual editing availability", () => {
     vi.resetModules();
   });
 
-  it("enables inspector selection and manual dragging by default while motion stays opt-in", async () => {
-    const availability = await loadAvailabilityWithEnv({});
-
-    expect(availability.STUDIO_PREVIEW_MANUAL_EDITING_ENABLED).toBe(true);
-    expect(availability.STUDIO_PREVIEW_SELECTION_ENABLED).toBe(true);
-    expect(availability.STUDIO_INSPECTOR_PANELS_ENABLED).toBe(true);
-    expect(availability.STUDIO_MOTION_PANEL_ENABLED).toBe(false);
-    expect(availability.STUDIO_TIMELINE_LAYER_INSPECTOR_ENABLED).toBe(true);
-  });
-
-  it("keeps explicit truthy inspector env flags enabled", async () => {
-    const availability = await loadAvailabilityWithEnv({
-      VITE_STUDIO_ENABLE_INSPECTOR_PANELS: "1",
-      VITE_STUDIO_ENABLE_TIMELINE_LAYER_INSPECTOR: "true",
-    });
-
-    expect(availability.STUDIO_INSPECTOR_PANELS_ENABLED).toBe(true);
-    expect(availability.STUDIO_TIMELINE_LAYER_INSPECTOR_ENABLED).toBe(true);
-  });
-
-  it("allows explicit env flags to disable default-on inspector layers", async () => {
-    const availability = await loadAvailabilityWithEnv({
-      VITE_STUDIO_ENABLE_TIMELINE_LAYER_INSPECTOR: "off",
-    });
-
-    expect(availability.STUDIO_INSPECTOR_PANELS_ENABLED).toBe(true);
-    expect(availability.STUDIO_TIMELINE_LAYER_INSPECTOR_ENABLED).toBe(false);
-  });
-
-  it("keeps timeline layer inspection off when the parent inspector flag is off", async () => {
-    const availability = await loadAvailabilityWithEnv({
-      VITE_STUDIO_ENABLE_INSPECTOR_PANELS: "0",
-      VITE_STUDIO_ENABLE_TIMELINE_LAYER_INSPECTOR: "true",
-    });
-
-    expect(availability.STUDIO_INSPECTOR_PANELS_ENABLED).toBe(false);
-    expect(availability.STUDIO_PREVIEW_SELECTION_ENABLED).toBe(false);
-    expect(availability.STUDIO_TIMELINE_LAYER_INSPECTOR_ENABLED).toBe(false);
-  });
-
   it("enables feature flags with explicit truthy env values", () => {
     expect(
       resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING: "true" },
-        ["VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING"],
+        { VITE_STUDIO_ENABLE_FLAT_INSPECTOR: "true" },
+        ["VITE_STUDIO_ENABLE_FLAT_INSPECTOR"],
         false,
       ),
     ).toBe(true);
     expect(
       resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_ENABLE_MOTION_PANEL: "1" },
-        ["VITE_STUDIO_ENABLE_MOTION_PANEL"],
+        { VITE_STUDIO_SDK_CUTOVER_ENABLED: "1" },
+        ["VITE_STUDIO_SDK_CUTOVER_ENABLED"],
         false,
       ),
     ).toBe(true);
@@ -76,15 +36,15 @@ describe("manual editing availability", () => {
   it("disables feature flags with explicit falsy env values", () => {
     expect(
       resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING: "off" },
-        ["VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING"],
+        { VITE_STUDIO_ENABLE_FLAT_INSPECTOR: "off" },
+        ["VITE_STUDIO_ENABLE_FLAT_INSPECTOR"],
         true,
       ),
     ).toBe(false);
     expect(
       resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_ENABLE_MOTION_PANEL: "0" },
-        ["VITE_STUDIO_ENABLE_MOTION_PANEL"],
+        { VITE_STUDIO_SDK_CUTOVER_ENABLED: "0" },
+        ["VITE_STUDIO_SDK_CUTOVER_ENABLED"],
         true,
       ),
     ).toBe(false);
@@ -93,18 +53,8 @@ describe("manual editing availability", () => {
   it("supports legacy flag aliases after the preferred name", () => {
     expect(
       resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_PREVIEW_MANUAL_EDITING_ENABLED: "yes" },
-        [
-          "VITE_STUDIO_ENABLE_PREVIEW_MANUAL_DRAGGING",
-          "VITE_STUDIO_PREVIEW_MANUAL_EDITING_ENABLED",
-        ],
-        false,
-      ),
-    ).toBe(true);
-    expect(
-      resolveStudioBooleanEnvFlag(
-        { VITE_STUDIO_MOTION_PANEL_ENABLED: "enabled" },
-        ["VITE_STUDIO_ENABLE_MOTION_PANEL", "VITE_STUDIO_MOTION_PANEL_ENABLED"],
+        { VITE_STUDIO_FLAT_INSPECTOR_ENABLED: "yes" },
+        ["VITE_STUDIO_ENABLE_FLAT_INSPECTOR", "VITE_STUDIO_FLAT_INSPECTOR_ENABLED"],
         false,
       ),
     ).toBe(true);
@@ -114,10 +64,10 @@ describe("manual editing availability", () => {
     expect(
       resolveStudioBooleanEnvFlag(
         {
-          VITE_STUDIO_ENABLE_INSPECTOR_PANELS: "off",
-          VITE_STUDIO_INSPECTOR_PANELS_ENABLED: "on",
+          VITE_STUDIO_ENABLE_FLAT_INSPECTOR: "off",
+          VITE_STUDIO_FLAT_INSPECTOR_ENABLED: "on",
         },
-        ["VITE_STUDIO_ENABLE_INSPECTOR_PANELS", "VITE_STUDIO_INSPECTOR_PANELS_ENABLED"],
+        ["VITE_STUDIO_ENABLE_FLAT_INSPECTOR", "VITE_STUDIO_FLAT_INSPECTOR_ENABLED"],
         true,
       ),
     ).toBe(false);
@@ -127,5 +77,15 @@ describe("manual editing availability", () => {
     expect(resolveStudioBooleanEnvFlag({}, ["MISSING"], false)).toBe(false);
     expect(resolveStudioBooleanEnvFlag({ EMPTY: "" }, ["EMPTY"], true)).toBe(true);
     expect(resolveStudioBooleanEnvFlag({ UNKNOWN: "maybe" }, ["UNKNOWN"], false)).toBe(false);
+  });
+
+  it("defaults the flat inspector flag to true and honors an explicit override", async () => {
+    const on = await loadAvailabilityWithEnv({});
+    expect(on.STUDIO_FLAT_INSPECTOR_ENABLED).toBe(true);
+
+    const off = await loadAvailabilityWithEnv({
+      VITE_STUDIO_FLAT_INSPECTOR_ENABLED: "false",
+    });
+    expect(off.STUDIO_FLAT_INSPECTOR_ENABLED).toBe(false);
   });
 });

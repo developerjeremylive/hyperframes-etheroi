@@ -1,8 +1,19 @@
-import { describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
+import { resolve } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { formatFfmpegError } from "./runFfmpeg.js";
 
 describe("formatFfmpegError", () => {
+  const originalPlatform = process.platform;
+  const originalFfmpegPath = process.env.HYPERFRAMES_FFMPEG_PATH;
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+    if (originalFfmpegPath === undefined) delete process.env.HYPERFRAMES_FFMPEG_PATH;
+    else process.env.HYPERFRAMES_FFMPEG_PATH = originalFfmpegPath;
+  });
+
   it("reports exit code alone when stderr is empty", () => {
     expect(formatFfmpegError(-22, "")).toBe("FFmpeg exited with code -22");
   });
@@ -42,5 +53,67 @@ describe("formatFfmpegError", () => {
 
   it("wraps stderr in [FFmpeg] prefix when exit code is null (spawn failure)", () => {
     expect(formatFfmpegError(null, "spawn ffmpeg ENOENT")).toBe("[FFmpeg] spawn ffmpeg ENOENT");
+  });
+
+  it("maps Windows invalid-image exit codes to an actionable architecture hint", () => {
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+
+    expect(formatFfmpegError(3221225595, "")).toContain("wrong architecture");
+  });
+
+  it.each([3221225781, -1073741515])(
+    "maps Windows DLL-not-found exit code %s to selected-path guidance",
+    (exitCode) => {
+      Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+      process.env.HYPERFRAMES_FFMPEG_PATH = "/tools/ffmpeg.exe";
+
+      const message = formatFfmpegError(exitCode, "");
+
+      expect(message).toContain("0xC0000135 (STATUS_DLL_NOT_FOUND)");
+      expect(message).toContain(resolve("/tools/ffmpeg.exe"));
+      expect(message).toContain("working 64-bit Windows FFmpeg build");
+    },
+  );
+});
+
+function createSpawnSpy() {
+  const calls: Array<{ command: string; args: string[] }> = [];
+  const spawn = vi.fn((command: string, args: string[]) => {
+    calls.push({ command, args });
+    const proc = new EventEmitter() as EventEmitter & {
+      stderr: EventEmitter;
+      kill: ReturnType<typeof vi.fn>;
+      killed: boolean;
+    };
+    proc.stderr = new EventEmitter();
+    proc.kill = vi.fn();
+    proc.killed = false;
+    process.nextTick(() => proc.emit("close", 0));
+    return proc;
+  });
+  return { spawn, calls };
+}
+
+describe("runFfmpeg binary resolution", () => {
+  const originalFfmpegPath = process.env.HYPERFRAMES_FFMPEG_PATH;
+
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("child_process");
+    if (originalFfmpegPath === undefined) delete process.env.HYPERFRAMES_FFMPEG_PATH;
+    else process.env.HYPERFRAMES_FFMPEG_PATH = originalFfmpegPath;
+  });
+
+  it("spawns the configured absolute FFmpeg path when HYPERFRAMES_FFMPEG_PATH is set", async () => {
+    process.env.HYPERFRAMES_FFMPEG_PATH = "/tools/ffmpeg.exe";
+    const { spawn, calls } = createSpawnSpy();
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { runFfmpeg } = await import("./runFfmpeg.js");
+    const result = await runFfmpeg(["-version"]);
+
+    expect(result.success).toBe(true);
+    expect(calls[0]).toEqual({ command: resolve("/tools/ffmpeg.exe"), args: ["-version"] });
   });
 });

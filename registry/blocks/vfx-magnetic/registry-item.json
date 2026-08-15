@@ -17,5 +17,23 @@
       "target": "compositions/vfx-magnetic.html",
       "type": "hyperframes:composition"
     }
+  ],
+  "preview": {
+    "video": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-magnetic.mp4",
+    "poster": "https://static.heygen.ai/hyperframes-oss/docs/images/catalog/blocks/vfx-magnetic.png"
+  },
+  "params": [
+    {
+      "key": "--bg-color",
+      "label": "Background",
+      "type": "color",
+      "default": "#0c0c0c"
+    },
+    {
+      "key": "--text-color",
+      "label": "Text color",
+      "type": "color",
+      "default": "#e8e8e8"
+    }
   ]
 }

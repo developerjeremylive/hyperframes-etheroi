@@ -3,13 +3,88 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import path, { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  closeFileServerSafely,
   createFileServer,
+  RENDER_CAPTURE_MODE_SHIM,
   HF_BRIDGE_SCRIPT,
   HF_EARLY_STUB,
   injectScriptsAtHeadStart,
   isPathInside,
+  parseRangeHeader,
   VIRTUAL_TIME_SHIM,
 } from "./fileServer.js";
+
+function captureLogger() {
+  const warnings: { message: string; meta?: Record<string, unknown> }[] = [];
+  return {
+    warnings,
+    log: {
+      error() {},
+      warn(message: string, meta?: Record<string, unknown>) {
+        warnings.push({ message, meta });
+      },
+      info() {},
+      debug() {},
+    },
+  };
+}
+
+describe("closeFileServerSafely", () => {
+  it("swallows and logs a throwing close instead of propagating", () => {
+    const { log, warnings } = captureLogger();
+    const fileServer = {
+      close: () => {
+        // http.Server.close() throws ERR_SERVER_NOT_RUNNING on a second close.
+        throw new Error("Server is not running.");
+      },
+    };
+    expect(() => closeFileServerSafely(fileServer, "plan", log)).not.toThrow();
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0].message).toContain("[plan]");
+    expect(warnings[0].meta?.error).toBe("Server is not running.");
+  });
+
+  it("closes once and stays quiet on the happy path", () => {
+    const { log, warnings } = captureLogger();
+    let closed = 0;
+    closeFileServerSafely({ close: () => closed++ }, "renderChunk", log);
+    expect(closed).toBe(1);
+    expect(warnings).toHaveLength(0);
+  });
+});
+
+async function withFileServer(
+  projectDir: string,
+  run: (server: Awaited<ReturnType<typeof createFileServer>>) => Promise<void>,
+): Promise<void> {
+  const server = await createFileServer({
+    projectDir,
+    preHeadScripts: [],
+    headScripts: [],
+    bodyScripts: [],
+  });
+  try {
+    await run(server);
+  } finally {
+    server.close();
+  }
+}
+
+function writeEmptyIndex(projectDir: string): void {
+  writeFileSync(join(projectDir, "index.html"), "<!doctype html><html></html>");
+}
+
+async function expectTextResponse(
+  url: string,
+  options: { contentType?: string; bodyIncludes: string },
+): Promise<void> {
+  const response = await fetch(url);
+  expect(response.status).toBe(200);
+  if (options.contentType) {
+    expect(response.headers.get("content-type")).toContain(options.contentType);
+  }
+  expect(await response.text()).toContain(options.bodyIncludes);
+}
 
 describe("injectScriptsIntoHtml", () => {
   it("injects the virtual time shim into head content before authored scripts", () => {
@@ -152,7 +227,211 @@ describe("isPathInside", () => {
   });
 });
 
+describe("parseRangeHeader", () => {
+  const SIZE = 1000;
+
+  it("returns absent when there is no Range header", () => {
+    expect(parseRangeHeader(undefined, SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader(null, SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader("", SIZE)).toEqual({ kind: "absent" });
+  });
+
+  it("parses a closed range bytes=START-END", () => {
+    expect(parseRangeHeader("bytes=0-99", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 0,
+      end: 99,
+    });
+    expect(parseRangeHeader("bytes=100-199", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 100,
+      end: 199,
+    });
+  });
+
+  it("parses an open-ended range bytes=START- as start..EOF", () => {
+    expect(parseRangeHeader("bytes=100-", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 100,
+      end: SIZE - 1,
+    });
+    expect(parseRangeHeader("bytes=0-", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 0,
+      end: SIZE - 1,
+    });
+  });
+
+  it("parses a suffix range bytes=-N as the last N bytes", () => {
+    expect(parseRangeHeader("bytes=-50", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: SIZE - 50,
+      end: SIZE - 1,
+    });
+    // Suffix larger than the file: clamp to the whole file.
+    expect(parseRangeHeader("bytes=-5000", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 0,
+      end: SIZE - 1,
+    });
+  });
+
+  it("clamps the end of a closed range to the last valid byte", () => {
+    // bytes=900-9999 on a 1000-byte file -> serve 900..999.
+    expect(parseRangeHeader("bytes=900-9999", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 900,
+      end: SIZE - 1,
+    });
+  });
+
+  it("returns unsatisfiable when start >= size", () => {
+    expect(parseRangeHeader("bytes=1000-2000", SIZE)).toEqual({ kind: "unsatisfiable" });
+    expect(parseRangeHeader("bytes=2000-", SIZE)).toEqual({ kind: "unsatisfiable" });
+  });
+
+  it("returns unsatisfiable when end < start in a closed range", () => {
+    expect(parseRangeHeader("bytes=200-100", SIZE)).toEqual({ kind: "unsatisfiable" });
+  });
+
+  it("returns unsatisfiable for a suffix request on a zero-byte file", () => {
+    expect(parseRangeHeader("bytes=-10", 0)).toEqual({ kind: "unsatisfiable" });
+  });
+
+  it("returns absent for non-bytes units, multi-range, and malformed inputs", () => {
+    expect(parseRangeHeader("items=0-1", SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader("bytes=0-99,200-299", SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader("bytes=abc-def", SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader("bytes=", SIZE)).toEqual({ kind: "absent" });
+    expect(parseRangeHeader("bytes=-", SIZE)).toEqual({ kind: "absent" });
+  });
+
+  it("tolerates surrounding whitespace and case", () => {
+    expect(parseRangeHeader(" Bytes = 0-99 ", SIZE)).toEqual({
+      kind: "satisfiable",
+      start: 0,
+      end: 99,
+    });
+  });
+});
+
 describe("createFileServer", () => {
+  it("marks producer pages as render capture before the runtime loads", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-render-mode-"));
+    try {
+      writeFileSync(
+        join(projectDir, "index.html"),
+        "<!doctype html><html><head></head><body></body></html>",
+      );
+      const runtimeScript = "globalThis.__hfRuntimeLoaded = true;";
+      const server = await createFileServer({
+        projectDir,
+        preHeadScripts: [],
+        headScripts: [runtimeScript],
+      });
+      try {
+        const response = await fetch(`${server.url}/index.html`);
+        expect(response.status).toBe(200);
+        const html = await response.text();
+        expect(html).toContain(RENDER_CAPTURE_MODE_SHIM);
+        expect(html.indexOf(RENDER_CAPTURE_MODE_SHIM)).toBeLessThan(html.indexOf(runtimeScript));
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serves ES modules with a JavaScript MIME type", async () => {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-mjs-"));
+    try {
+      writeEmptyIndex(projectDir);
+      writeFileSync(join(projectDir, "scene.mjs"), "export const scene = true;");
+      const server = await createFileServer({ projectDir, preHeadScripts: [], headScripts: [] });
+      try {
+        const response = await fetch(`${server.url}/scene.mjs`);
+        expect(response.status).toBe(200);
+        expect(response.headers.get("content-type")).toBe("application/javascript; charset=utf-8");
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  async function expectInjectedRenderFps(
+    fps: Parameters<typeof createFileServer>[0]["fps"],
+    expected: {
+      value: string;
+      source: "render-options" | "default";
+      fallbackReason?: "missing" | "invalid";
+    },
+  ): Promise<void> {
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-render-fps-"));
+
+    try {
+      writeEmptyIndex(projectDir);
+      const server = await createFileServer({
+        projectDir,
+        preHeadScripts: [],
+        headScripts: [],
+        ...(fps ? { fps } : {}),
+      });
+      try {
+        const response = await fetch(`${server.url}/index.html`);
+        expect(response.status).toBe(200);
+        const html = await response.text();
+        expect(html).toContain("window.__HF_EXPORT_RENDER_SEEK_CONFIG");
+        expect(html).toContain(`var __renderFps = ${expected.value}`);
+        expect(html).toContain(`var __renderFpsSource = "${expected.source}"`);
+        if (expected.fallbackReason) {
+          expect(html).toContain(`var __renderFpsFallbackReason = "${expected.fallbackReason}"`);
+        } else {
+          expect(html).toContain("var __renderFpsFallbackReason = null");
+        }
+        expect(html).toContain("fps: __renderFps");
+        expect(html).toContain("fpsSource: __renderFpsSource");
+        expect(html).not.toContain("[hyperframes] render fps defaulted");
+      } finally {
+        server.close();
+      }
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  }
+
+  it("injects the requested render fps into the page render config", async () => {
+    await expectInjectedRenderFps({ num: 60, den: 1 }, { value: "60", source: "render-options" });
+  });
+
+  it("injects fractional render fps without rounding", async () => {
+    await expectInjectedRenderFps(
+      { num: 24000, den: 1001 },
+      { value: "23.976023976023978", source: "render-options" },
+    );
+  });
+
+  it("marks missing render fps as an explicit 30fps default", async () => {
+    await expectInjectedRenderFps(undefined, {
+      value: "30",
+      source: "default",
+      fallbackReason: "missing",
+    });
+  });
+
+  it("marks invalid render fps as an explicit 30fps default", async () => {
+    await expectInjectedRenderFps(
+      { num: 60, den: 0 },
+      {
+        value: "30",
+        source: "default",
+        fallbackReason: "invalid",
+      },
+    );
+  });
+
   it("serves asset files through project-root symlinked directories", async () => {
     const workspaceDir = mkdtempSync(join(tmpdir(), "hf-file-server-symlink-assets-"));
     const adsDir = join(workspaceDir, "Ads");
@@ -162,31 +441,165 @@ describe("createFileServer", () => {
     try {
       mkdirSync(projectDir, { recursive: true });
       mkdirSync(sharedDir, { recursive: true });
-      writeFileSync(join(projectDir, "index.html"), "<!doctype html><html></html>");
+      writeEmptyIndex(projectDir);
       writeFileSync(
         join(sharedDir, "brand.css"),
         ".aisplus-glass { backdrop-filter: blur(28px); }",
       );
       symlinkSync("../shared", join(projectDir, "shared"));
 
-      const server = await createFileServer({
-        projectDir,
-        preHeadScripts: [],
-        headScripts: [],
-        bodyScripts: [],
+      await withFileServer(projectDir, async (server) => {
+        await expectTextResponse(`${server.url}/shared/brand.css`, {
+          contentType: "text/css",
+          bodyIncludes: ".aisplus-glass",
+        });
       });
-
-      try {
-        const response = await fetch(`${server.url}/shared/brand.css`);
-
-        expect(response.status).toBe(200);
-        expect(response.headers.get("content-type")).toContain("text/css");
-        expect(await response.text()).toContain(".aisplus-glass");
-      } finally {
-        server.close();
-      }
     } finally {
       rmSync(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("streams binary file content without buffering through readFileSync", async () => {
+    // Regression test for the video-heavy event-loop block documented at
+    // renderOrchestrator.ts:1277-1306. Pre-fix the file route called
+    // readFileSync on every binary asset, which on 32MB+ videos stalled
+    // the Node event loop long enough to wedge concurrent /health probes.
+    // This test pins three properties of the streaming path:
+    //
+    //   1. Correctness: the served byte sequence matches the file exactly,
+    //      across a chunk boundary (we use a 5 MB synthetic asset, well past
+    //      Node's default 64KB createReadStream highWaterMark).
+    //   2. Content-Length is reported via statSync so range-aware HTTP
+    //      consumers (Chrome's media stack) see the size up front.
+    //   3. Concurrent requests don't serialize behind each other — N
+    //      parallel fetches all return identical content. With readFileSync
+    //      they'd block the event loop in serial; with the stream they
+    //      pipe interleaved chunks.
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-stream-"));
+    try {
+      writeEmptyIndex(projectDir);
+      // 5 MB of deterministic bytes — large enough to span many 64KB read
+      // chunks, small enough to keep the test fast.
+      const size = 5 * 1024 * 1024;
+      const buf = Buffer.alloc(size);
+      for (let i = 0; i < size; i++) buf[i] = i & 0xff;
+      writeFileSync(join(projectDir, "big.bin"), buf);
+
+      await withFileServer(projectDir, async (server) => {
+        // Single-request correctness + content-length.
+        const r = await fetch(`${server.url}/big.bin`);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("content-length")).toBe(String(size));
+        const out = Buffer.from(await r.arrayBuffer());
+        expect(out.length).toBe(size);
+        // Spot-check a few sentinel positions (full equality check is O(5MB)
+        // and unnecessary — if any chunk were misaligned we'd see it here).
+        expect(out[0]).toBe(0);
+        expect(out[255]).toBe(255);
+        expect(out[256]).toBe(0);
+        expect(out[size - 1]).toBe((size - 1) & 0xff);
+
+        // Concurrent requests don't corrupt each other.
+        const concurrent = await Promise.all(
+          Array.from({ length: 4 }, () => fetch(`${server.url}/big.bin`)),
+        );
+        for (const resp of concurrent) {
+          expect(resp.status).toBe(200);
+          const body = Buffer.from(await resp.arrayBuffer());
+          expect(body.length).toBe(size);
+          expect(body[0]).toBe(0);
+          expect(body[size - 1]).toBe((size - 1) & 0xff);
+        }
+      });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it("serves Range requests with 206 Partial Content + Accept-Ranges", async () => {
+    // Pins the RFC 7233 implementation for the binary path: Chrome's <video>
+    // element issues `Range: bytes=...` when seeking, and the response must
+    // be 206 with `Content-Range` + a sliced body so the player can resume
+    // partial-load without re-pulling the whole file. Also pins that the
+    // server advertises `Accept-Ranges: bytes` on full-body GETs so clients
+    // know future Range requests are supported.
+    const projectDir = mkdtempSync(join(tmpdir(), "hf-file-server-range-"));
+    try {
+      writeEmptyIndex(projectDir);
+      // Use a 4 KB deterministic asset: small enough to keep the test
+      // fast, large enough that suffix / partial responses exercise the
+      // slicing math meaningfully.
+      const size = 4096;
+      const buf = Buffer.alloc(size);
+      for (let i = 0; i < size; i++) buf[i] = i & 0xff;
+      writeFileSync(join(projectDir, "asset.bin"), buf);
+
+      await withFileServer(projectDir, async (server) => {
+        // 1. Full GET advertises Accept-Ranges: bytes.
+        const full = await fetch(`${server.url}/asset.bin`);
+        expect(full.status).toBe(200);
+        expect(full.headers.get("accept-ranges")).toBe("bytes");
+        expect(full.headers.get("content-length")).toBe(String(size));
+        await full.body?.cancel();
+
+        // 2. Closed range: bytes=0-99 returns the first 100 bytes.
+        const head = await fetch(`${server.url}/asset.bin`, {
+          headers: { Range: "bytes=0-99" },
+        });
+        expect(head.status).toBe(206);
+        expect(head.headers.get("content-range")).toBe(`bytes 0-99/${size}`);
+        expect(head.headers.get("content-length")).toBe("100");
+        expect(head.headers.get("accept-ranges")).toBe("bytes");
+        const headBody = Buffer.from(await head.arrayBuffer());
+        expect(headBody.length).toBe(100);
+        expect(headBody[0]).toBe(0);
+        expect(headBody[99]).toBe(99);
+
+        // 3. Open-ended: bytes=4000- returns the tail.
+        const tail = await fetch(`${server.url}/asset.bin`, {
+          headers: { Range: "bytes=4000-" },
+        });
+        expect(tail.status).toBe(206);
+        expect(tail.headers.get("content-range")).toBe(`bytes 4000-${size - 1}/${size}`);
+        expect(tail.headers.get("content-length")).toBe(String(size - 4000));
+        const tailBody = Buffer.from(await tail.arrayBuffer());
+        expect(tailBody.length).toBe(size - 4000);
+        expect(tailBody[0]).toBe(4000 & 0xff);
+        expect(tailBody[tailBody.length - 1]).toBe((size - 1) & 0xff);
+
+        // 4. Suffix: bytes=-50 returns the last 50 bytes.
+        const suffix = await fetch(`${server.url}/asset.bin`, {
+          headers: { Range: "bytes=-50" },
+        });
+        expect(suffix.status).toBe(206);
+        expect(suffix.headers.get("content-range")).toBe(`bytes ${size - 50}-${size - 1}/${size}`);
+        expect(suffix.headers.get("content-length")).toBe("50");
+        const suffixBody = Buffer.from(await suffix.arrayBuffer());
+        expect(suffixBody.length).toBe(50);
+        expect(suffixBody[0]).toBe((size - 50) & 0xff);
+        expect(suffixBody[49]).toBe((size - 1) & 0xff);
+
+        // 5. Unsatisfiable: bytes=99999-99999 returns 416 with
+        //    Content-Range: bytes */<size> per RFC 7233 §4.4.
+        const bad = await fetch(`${server.url}/asset.bin`, {
+          headers: { Range: "bytes=99999-99999" },
+        });
+        expect(bad.status).toBe(416);
+        expect(bad.headers.get("content-range")).toBe(`bytes */${size}`);
+        expect(bad.headers.get("accept-ranges")).toBe("bytes");
+        await bad.body?.cancel();
+
+        // 6. Multi-range falls back to 200 (we don't reassemble
+        //    multipart/byteranges for the single-asset use case).
+        const multi = await fetch(`${server.url}/asset.bin`, {
+          headers: { Range: "bytes=0-9,20-29" },
+        });
+        expect(multi.status).toBe(200);
+        expect(multi.headers.get("accept-ranges")).toBe("bytes");
+        await multi.body?.cancel();
+      });
+    } finally {
+      rmSync(projectDir, { recursive: true, force: true });
     }
   });
 
@@ -196,23 +609,14 @@ describe("createFileServer", () => {
     try {
       const subDir = join(projectDir, "video#1");
       mkdirSync(subDir, { recursive: true });
-      writeFileSync(join(projectDir, "index.html"), "<!doctype html><html></html>");
+      writeEmptyIndex(projectDir);
       writeFileSync(join(subDir, "frame.jpg"), "fake-jpg");
 
-      const server = await createFileServer({
-        projectDir,
-        preHeadScripts: [],
-        headScripts: [],
-        bodyScripts: [],
+      await withFileServer(projectDir, async (server) => {
+        await expectTextResponse(`${server.url}/video%231/frame.jpg`, {
+          bodyIncludes: "fake-jpg",
+        });
       });
-
-      try {
-        const res = await fetch(`${server.url}/video%231/frame.jpg`);
-        expect(res.status).toBe(200);
-        expect(await res.text()).toBe("fake-jpg");
-      } finally {
-        server.close();
-      }
     } finally {
       rmSync(projectDir, { recursive: true, force: true });
     }
@@ -279,6 +683,319 @@ describe("HF_EARLY_STUB + HF_BRIDGE_SCRIPT integration", () => {
       { time: 5, duration: 0.5, shader: "domain-warp", fromScene: "a", toScene: "b" },
     ]);
     expect(typeof sandbox.window.__hf?.seek).toBe("function");
+    expect(sandbox.window.__hf?.duration).toBe(0);
+
+    sandbox.window.__renderReady = true;
     expect(sandbox.window.__hf?.duration).toBe(30);
+  });
+
+  it("forwards suppressEvents from __hf.seek to renderSeek", () => {
+    const renderSeekCalls: Array<[number, { suppressEvents?: boolean } | undefined]> = [];
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: {
+          seek?: (t: number, options?: { suppressEvents?: boolean }) => void;
+          duration?: number;
+        };
+        __player?: {
+          renderSeek: (t: number, options?: { suppressEvents?: boolean }) => void;
+          getDuration: () => number;
+        };
+        setInterval: typeof setInterval;
+        clearInterval: typeof clearInterval;
+      };
+      document: { querySelector: () => null };
+    } = {
+      window: {
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+      },
+      document: { querySelector: () => null },
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.__renderReady = true;
+    sandbox.window.__player = {
+      renderSeek: (time, options) => {
+        renderSeekCalls.push([time, options]);
+      },
+      getDuration: () => 10,
+    };
+
+    new Function("window", "document", `with (window) {\n${HF_BRIDGE_SCRIPT}\n}`)(
+      sandbox.window,
+      sandbox.document,
+    );
+
+    sandbox.window.__hf?.seek?.(5, { suppressEvents: true });
+
+    expect(renderSeekCalls).toEqual([[5, { suppressEvents: true }]]);
+  });
+
+  it("keeps render-time timeline seeks synchronous during large renders", () => {
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: Record<string, unknown>;
+        __hfTimelinesBuilding?: boolean;
+        gsap?: { timeline: () => { totalTime: (time?: number) => number | unknown } };
+        requestAnimationFrame: typeof requestAnimationFrame;
+        setTimeout: typeof setTimeout;
+      };
+      document: Record<string, never>;
+      CustomEvent: typeof CustomEvent;
+    } = {
+      window: {
+        requestAnimationFrame: (() => 1) as typeof requestAnimationFrame,
+        setTimeout: (() => 1) as typeof setTimeout,
+      },
+      document: {},
+      CustomEvent,
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.CustomEvent = sandbox.CustomEvent;
+
+    new Function("window", "document", "CustomEvent", `with (window) {\n${HF_EARLY_STUB}\n}`)(
+      sandbox.window,
+      sandbox.document,
+      sandbox.CustomEvent,
+    );
+
+    const totalTimeCalls: number[] = [];
+    sandbox.window.gsap = {
+      timeline: () => ({
+        to: () => {},
+        from: () => {},
+        fromTo: () => {},
+        set: () => {},
+        pause: () => {},
+        play: () => {},
+        seek: () => {},
+        totalTime: (time?: number) => {
+          if (typeof time === "number") totalTimeCalls.push(time);
+          return totalTimeCalls.at(-1) ?? 0;
+        },
+        time: () => 0,
+        duration: () => 10,
+        add: () => {},
+        getChildren: () => [],
+        paused: () => true,
+        timeScale: () => 1,
+        kill: () => {},
+      }),
+    };
+
+    const timeline = sandbox.window.gsap.timeline();
+    for (let i = 0; i < 5100; i += 1) {
+      timeline.totalTime(i / 30);
+    }
+
+    expect(totalTimeCalls).toHaveLength(5100);
+    expect(sandbox.window.__hfTimelinesBuilding).toBe(false);
+  });
+
+  it("flushes queued construction calls before forwarding timeline children", () => {
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: Record<string, unknown>;
+        __hfTimelinesBuilding?: boolean;
+        gsap?: {
+          timeline: () => { to: (...args: unknown[]) => unknown; getChildren: () => unknown[] };
+        };
+        requestAnimationFrame: typeof requestAnimationFrame;
+        setTimeout: typeof setTimeout;
+      };
+      document: Record<string, never>;
+      CustomEvent: typeof CustomEvent;
+    } = {
+      window: {
+        requestAnimationFrame: (() => 1) as typeof requestAnimationFrame,
+        setTimeout: ((callback: () => void) => {
+          callback();
+          return 1;
+        }) as typeof setTimeout,
+      },
+      document: {},
+      CustomEvent,
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.CustomEvent = sandbox.CustomEvent;
+
+    new Function("window", "document", "CustomEvent", `with (window) {\n${HF_EARLY_STUB}\n}`)(
+      sandbox.window,
+      sandbox.document,
+      sandbox.CustomEvent,
+    );
+
+    const constructionCalls: unknown[][] = [];
+    const child = { id: "child" };
+    sandbox.window.gsap = {
+      timeline: () => ({
+        to: (...args: unknown[]) => {
+          constructionCalls.push(args);
+        },
+        from: () => {},
+        fromTo: () => {},
+        set: () => {},
+        pause: () => {},
+        play: () => {},
+        seek: () => {},
+        totalTime: () => 0,
+        time: () => 0,
+        duration: () => 10,
+        add: () => {},
+        getChildren: () => [child],
+        paused: () => true,
+        timeScale: () => 1,
+        kill: () => {},
+      }),
+    };
+
+    const timeline = sandbox.window.gsap.timeline();
+    timeline.to("#box", { x: 100 });
+
+    expect(constructionCalls).toHaveLength(0);
+    expect(timeline.getChildren()).toEqual([child]);
+    expect(constructionCalls).toHaveLength(1);
+    expect(sandbox.window.__hfTimelinesBuilding).toBe(false);
+  });
+
+  it("proxy is non-thenable — Promise.resolve(proxy) resolves immediately", async () => {
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: Record<string, unknown>;
+        __hfTimelinesBuilding?: boolean;
+        gsap?: { timeline: () => Record<string, unknown> };
+        requestAnimationFrame: typeof requestAnimationFrame;
+        setTimeout: typeof setTimeout;
+      };
+      document: Record<string, never>;
+      CustomEvent: typeof CustomEvent;
+    } = {
+      window: {
+        requestAnimationFrame: (() => 1) as typeof requestAnimationFrame,
+        setTimeout: (() => 1) as typeof setTimeout,
+      },
+      document: {},
+      CustomEvent,
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.CustomEvent = sandbox.CustomEvent;
+
+    new Function("window", "document", "CustomEvent", `with (window) {\n${HF_EARLY_STUB}\n}`)(
+      sandbox.window,
+      sandbox.document,
+      sandbox.CustomEvent,
+    );
+
+    sandbox.window.gsap = {
+      timeline: () => ({
+        to: () => {},
+        from: () => {},
+        fromTo: () => {},
+        set: () => {},
+        pause: () => {},
+        play: () => {},
+        seek: () => {},
+        totalTime: () => 0,
+        time: () => 0,
+        duration: () => 10,
+        add: () => {},
+        getChildren: () => [],
+        paused: () => true,
+        timeScale: () => 1,
+        kill: () => {},
+        then: (_resolve: () => void) => {
+          throw new Error("Real then() was called — proxy is thenable");
+        },
+      }),
+    };
+
+    const timeline = sandbox.window.gsap.timeline();
+    const resolved = await Promise.resolve(timeline);
+    expect(resolved).toBe(timeline);
+  });
+
+  it("keeps bridge duration at zero until the runtime publishes render readiness", () => {
+    const sandbox: {
+      window: Record<string, unknown> & {
+        __hf?: { seek?: (t: number) => void; duration?: number };
+        __player?: { renderSeek: (t: number) => void; getDuration: () => number };
+        __renderReady?: boolean;
+        __hfTimelinesBuilding?: boolean;
+        setInterval: typeof setInterval;
+        clearInterval: typeof clearInterval;
+      };
+      document: { querySelector: () => { getAttribute: (name: string) => string | null } };
+    } = {
+      window: {
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+      },
+      document: {
+        querySelector: () => ({
+          getAttribute: (name: string) => (name === "data-duration" ? "15" : null),
+        }),
+      },
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.__player = {
+      renderSeek: () => {},
+      getDuration: () => 0,
+    };
+
+    new Function("window", "document", `with (window) {\n${HF_BRIDGE_SCRIPT}\n}`)(
+      sandbox.window,
+      sandbox.document,
+    );
+
+    expect(sandbox.window.__hf?.duration).toBe(0);
+
+    sandbox.window.__renderReady = true;
+    expect(sandbox.window.__hf?.duration).toBe(15);
+
+    sandbox.window.__hfTimelinesBuilding = true;
+    expect(sandbox.window.__hf?.duration).toBe(0);
+  });
+
+  it("derives duration from sub-composition data-start + data-duration when root has none", () => {
+    const sandbox: any = {
+      window: {
+        setInterval: globalThis.setInterval,
+        clearInterval: globalThis.clearInterval,
+      },
+      document: {
+        querySelector: () => ({
+          getAttribute: () => null,
+        }),
+        querySelectorAll: () => [
+          {
+            getAttribute: (n: string) =>
+              n === "data-start" ? "0" : n === "data-duration" ? "5" : null,
+          },
+          {
+            getAttribute: (n: string) =>
+              n === "data-start" ? "5" : n === "data-duration" ? "8" : null,
+          },
+        ],
+      },
+    };
+    sandbox.window.window = sandbox.window;
+    sandbox.window.document = sandbox.document;
+    sandbox.window.__player = {
+      renderSeek: () => {},
+      getDuration: () => 0,
+    };
+    sandbox.window.__renderReady = true;
+
+    new Function("window", "document", `with (window) {\n${HF_BRIDGE_SCRIPT}\n}`)(
+      sandbox.window,
+      sandbox.document,
+    );
+
+    expect(sandbox.window.__hf?.duration).toBe(13);
   });
 });

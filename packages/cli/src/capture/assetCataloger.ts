@@ -10,6 +10,7 @@
  */
 
 import type { Page } from "puppeteer-core";
+import { parseAnimatedGifMetadata } from "@hyperframes/core";
 
 export interface CatalogedAsset {
   url: string;
@@ -24,6 +25,12 @@ export interface CatalogedAsset {
   sectionClasses?: string;
   /** Whether the image is above the fold (visible without scrolling) */
   aboveFold?: boolean;
+  /** Element sits inside <header>, <nav>, or [role="banner"] — logo signal */
+  inBanner?: boolean;
+  /** Element sits inside <a> with site-root href ("/", "#", origin-only) — brand-home link */
+  inHomeLink?: boolean;
+  /** alt/aria-label/title contains the brand segment of document.title */
+  matchesTitleBrand?: boolean;
 }
 
 /**
@@ -61,6 +68,26 @@ export async function catalogAssets(page: Page): Promise<CatalogedAsset[]> {
         var rect = el.getBoundingClientRect();
         ctx.aboveFold = rect.top < window.innerHeight;
       } catch(e) {}
+      // Structural logo-candidate signals: class-substring alone caught 0/32 SVGs on heygen.com.
+      ctx.inBanner = el.closest('header, nav, [role="banner"]') !== null;
+      var homeAnchor = el.closest('a[href]');
+      if (homeAnchor) {
+        var aHref = homeAnchor.getAttribute('href') || '';
+        ctx.inHomeLink = aHref === '/' || aHref === '#' || aHref === './' ||
+                         /^https?:\\/\\/[^/]+\\/?$/.test(aHref);
+      }
+      // Brand can be first ("HeyGen - Ideas"), last ("Ideas - HeyGen"), or colon-separated ("Vercel: Build").
+      var titleParts = (document.title || '').split(/[-|—:]/);
+      if (desc) {
+        for (var ti = 0; ti < titleParts.length; ti++) {
+          var part = titleParts[ti].trim();
+          if (part.length > 1 && part.length < 30 &&
+              desc.toLowerCase().indexOf(part.toLowerCase()) !== -1) {
+            ctx.matchesTitleBrand = true;
+            break;
+          }
+        }
+      }
       return ctx;
     }
 
@@ -91,12 +118,15 @@ export async function catalogAssets(page: Page): Promise<CatalogedAsset[]> {
       if (notes && !entry.notes) {
         entry.notes = notes;
       }
-      // Merge rich context (first one wins)
+      // Text fields: first-occurrence wins. Boolean signals: any positive sample wins.
       if (richCtx) {
         if (richCtx.description && !entry.description) entry.description = richCtx.description;
         if (richCtx.nearestHeading && !entry.nearestHeading) entry.nearestHeading = richCtx.nearestHeading;
         if (richCtx.sectionClasses && !entry.sectionClasses) entry.sectionClasses = richCtx.sectionClasses;
         if (richCtx.aboveFold !== undefined && entry.aboveFold === undefined) entry.aboveFold = richCtx.aboveFold;
+        if (richCtx.inBanner) entry.inBanner = true;
+        if (richCtx.inHomeLink) entry.inHomeLink = true;
+        if (richCtx.matchesTitleBrand) entry.matchesTitleBrand = true;
       }
     }
 
@@ -229,7 +259,65 @@ export async function catalogAssets(page: Page): Promise<CatalogedAsset[]> {
   const raw = (assets as CatalogedAsset[]) || [];
 
   // Deduplicate srcset resolution variants — keep highest resolution per base URL
-  return deduplicateSrcsetVariants(raw);
+  return annotateGifAssetMetadata(deduplicateSrcsetVariants(raw));
+}
+
+function isGifUrl(url: string): boolean {
+  try {
+    return new URL(url).pathname.toLowerCase().endsWith(".gif");
+  } catch {
+    return url.toLowerCase().split(/[?#]/, 1)[0]?.endsWith(".gif") ?? false;
+  }
+}
+
+function appendNote(existing: string | undefined, note: string): string {
+  return existing ? `${existing}; ${note}` : note;
+}
+
+async function readAssetBytes(url: string): Promise<Uint8Array | null> {
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) return null;
+    const contentLength = response.headers.get("content-length");
+    if (contentLength && Number.parseInt(contentLength, 10) > 25 * 1024 * 1024) return null;
+    return new Uint8Array(await response.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+export async function annotateGifAssetMetadata(
+  assets: CatalogedAsset[],
+  readBytes: (url: string) => Promise<Uint8Array | null> = readAssetBytes,
+): Promise<CatalogedAsset[]> {
+  return Promise.all(
+    assets.map(async (asset) => {
+      if (!isGifUrl(asset.url)) return asset;
+      const bytes = await readBytes(asset.url);
+      if (!bytes) return asset;
+      const metadata = parseAnimatedGifMetadata(bytes);
+      if (!metadata) return asset;
+      if (!metadata.animated) {
+        return {
+          ...asset,
+          notes: appendNote(asset.notes, "single-frame GIF"),
+        };
+      }
+      const loop =
+        metadata.loopCount === 0
+          ? "loops forever"
+          : metadata.loopCount == null
+            ? "no loop metadata"
+            : `loop count ${metadata.loopCount}`;
+      return {
+        ...asset,
+        notes: appendNote(
+          asset.notes,
+          `animated GIF: ${metadata.frameCount} frames, ${metadata.durationSeconds.toFixed(3)}s, ${loop}`,
+        ),
+      };
+    }),
+  );
 }
 
 /**
@@ -265,6 +353,9 @@ function deduplicateSrcsetVariants(assets: CatalogedAsset[]): CatalogedAsset[] {
       if (a.notes && !existing.notes) {
         existing.notes = a.notes;
       }
+      if (a.inBanner) existing.inBanner = true;
+      if (a.inHomeLink) existing.inHomeLink = true;
+      if (a.matchesTitleBrand) existing.matchesTitleBrand = true;
       // Keep the URL with highest w= value (largest image)
       const existingW = getWidthParam(existing.url);
       const newW = getWidthParam(a.url);
@@ -286,78 +377,5 @@ function getWidthParam(url: string): number {
     return w ? parseInt(w) : 0;
   } catch {
     return 0;
-  }
-}
-
-/**
- * Format cataloged assets as markdown for the DESIGN.md Assets section.
- * Matches Aura.build's format: grouped by type, named from file paths.
- */
-export function formatAssetCatalog(assets: CatalogedAsset[]): string {
-  if (assets.length === 0) return "No assets detected.\n";
-
-  // Group by type
-  const groups: Record<string, CatalogedAsset[]> = {};
-  for (const a of assets) {
-    const group = a.type;
-    if (!groups[group]) groups[group] = [];
-    groups[group]!.push(a);
-  }
-
-  const lines: string[] = [];
-
-  // Output in order: Fonts, Images, Videos, Icons, Background, Other
-  const order: CatalogedAsset["type"][] = ["Font", "Image", "Video", "Icon", "Background", "Other"];
-  for (const type of order) {
-    const group = groups[type];
-    if (!group || group.length === 0) continue;
-
-    const sectionName =
-      type === "Font"
-        ? "Fonts"
-        : type === "Image"
-          ? "Images"
-          : type === "Video"
-            ? "Videos"
-            : type === "Icon"
-              ? "Icons"
-              : type === "Background"
-                ? "Backgrounds"
-                : "Other";
-    lines.push(`### ${sectionName}`);
-
-    for (const a of group) {
-      const name = a.notes || deriveAssetName(a.url);
-      const contexts = a.contexts.join(", ");
-      lines.push(`- **${name}**: ${a.url} — contexts: ${contexts}`);
-    }
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-/**
- * Derive a human-readable name from a URL's file path.
- * E.g., "ConnectBentoBackground.jpg" → "Connect Bento Background"
- */
-function deriveAssetName(url: string): string {
-  try {
-    const u = new URL(url);
-    const path = u.pathname;
-    // Get filename without extension
-    const filename = path.split("/").pop() || "";
-    const nameWithoutExt = filename.replace(/\.[^.]+$/, "");
-    // Remove hash suffixes (e.g., "Sohne.cb178166" → "Sohne")
-    const cleaned = nameWithoutExt.replace(/\.[a-f0-9]{6,}$/, "");
-    // Convert camelCase/PascalCase to spaces
-    const spaced = cleaned
-      .replace(/([a-z])([A-Z])/g, "$1 $2")
-      .replace(/[-_]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
-    return spaced || filename;
-  } catch {
-    return "Asset";
   }
 }

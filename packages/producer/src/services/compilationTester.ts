@@ -39,7 +39,7 @@ const EPSILON = 0.001; // Tolerance for floating-point timing comparisons
  * Parse HTML and extract all elements with timing attributes.
  * Includes <video>, <audio>, and <div data-composition-src>.
  */
-export function extractTimedElements(html: string): CompiledElement[] {
+function extractTimedElements(html: string): CompiledElement[] {
   const elements: CompiledElement[] = [];
 
   // Extract video elements

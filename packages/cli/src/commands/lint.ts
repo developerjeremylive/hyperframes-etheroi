@@ -1,3 +1,4 @@
+import { setCommandExitCode } from "../utils/commandResult.js";
 import { defineCommand } from "citty";
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
@@ -36,9 +37,15 @@ export default defineCommand({
     },
   },
   async run({ args }) {
+    // Set process.exitCode + return instead of process.exit(): process.exit()
+    // terminates before Node flushes an async (non-TTY / piped) stdout, so
+    // `hyperframes lint --json | ...` on Windows silently loses the entire JSON
+    // payload written just above the exit. Letting run() return drains stdout
+    // first, then Node exits with the set code — the pattern the other commands
+    // (publish/transcribe/upgrade/play/present) already use.
     try {
       const project = resolveProject(args.dir);
-      const lintResult = lintProject(project);
+      const lintResult = await lintProject(project.dir);
 
       if (args.json) {
         const allFindings = lintResult.results.flatMap((r) => r.result.findings);
@@ -51,7 +58,8 @@ export default defineCommand({
           filesScanned: lintResult.results.length,
         };
         console.log(JSON.stringify(withMeta(combined), null, 2));
-        process.exit(combined.ok ? 0 : 1);
+        setCommandExitCode(combined.ok ? 0 : 1);
+        return;
       }
 
       const fileCount = lintResult.results.length;
@@ -72,7 +80,8 @@ export default defineCommand({
       });
       for (const line of lines) console.log(line);
 
-      process.exit(lintResult.totalErrors > 0 ? 1 : 0);
+      setCommandExitCode(lintResult.totalErrors > 0 ? 1 : 0);
+      return;
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       if (args.json) {
@@ -91,10 +100,11 @@ export default defineCommand({
             2,
           ),
         );
-        process.exit(1);
+        setCommandExitCode(1);
+        return;
       }
       console.error(message);
-      process.exit(1);
+      setCommandExitCode(1);
     }
   },
 });

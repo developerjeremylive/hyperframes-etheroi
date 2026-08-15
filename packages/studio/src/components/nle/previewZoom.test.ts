@@ -1,12 +1,19 @@
+// @vitest-environment happy-dom
+
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_PREVIEW_ZOOM,
   MAX_PREVIEW_ZOOM_PERCENT,
   MIN_PREVIEW_ZOOM_PERCENT,
+  canStartPreviewPan,
   clampPreviewPan,
   clampPreviewZoomPercent,
   getNextPreviewZoomPercent,
   getPreviewWheelZoomPercent,
+  ownsPreviewPanTarget,
+  PREVIEW_PAN_OVERSCROLL_PX,
+  PREVIEW_PAN_SURFACE_SELECTOR,
+  resolvePreviewWheelPan,
   resolvePreviewWheelZoom,
   toDomPrecision,
 } from "./previewZoom";
@@ -64,16 +71,17 @@ describe("getNextPreviewZoomPercent", () => {
 });
 
 describe("clampPreviewPan", () => {
-  it("centers the preview when fit or zoomed out", () => {
-    expect(
-      clampPreviewPan({
-        panX: 120,
-        panY: -90,
-        zoomPercent: 100,
-        viewportWidth: 800,
-        viewportHeight: 600,
-      }),
-    ).toEqual({ panX: 0, panY: 0 });
+  it("allows a small overscroll margin at fit zoom", () => {
+    const next = clampPreviewPan({
+      panX: 900,
+      panY: -900,
+      zoomPercent: 100,
+      viewportWidth: 800,
+      viewportHeight: 600,
+    });
+
+    expect(next.panX).toBe(PREVIEW_PAN_OVERSCROLL_PX);
+    expect(next.panY).toBe(-PREVIEW_PAN_OVERSCROLL_PX);
   });
 
   it("keeps pan within the zoomed preview bounds", () => {
@@ -85,7 +93,71 @@ describe("clampPreviewPan", () => {
         viewportWidth: 800,
         viewportHeight: 600,
       }),
-    ).toEqual({ panX: 400, panY: -300 });
+    ).toEqual({
+      panX: 400 + PREVIEW_PAN_OVERSCROLL_PX,
+      panY: -(300 + PREVIEW_PAN_OVERSCROLL_PX),
+    });
+  });
+
+  it("allows overscroll even when only one axis overflows", () => {
+    expect(
+      clampPreviewPan({
+        panX: 120,
+        panY: -90,
+        zoomPercent: 107.25,
+        viewportWidth: 1352,
+        viewportHeight: 682,
+        contentWidth: 1184,
+        contentHeight: 666,
+      }),
+    ).toEqual({
+      panX: PREVIEW_PAN_OVERSCROLL_PX,
+      panY: -(16.142499999999984 + PREVIEW_PAN_OVERSCROLL_PX),
+    });
+  });
+});
+
+describe("canStartPreviewPan", () => {
+  it("allows middle mouse pan at fit zoom", () => {
+    expect(canStartPreviewPan(1)).toBe(true);
+  });
+
+  it("allows middle mouse pan when zoomed in", () => {
+    expect(canStartPreviewPan(1)).toBe(true);
+  });
+
+  it("rejects other mouse buttons", () => {
+    expect(canStartPreviewPan(0)).toBe(false);
+    expect(canStartPreviewPan(2)).toBe(false);
+  });
+});
+
+describe("ownsPreviewPanTarget", () => {
+  it("accepts targets inside the preview stage", () => {
+    const stage = document.createElement("div");
+    const child = document.createElement("div");
+    stage.appendChild(child);
+
+    expect(ownsPreviewPanTarget(child, stage)).toBe(true);
+  });
+
+  it("accepts targets inside the shared preview pan surface", () => {
+    const surface = document.createElement("div");
+    surface.setAttribute("data-preview-pan-surface", "true");
+    const overlay = document.createElement("div");
+    surface.appendChild(overlay);
+
+    expect(ownsPreviewPanTarget(overlay, null)).toBe(true);
+  });
+
+  it("rejects targets outside the preview stage and preview pan surface", () => {
+    const outside = document.createElement("div");
+
+    expect(ownsPreviewPanTarget(outside, null)).toBe(false);
+  });
+
+  it("uses the shared preview pan surface selector contract", () => {
+    expect(PREVIEW_PAN_SURFACE_SELECTOR).toBe('[data-preview-pan-surface="true"]');
   });
 });
 
@@ -103,7 +175,7 @@ describe("resolvePreviewWheelZoom", () => {
     expect(next.panY).toBe(0);
   });
 
-  it("clamps pan when zooming out past minimum", () => {
+  it("preserves small pan inside the overscroll margin when zooming out past minimum", () => {
     const next = resolvePreviewWheelZoom({
       state: { zoomPercent: 26, panX: 20, panY: 20 },
       deltaY: 500,
@@ -112,7 +184,140 @@ describe("resolvePreviewWheelZoom", () => {
     });
 
     expect(next.zoomPercent).toBeCloseTo(MIN_PREVIEW_ZOOM_PERCENT, 0);
+    expect(next.panX).toBe(20);
+    expect(next.panY).toBe(20);
+  });
+
+  it("zooms toward the cursor when cursorX/cursorY are provided", () => {
+    const next = resolvePreviewWheelZoom({
+      state: DEFAULT_PREVIEW_ZOOM,
+      deltaY: -5,
+      viewportWidth: 800,
+      viewportHeight: 600,
+      cursorX: 200,
+      cursorY: 100,
+    });
+
+    expect(next.zoomPercent).toBeGreaterThan(100);
+    expect(next.panX).toBeLessThan(0);
+    expect(next.panY).toBeLessThan(0);
+  });
+
+  it("keeps pan at zero when cursor is at viewport center", () => {
+    const next = resolvePreviewWheelZoom({
+      state: DEFAULT_PREVIEW_ZOOM,
+      deltaY: -5,
+      viewportWidth: 800,
+      viewportHeight: 600,
+      cursorX: 0,
+      cursorY: 0,
+    });
+
+    expect(next.zoomPercent).toBeGreaterThan(100);
     expect(next.panX).toBe(0);
     expect(next.panY).toBe(0);
+  });
+
+  it("scales pan proportionally when cursor is at center", () => {
+    const next = resolvePreviewWheelZoom({
+      state: { zoomPercent: 200, panX: 50, panY: 30 },
+      deltaY: -5,
+      viewportWidth: 800,
+      viewportHeight: 600,
+      contentWidth: 800,
+      contentHeight: 450,
+      cursorX: 0,
+      cursorY: 0,
+    });
+
+    const ratio = next.zoomPercent / 200;
+    expect(next.panX).toBeCloseTo(50 * ratio, 1);
+    expect(next.panY).toBeCloseTo(30 * ratio, 1);
+  });
+
+  it("keeps the content point under a non-center cursor fixed after zoom", () => {
+    const cursorX = 150;
+    const cursorY = -80;
+    const state: PreviewZoomState = { zoomPercent: 150, panX: 20, panY: -10 };
+    const oldScale = state.zoomPercent / 100;
+
+    const next = resolvePreviewWheelZoom({
+      state,
+      deltaY: -5,
+      viewportWidth: 800,
+      viewportHeight: 600,
+      contentWidth: 800,
+      contentHeight: 450,
+      cursorX,
+      cursorY,
+    });
+
+    const newScale = next.zoomPercent / 100;
+    const contentXBefore = (cursorX - state.panX) / oldScale;
+    const contentXAfter = (cursorX - next.panX) / newScale;
+    const contentYBefore = (cursorY - state.panY) / oldScale;
+    const contentYAfter = (cursorY - next.panY) / newScale;
+
+    expect(contentXAfter).toBeCloseTo(contentXBefore, 6);
+    expect(contentYAfter).toBeCloseTo(contentYBefore, 6);
+  });
+
+  it("uses wider pan range for cursor zoom than manual drag", () => {
+    let state: PreviewZoomState = { zoomPercent: 100, panX: 0, panY: 0 };
+    for (let i = 0; i < 40; i++) {
+      state = resolvePreviewWheelZoom({
+        state,
+        deltaY: 5,
+        viewportWidth: 800,
+        viewportHeight: 600,
+        contentWidth: 800,
+        contentHeight: 450,
+        cursorX: -300,
+        cursorY: 0,
+      });
+    }
+
+    expect(state.zoomPercent).toBeLessThan(100);
+
+    const dragClamped = clampPreviewPan({
+      panX: state.panX,
+      panY: state.panY,
+      zoomPercent: state.zoomPercent,
+      viewportWidth: 800,
+      viewportHeight: 600,
+      contentWidth: 800,
+      contentHeight: 450,
+    });
+
+    expect(Math.abs(state.panX)).toBeGreaterThan(Math.abs(dragClamped.panX));
+  });
+});
+
+describe("resolvePreviewWheelPan", () => {
+  it("moves preview pan from wheel deltas", () => {
+    const next = resolvePreviewWheelPan({
+      state: DEFAULT_PREVIEW_ZOOM,
+      deltaX: 18,
+      deltaY: -12,
+      viewportWidth: 800,
+      viewportHeight: 600,
+    });
+
+    expect(next.zoomPercent).toBe(100);
+    expect(next.panX).toBe(-18);
+    expect(next.panY).toBe(12);
+  });
+
+  it("keeps wheel pan inside overscroll bounds", () => {
+    const next = resolvePreviewWheelPan({
+      state: DEFAULT_PREVIEW_ZOOM,
+      deltaX: -900,
+      deltaY: 900,
+      viewportWidth: 800,
+      viewportHeight: 600,
+    });
+
+    expect(next.panX).toBe(PREVIEW_PAN_OVERSCROLL_PX);
+    expect(next.panY).toBe(-PREVIEW_PAN_OVERSCROLL_PX);
   });
 });

@@ -6,6 +6,8 @@ export interface PreviewZoomState {
 
 export const MIN_PREVIEW_ZOOM_PERCENT = 25;
 export const MAX_PREVIEW_ZOOM_PERCENT = 400;
+export const PREVIEW_PAN_SURFACE_SELECTOR = '[data-preview-pan-surface="true"]';
+export const PREVIEW_PAN_OVERSCROLL_PX = 48;
 export const DEFAULT_PREVIEW_ZOOM: PreviewZoomState = {
   zoomPercent: 100,
   panX: 0,
@@ -22,6 +24,19 @@ export function toDomPrecision(value: number): number {
 export function clampPreviewZoomPercent(percent: number): number {
   if (!Number.isFinite(percent)) return 100;
   return Math.min(MAX_PREVIEW_ZOOM_PERCENT, Math.max(MIN_PREVIEW_ZOOM_PERCENT, percent));
+}
+
+export function canStartPreviewPan(button: number): boolean {
+  return button === 1;
+}
+
+export function ownsPreviewPanTarget(
+  target: EventTarget | null,
+  stage: HTMLElement | null,
+): boolean {
+  if (!(target instanceof Element)) return false;
+  if (stage?.contains(target)) return true;
+  return !!target.closest(PREVIEW_PAN_SURFACE_SELECTOR);
 }
 
 export function getPreviewWheelZoomPercent(deltaY: number, currentZoomPercent: number): number {
@@ -47,15 +62,37 @@ export function clampPreviewPan(input: {
   zoomPercent: number;
   viewportWidth: number;
   viewportHeight: number;
+  contentWidth?: number;
+  contentHeight?: number;
 }): Pick<PreviewZoomState, "panX" | "panY"> {
   const scale = clampPreviewZoomPercent(input.zoomPercent) / 100;
-  if (scale <= 1) return { panX: 0, panY: 0 };
-
-  const maxPanX = ((scale - 1) * input.viewportWidth) / 2;
-  const maxPanY = ((scale - 1) * input.viewportHeight) / 2;
+  const contentWidth = input.contentWidth ?? input.viewportWidth;
+  const contentHeight = input.contentHeight ?? input.viewportHeight;
+  const maxPanX =
+    Math.max(0, (contentWidth * scale - input.viewportWidth) / 2) + PREVIEW_PAN_OVERSCROLL_PX;
+  const maxPanY =
+    Math.max(0, (contentHeight * scale - input.viewportHeight) / 2) + PREVIEW_PAN_OVERSCROLL_PX;
   return {
     panX: Math.min(maxPanX, Math.max(-maxPanX, input.panX)),
     panY: Math.min(maxPanY, Math.max(-maxPanY, input.panY)),
+  };
+}
+
+function clampPreviewPanForZoom(
+  panX: number,
+  panY: number,
+  zoomPercent: number,
+  viewportWidth: number,
+  viewportHeight: number,
+  contentWidth: number,
+  contentHeight: number,
+): Pick<PreviewZoomState, "panX" | "panY"> {
+  const scale = clampPreviewZoomPercent(zoomPercent) / 100;
+  const maxPanX = Math.abs(contentWidth * scale - viewportWidth) / 2 + PREVIEW_PAN_OVERSCROLL_PX;
+  const maxPanY = Math.abs(contentHeight * scale - viewportHeight) / 2 + PREVIEW_PAN_OVERSCROLL_PX;
+  return {
+    panX: Math.min(maxPanX, Math.max(-maxPanX, panX)),
+    panY: Math.min(maxPanY, Math.max(-maxPanY, panY)),
   };
 }
 
@@ -64,21 +101,64 @@ export function resolvePreviewWheelZoom(input: {
   deltaY: number;
   viewportWidth: number;
   viewportHeight: number;
+  contentWidth?: number;
+  contentHeight?: number;
+  cursorX?: number;
+  cursorY?: number;
 }): PreviewZoomState {
-  const nextZoomPercent = getPreviewWheelZoomPercent(
-    input.deltaY,
-    clampPreviewZoomPercent(input.state.zoomPercent),
+  const oldZoom = clampPreviewZoomPercent(input.state.zoomPercent);
+  const nextZoomPercent = getPreviewWheelZoomPercent(input.deltaY, oldZoom);
+  const oldScale = oldZoom / 100;
+  const newScale = nextZoomPercent / 100;
+
+  let panX = input.state.panX;
+  let panY = input.state.panY;
+
+  if (input.cursorX !== undefined && input.cursorY !== undefined) {
+    const ratio = newScale / oldScale;
+    panX = input.cursorX * (1 - ratio) + panX * ratio;
+    panY = input.cursorY * (1 - ratio) + panY * ratio;
+  }
+
+  const cw = input.contentWidth ?? input.viewportWidth;
+  const ch = input.contentHeight ?? input.viewportHeight;
+  const pan = clampPreviewPanForZoom(
+    panX,
+    panY,
+    nextZoomPercent,
+    input.viewportWidth,
+    input.viewportHeight,
+    cw,
+    ch,
   );
-  const pan = clampPreviewPan({
-    panX: input.state.panX,
-    panY: input.state.panY,
-    zoomPercent: nextZoomPercent,
-    viewportWidth: input.viewportWidth,
-    viewportHeight: input.viewportHeight,
-  });
 
   return {
     zoomPercent: nextZoomPercent,
+    ...pan,
+  };
+}
+
+export function resolvePreviewWheelPan(input: {
+  state: PreviewZoomState;
+  deltaX: number;
+  deltaY: number;
+  viewportWidth: number;
+  viewportHeight: number;
+  contentWidth?: number;
+  contentHeight?: number;
+}): PreviewZoomState {
+  const pan = clampPreviewPan({
+    panX: input.state.panX - input.deltaX,
+    panY: input.state.panY - input.deltaY,
+    zoomPercent: input.state.zoomPercent,
+    viewportWidth: input.viewportWidth,
+    viewportHeight: input.viewportHeight,
+    contentWidth: input.contentWidth,
+    contentHeight: input.contentHeight,
+  });
+
+  return {
+    zoomPercent: clampPreviewZoomPercent(input.state.zoomPercent),
     ...pan,
   };
 }

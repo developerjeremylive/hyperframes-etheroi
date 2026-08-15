@@ -1,3 +1,4 @@
+// fallow-ignore-file code-duplication complexity
 /**
  * Unit tests for `services/distributed/renderChunk.ts`.
  *
@@ -30,6 +31,7 @@ import {
   PLAN_HASH_MISMATCH,
   renderChunk,
   RenderChunkValidationError,
+  resolveLockedVp9CpuUsed,
   resolvePresetForLockedEncoder,
 } from "./renderChunk.js";
 
@@ -40,7 +42,7 @@ const FIXTURE_HTML = `<!doctype html>
 <html>
 <head><meta charset="utf-8"><title>renderChunk fixture</title></head>
 <body style="margin:0;background:#000;color:#fff;font:32px sans-serif">
-  <div data-composition-id="root" data-width="160" data-height="120" data-duration="0.16667">
+  <div data-composition-id="root" data-no-timeline data-width="160" data-height="120" data-duration="0.16667">
     <p style="padding:1rem">chunk fixture</p>
   </div>
 </body>
@@ -133,7 +135,7 @@ beforeAll(async () => {
   planDir = join(runRoot, "plan");
   mkdirSync(planDir, { recursive: true });
   await plan(projectDir, { fps: 30, width: 160, height: 120, format: "png-sequence" }, planDir);
-});
+}, 30_000);
 
 afterAll(() => {
   rmSync(runRoot, { recursive: true, force: true });
@@ -192,6 +194,29 @@ describe("renderChunk()", () => {
       // `(name, sha256)` pairs, so two byte-identical chunks have the same
       // fingerprint without us having to compare each PNG separately.
       expect(a.sha256).toBe(b.sha256);
+
+      // Stage perf split: the timers must be populated and bounded by the
+      // chunk's total wall time (they partition `durationMs` alongside
+      // validation/file-server/hash overhead).
+      expect(a.planHashMs).toBeGreaterThanOrEqual(0);
+      expect(a.sessionBootMs).toBeGreaterThanOrEqual(0);
+      expect(a.captureStageMs).toBeGreaterThan(0);
+      expect(a.encodeStageMs).toBeGreaterThanOrEqual(0);
+      expect(a.workers).toBeGreaterThanOrEqual(1);
+      expect(["beginframe", "screenshot", "drawelement"]).toContain(a.captureMode);
+      expect(b.captureMode).toBe(a.captureMode);
+      expect(a.captureStageMs + a.encodeStageMs).toBeLessThanOrEqual(a.durationMs);
+      const perf = JSON.parse(readFileSync(a.perfPath, "utf-8"));
+      expect(perf.captureMode).toBe(a.captureMode);
+      for (const key of [
+        "planHashMs",
+        "sessionBootMs",
+        "captureStageMs",
+        "encodeStageMs",
+        "workers",
+      ]) {
+        expect(typeof perf[key]).toBe("number");
+      }
     },
     TIMEOUT_MS,
   );
@@ -296,6 +321,103 @@ describe("renderChunk()", () => {
   );
 });
 
+describe("renderChunk() — variables threading", () => {
+  // 60s ceiling absorbs Chrome cold-start + 5-frame capture + ffmpeg encode
+  // on slower CI workers.
+  const TIMEOUT_MS = 60_000;
+
+  // Fixture whose pixels depend on `window.__hfVariables.color`. Read the
+  // variables on `DOMContentLoaded` and write the color onto a fullscreen
+  // element. Two plans with different `variables.color` MUST produce
+  // different chunk fingerprints — proves the controller's snapshotted
+  // variables reach the chunk worker's page.
+  const VARIABLES_FIXTURE_HTML = `<!doctype html>
+<html data-composition-variables='{"color":"string"}'>
+<head><meta charset="utf-8"><title>renderChunk variables fixture</title></head>
+<body style="margin:0">
+  <div data-composition-id="root" data-no-timeline data-width="160" data-height="120" data-duration="0.16667">
+    <div id="paint" style="width:160px;height:120px;background:#000"></div>
+  </div>
+  <script>
+    (function () {
+      var v = (window.__hfVariables && window.__hfVariables.color) || "#000";
+      var el = document.getElementById("paint");
+      if (el) el.style.background = v;
+    })();
+  </script>
+</body>
+</html>`;
+
+  it(
+    "chunks rendered with different variables produce different output fingerprints",
+    async () => {
+      if (!hasChrome) {
+        // Soft skip — Docker harness covers the real assertion.
+        console.warn(
+          "[renderChunk.test] skipping variables-threading test — chrome-headless-shell not available on this host",
+        );
+        return;
+      }
+
+      const variablesProjectDir = join(runRoot, "project-variables");
+      mkdirSync(variablesProjectDir, { recursive: true });
+      writeFileSync(join(variablesProjectDir, "index.html"), VARIABLES_FIXTURE_HTML, "utf-8");
+
+      const planDirRed = join(runRoot, "plan-variables-red");
+      const planDirBlue = join(runRoot, "plan-variables-blue");
+      mkdirSync(planDirRed, { recursive: true });
+      mkdirSync(planDirBlue, { recursive: true });
+
+      const baseConfig = {
+        fps: 30 as const,
+        width: 160,
+        height: 120,
+        format: "png-sequence" as const,
+      };
+      await plan(
+        variablesProjectDir,
+        { ...baseConfig, variables: { color: "#ff0000" } },
+        planDirRed,
+      );
+      await plan(
+        variablesProjectDir,
+        { ...baseConfig, variables: { color: "#0000ff" } },
+        planDirBlue,
+      );
+
+      const outRed = join(runRoot, "chunk-variables-red");
+      const outBlue = join(runRoot, "chunk-variables-blue");
+
+      let red, blue;
+      try {
+        red = await renderChunk(planDirRed, 0, outRed);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (HOST_CHROME_FAILURE_PATTERNS.test(message)) {
+          console.warn(
+            "[renderChunk.test] skipping variables-threading test — host Chrome stack can't render. ",
+            "Docker harness covers the contract. Diagnostic:",
+            message.slice(0, 240),
+          );
+          return;
+        }
+        throw err;
+      }
+      blue = await renderChunk(planDirBlue, 0, outBlue);
+
+      expect(red.outputKind).toBe("frame-dir");
+      expect(blue.outputKind).toBe("frame-dir");
+      // Different variables.color → different rendered pixels → different
+      // fingerprint. The byte-identical-retry contract from the dedicated
+      // test above is what gives this assertion teeth: if variables
+      // weren't actually reaching the page, both chunks would hash the
+      // same #000 fallback.
+      expect(red.sha256).not.toBe(blue.sha256);
+    },
+    TIMEOUT_MS,
+  );
+});
+
 describe("resolvePresetForLockedEncoder", () => {
   // Tiny fast tests for the codec-override helper. No Chrome, no ffmpeg —
   // exists so a refactor that moves the override (e.g. into
@@ -331,5 +453,19 @@ describe("resolvePresetForLockedEncoder", () => {
     const base = { preset: "medium", quality: 18, codec: "h264" as const, pixelFormat: "yuv420p" };
     const out = resolvePresetForLockedEncoder(base, "png-sequence");
     expect(out).toBe(base);
+  });
+});
+
+describe("resolveLockedVp9CpuUsed", () => {
+  it("uses the locked value for new VP9 planDirs", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libvpx-vp9-software", vp9CpuUsed: 4 })).toBe(4);
+  });
+
+  it("preserves legacy distributed VP9 replay behavior when the field is absent", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libvpx-vp9-software" })).toBe(2);
+  });
+
+  it("returns undefined for non-VP9 planDirs", () => {
+    expect(resolveLockedVp9CpuUsed({ encoder: "libx264-software" })).toBeUndefined();
   });
 });

@@ -1,11 +1,39 @@
+import { failCommand } from "../utils/commandResult.js";
 import { defineCommand } from "citty";
 import { resolve } from "node:path";
 import type { Example } from "./_examples.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import { diag } from "../ui/diagnostics.js";
+import type { CapturePhaseProgress } from "../capture/types.js";
+
+const CAPTURE_PHASE_PREFIX = "HYPERFRAMES_CAPTURE_PHASE ";
+
+function emitCapturePhase(event: CapturePhaseProgress): void {
+  diag.notice(`${CAPTURE_PHASE_PREFIX}${JSON.stringify(event)}`);
+}
+
+function parseCaptureBudget(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error("--capture-budget must be a positive integer in milliseconds.");
+    failCommand();
+  }
+  return parsed;
+}
 
 export const examples: Example[] = [
-  ["Capture a website", "hyperframes capture https://stripe.com"],
-  ["Capture to a specific directory", "hyperframes capture https://linear.app -o linear-video"],
+  ["Capture a website into ./capture/", "hyperframes capture https://stripe.com"],
+  ["Capture to a different directory", "hyperframes capture https://linear.app -o linear-video"],
   ["JSON output for AI agents", "hyperframes capture https://example.com --json"],
+  [
+    "Pull a video from the captured manifest by index",
+    "hyperframes capture --video ./linear-video --index 0",
+  ],
+  [
+    "List videos referenced in the captured manifest",
+    "hyperframes capture --video ./linear-video --list",
+  ],
 ];
 
 export default defineCommand({
@@ -16,17 +44,22 @@ export default defineCommand({
   args: {
     url: {
       type: "positional",
-      description: "Website URL to capture",
-      required: true,
+      description: "Website URL to capture (omit when using --video)",
+      required: false,
     },
     output: {
       type: "string",
-      description: "Output directory name",
+      description: "Output directory name (default: ./capture, then ./capture-2/, ./capture-3/, …)",
       alias: "o",
     },
     "skip-assets": {
       type: "boolean",
       description: "Skip downloading assets (images, SVGs)",
+      default: false,
+    },
+    "skip-vision": {
+      type: "boolean",
+      description: "Skip optional AI image captioning",
       default: false,
     },
     "max-screenshots": {
@@ -37,30 +70,84 @@ export default defineCommand({
       type: "string",
       description: "Page load timeout in ms (default: 120000)",
     },
+    "capture-budget": {
+      type: "string",
+      description:
+        "Cooperative post-navigation budget in ms (default: 120000), separate from page-load --timeout; not a hard wall-clock timeout and cannot interrupt already-started native/core work",
+    },
     json: {
       type: "boolean",
       description: "Output JSON (for AI agents / programmatic use)",
       default: false,
     },
+    video: {
+      type: "string",
+      description:
+        "Switch to video-download mode: path to a captured project directory whose video-manifest.json should be read. Pair with --index, --video-url, or --list.",
+    },
+    index: {
+      type: "string",
+      description: "(--video mode) Manifest entry index to download (0-based)",
+    },
+    "video-url": {
+      type: "string",
+      description: "(--video mode) Exact video URL to download (must match a manifest entry)",
+    },
+    list: {
+      type: "boolean",
+      description: "(--video mode) List manifest entries and exit",
+      default: false,
+    },
   },
+  // fallow-ignore-next-line complexity
   async run({ args }) {
-    const url = args.url as string;
+    if (args.video) {
+      const { runVideoMode } = await import("./capture/video.js");
+      await runVideoMode({
+        project: args.video as string,
+        index: (args.index as string | undefined) ?? null,
+        url: (args["video-url"] as string | undefined) ?? null,
+        list: args.list as boolean,
+      });
+      return;
+    }
 
-    // Validate URL
+    const url = args.url as string | undefined;
+    if (!url) {
+      console.error(
+        "Missing URL. Pass a website URL, or use --video <project> for video download.",
+      );
+      failCommand();
+    }
+
     try {
       new URL(url);
     } catch {
       console.error(`Invalid URL: ${url}`);
-      process.exit(1);
+      failCommand();
     }
 
-    // Determine output directory — default to captures/<hostname> to keep repo root clean
-    let outputName = args.output as string | undefined;
-    if (!outputName) {
-      const hostname = new URL(url).hostname.replace(/^www\./, "");
-      outputName = `captures/${hostname.replace(/\./g, "-")}`;
+    const captureBudgetMs = parseCaptureBudget(args["capture-budget"] as string | undefined);
+
+    const isDefaultOutput = !args.output;
+    let outputName = (args.output as string | undefined) ?? "capture";
+    let outputDir = resolve(outputName);
+
+    if (isDefaultOutput) {
+      const { existsSync } = await import("node:fs");
+      // Auto-suffix when ./capture/ is taken: capture-2, capture-3, … so re-runs
+      // never silently merge into a previous capture's artifacts.
+      let n = 2;
+      while (existsSync(outputDir) && n < 100) {
+        outputName = `capture-${n}`;
+        outputDir = resolve(outputName);
+        n++;
+      }
+      if (existsSync(outputDir)) {
+        console.error(`./capture-{2..99} are all taken. Pass -o <name> to pick a directory.`);
+        failCommand();
+      }
     }
-    const outputDir = resolve(outputName);
 
     const isJson = args.json as boolean;
 
@@ -68,6 +155,9 @@ export default defineCommand({
       const { c } = await import("../ui/colors.js");
       console.log();
       console.log(c.dim("◆") + "  Capturing " + c.bold(url));
+      if (isDefaultOutput && outputName !== "capture") {
+        console.log(`  ${c.dim(`(./capture/ exists; writing to ./${outputName}/)`)}`);
+      }
       console.log();
     }
 
@@ -79,11 +169,14 @@ export default defineCommand({
           url,
           outputDir,
           skipAssets: args["skip-assets"] as boolean,
+          skipVision: args["skip-vision"] as boolean,
           maxScreenshots: args["max-screenshots"]
             ? parseInt(args["max-screenshots"] as string)
             : undefined,
           timeout: args.timeout ? parseInt(args.timeout as string) : undefined,
+          postNavigationBudgetMs: captureBudgetMs,
           json: isJson,
+          onPhase: emitCapturePhase,
         },
         isJson
           ? undefined
@@ -119,6 +212,7 @@ export default defineCommand({
               fontsDetailed: result.tokens.fonts,
               animations: result.animationCatalog?.summary,
               warnings: result.warnings,
+              lastPhase: result.lastPhase,
             },
             null,
             2,
@@ -155,15 +249,12 @@ export default defineCommand({
         console.log();
       }
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      // Write BLOCKED.md so the user/agent knows the capture failed
+      const errMsg = normalizeErrorMessage(err);
       try {
         const { mkdirSync, writeFileSync } = await import("node:fs");
+        const { formatCaptureFailureReason } = await import("../capture/captureTimeout.js");
         mkdirSync(outputDir, { recursive: true });
-        const isTimeout = /timeout|timed out/i.test(errMsg);
-        const reason = isTimeout
-          ? "Page navigation timed out — the site may be blocking headless browsers or requires authentication."
-          : `Capture failed: ${errMsg}`;
+        const reason = formatCaptureFailureReason(errMsg);
         writeFileSync(
           `${outputDir}/BLOCKED.md`,
           `# Capture Failed\n\n${reason}\n\nURL: ${url}\n\n## What to try\n\n- Re-run with a longer timeout: \`--timeout 60000\`\n- The site may block headless browsers (anti-bot protection)\n- Try capturing a different page on the same domain\n`,
@@ -177,7 +268,7 @@ export default defineCommand({
       } else {
         console.error(`\n  ✗ Capture failed: ${errMsg}\n`);
       }
-      process.exit(1);
+      failCommand();
     }
   },
 });

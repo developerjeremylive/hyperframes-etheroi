@@ -77,6 +77,17 @@ export interface ExampleItem extends RegistryItemBase {
   duration: number;
 }
 
+export interface BlockParam {
+  key: string;
+  label: string;
+  type: "color" | "text" | "number" | "select";
+  default: string;
+  options?: { label: string; value: string }[];
+  min?: number;
+  max?: number;
+  step?: number;
+}
+
 /** Sub-composition block — installed by `hyperframes add <name>`. */
 export interface BlockItem extends RegistryItemBase {
   type: "hyperframes:block";
@@ -84,6 +95,8 @@ export interface BlockItem extends RegistryItemBase {
   dimensions: RegistryItemDimensions;
   /** Duration in seconds (required for blocks). */
   duration: number;
+  /** Customizable parameters with CSS variable mapping. */
+  params?: BlockParam[];
 }
 
 /** Effect / snippet — merged into an existing composition. */
@@ -115,6 +128,11 @@ export interface RegistryManifest {
   name: string;
   /** Registry homepage URL. */
   homepage: string;
+  /** Published on-device vector artifact, when this registry provides one. */
+  catalogArtifact?: {
+    /** SHA-256 identity of the searchable corpus and embedding contract. */
+    revision: string;
+  };
   /** Items in this registry. */
   items: RegistryManifestEntry[];
 }
@@ -158,6 +176,51 @@ const _itemTypesExhaustive: _AssertItemTypesExhaustive = true;
 const _fileTypesExhaustive: _AssertFileTypesExhaustive = true;
 void _itemTypesExhaustive;
 void _fileTypesExhaustive;
+
+// ── Block categories ───────────────────────────────────────────────────────
+
+export type BlockCategory =
+  | "vfx"
+  | "transitions"
+  | "social"
+  | "data"
+  | "scenes"
+  | "captions"
+  | "effects"
+  | "text-effects"
+  | "code-animation";
+
+export interface BlockCategoryMeta {
+  id: BlockCategory;
+  label: string;
+  color: string;
+}
+
+export const BLOCK_CATEGORIES: BlockCategoryMeta[] = [
+  { id: "captions", label: "Captions", color: "cyan" },
+  { id: "code-animation", label: "Code Animations", color: "emerald" },
+  { id: "vfx", label: "VFX", color: "purple" },
+  { id: "transitions", label: "Transitions", color: "blue" },
+  { id: "effects", label: "Effects", color: "rose" },
+  { id: "text-effects", label: "Text Effects", color: "violet" },
+  { id: "social", label: "Social", color: "pink" },
+  { id: "data", label: "Data", color: "green" },
+  { id: "scenes", label: "Scenes", color: "amber" },
+];
+
+export function resolveBlockCategory(tags: string[] | undefined): BlockCategory {
+  if (!tags || tags.length === 0) return "scenes";
+  const set = new Set(tags);
+  if (set.has("captions") || set.has("caption-style")) return "captions";
+  if (set.has("code-animation")) return "code-animation";
+  if (set.has("transition")) return "transitions";
+  if (set.has("social") || set.has("overlay")) return "social";
+  if (set.has("data") || set.has("chart") || set.has("map")) return "data";
+  if (set.has("html-in-canvas") || set.has("webgl") || set.has("shader")) return "vfx";
+  if (set.has("text-effect")) return "text-effects";
+  if (set.has("effect") || set.has("grain") || set.has("vignette")) return "effects";
+  return "scenes";
+}
 
 // ── Type guards ─────────────────────────────────────────────────────────────
 

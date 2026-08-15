@@ -191,7 +191,7 @@ export const DEFAULT_CONTAINER: CaptionContainerStyle = {
   boxShadow: "none",
 };
 
-export const DEFAULT_ANIMATION: CaptionAnimation = {
+const DEFAULT_ANIMATION: CaptionAnimation = {
   preset: "fade",
   duration: 0.2,
   ease: "power2.out",

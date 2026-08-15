@@ -1,13 +1,20 @@
 import { describe, it, expect, afterEach } from "vitest";
-import { writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { loadTranscript, detectFormat, patchCaptionHtml, stripBeforeOnset } from "./normalize.js";
+import {
+  loadTranscript,
+  detectFormat,
+  patchCaptionHtml,
+  stripBeforeOnset,
+  formatSrt,
+  formatVtt,
+  wordsToCues,
+} from "./normalize.js";
 import { detectSpeechOnset } from "./transcribe.js";
 
 function tmpFile(name: string, content: string): string {
-  const dir = join(tmpdir(), `hf-normalize-test-${Date.now()}`);
-  mkdirSync(dir, { recursive: true });
+  const dir = mkdtempSync(join(tmpdir(), "hf-normalize-test-"));
   dirs.push(dir);
   const path = join(dir, name);
   writeFileSync(path, content);
@@ -213,6 +220,95 @@ Short format
   });
 });
 
+describe("caption formatting", () => {
+  it("round-trips SRT cues through normalized words", () => {
+    const srt = `1
+00:00:01,000 --> 00:00:03,500
+Write HTML.
+
+2
+00:00:03,500 --> 00:00:06,000
+Render video. Built for agents.
+`;
+    const path = tmpFile("captions.srt", srt);
+    const { words } = loadTranscript(path);
+
+    const output = formatSrt(words);
+    expect(output).toBe(srt);
+
+    const reparsed = loadTranscript(tmpFile("roundtrip.srt", output));
+    expect(reparsed.words).toEqual(words);
+  });
+
+  it("round-trips VTT cues through normalized words", () => {
+    const vtt = `WEBVTT
+
+00:00:01.000 --> 00:00:03.500
+Write HTML.
+
+00:00:03.500 --> 00:00:06.000
+Render video. Built for agents.
+`;
+    const path = tmpFile("captions.vtt", vtt);
+    const { words } = loadTranscript(path);
+
+    const output = formatVtt(words);
+    expect(output).toBe(vtt);
+
+    const reparsed = loadTranscript(tmpFile("roundtrip.vtt", output));
+    expect(reparsed.words).toEqual(words);
+  });
+
+  it("groups word-level transcript entries into readable cues", () => {
+    const cues = wordsToCues(
+      [
+        { text: "Write", start: 0, end: 0.2 },
+        { text: "HTML.", start: 0.2, end: 0.5 },
+        { text: "Render", start: 0.7, end: 0.9 },
+        { text: "video", start: 0.9, end: 1.1 },
+        { text: "for", start: 1.1, end: 1.2 },
+        { text: "agents.", start: 1.2, end: 1.6 },
+        { text: "Fresh", start: 2.5, end: 2.8 },
+        { text: "tracks.", start: 3.9, end: 4.1 },
+      ],
+      { maxChars: 18, maxGap: 0.8 },
+    );
+
+    expect(cues).toEqual([
+      { text: "Write HTML.", start: 0, end: 0.5 },
+      { text: "Render video for", start: 0.7, end: 1.2 },
+      { text: "agents.", start: 1.2, end: 1.6 },
+      { text: "Fresh", start: 2.5, end: 2.8 },
+      { text: "tracks.", start: 3.9, end: 4.1 },
+    ]);
+  });
+
+  it("joins CJK word-level tokens without inserting spaces", () => {
+    const cues = wordsToCues([
+      { text: "你", start: 0, end: 0.3 },
+      { text: "好", start: 0.3, end: 0.6 },
+      { text: "世界", start: 0.6, end: 1.0 },
+    ]);
+    expect(cues).toEqual([{ text: "你好世界", start: 0, end: 1 }]);
+  });
+
+  it("preserves single-word cue boundaries when preGrouped", () => {
+    // Phrase-level cues without internal whitespace (one-word or CJK captions)
+    // must not merge — auto-detection can't see them, so the caller forces it.
+    const cues = wordsToCues(
+      [
+        { text: "Yes", start: 0, end: 1 },
+        { text: "No", start: 1, end: 2 },
+      ],
+      { preGrouped: true },
+    );
+    expect(cues).toEqual([
+      { text: "Yes", start: 0, end: 1 },
+      { text: "No", start: 1, end: 2 },
+    ]);
+  });
+});
+
 describe("whisper-cpp contraction merging", () => {
   it("merges didn + 't into didn't", () => {
     const path = tmpFile(
@@ -381,8 +477,7 @@ describe("whisper-cpp zero-duration interpolation", () => {
 
 describe("patchCaptionHtml", () => {
   it("replaces const script = [] in HTML files", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<html><body><script>
@@ -404,8 +499,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("replaces const TRANSCRIPT = [] variant", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<script>const TRANSCRIPT = [];</script>`;
@@ -419,8 +513,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("does not modify HTML files without matching script patterns", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<html><body><script>console.log("hello");</script></body></html>`;
@@ -433,8 +526,7 @@ describe("patchCaptionHtml", () => {
   });
 
   it("skips empty word arrays", () => {
-    const dir = join(tmpdir(), `hf-patch-test-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), "hf-patch-test-"));
     dirs.push(dir);
 
     const html = `<script>const script = [];</script>`;
@@ -475,9 +567,10 @@ describe("detectSpeechOnset", () => {
       const amplitude = energyFn(t);
       buf.writeInt16LE(Math.round(amplitude * 32767), 44 + i * 2);
     }
-    const path = join(tmpdir(), `hf-wav-test-${Date.now()}-${Math.floor(Math.random() * 1e6)}.wav`);
+    const dir = mkdtempSync(join(tmpdir(), "hf-wav-test-"));
+    dirs.push(dir);
+    const path = join(dir, "tone.wav");
     writeFileSync(path, buf);
-    dirs.push(path);
     return path;
   }
 

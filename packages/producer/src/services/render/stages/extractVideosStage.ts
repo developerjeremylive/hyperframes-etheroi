@@ -33,24 +33,28 @@ import { isAbsolute, join } from "node:path";
 import {
   type CaptureVideoMetadataHint,
   type EngineConfig,
+  type ExtractedFrames,
+  type ExtractionResult,
   type FrameLookupTable,
   type HdrTransfer,
+  type VideoExtractionFailureKind,
   type VideoColorSpace,
+  classifyVideoExtractionError,
   createFrameLookupTable,
   detectTransfer,
   extractAllVideoFrames,
   extractMediaMetadata,
   isHdrColorSpace,
   resolveProjectRelativeSrc,
+  runVideoExtractionWithRetry,
 } from "@hyperframes/engine";
-import { fpsToNumber } from "@hyperframes/core";
 import {
   collectVideoMetadataHints,
   collectVideoReadinessSkipIds,
-  materializeExtractedFramesForCompiledDir,
   type RenderJob,
 } from "../../renderOrchestrator.js";
-import { type CompositionMetadata } from "../shared.js";
+import { materializeExtractedFramesForCompiledDir, type CompositionMetadata } from "../shared.js";
+import type { ProducerLogger } from "../../../logger.js";
 
 export interface ExtractVideosStageInput {
   projectDir: string;
@@ -58,6 +62,7 @@ export interface ExtractVideosStageInput {
   compiledDir: string;
   job: RenderJob;
   cfg: EngineConfig;
+  log?: ProducerLogger;
   /** Mutated in place — audio entries auto-discovered from video files are pushed onto `composition.audios`. */
   composition: CompositionMetadata;
   abortSignal: AbortSignal | undefined;
@@ -92,6 +97,154 @@ export interface ExtractVideosStageResult {
   imageColorSpaces: (VideoColorSpace | null)[];
   /** Wall-clock ms for the video extraction phase. */
   videoExtractMs: number;
+  /**
+   * Candidate-only typed failure gate. Callers throw this only after their
+   * extraction telemetry checkpoint has been emitted.
+   */
+  failureToEnforce: VideoExtractionStageError | null;
+}
+
+/**
+ * Whether the extract stage should COPY frames into the compiled dir instead of
+ * symlinking them. Windows without Developer Mode / Administrator can't create
+ * symlinks (`symlinkSync` throws EPERM), which failed local video renders; copy
+ * there instead. Elsewhere symlinking is cheaper, so keep it. (The distributed
+ * `plan()` path already forces copying for a different reason — a self-contained
+ * planDir — by passing `materializeSymlinks: true` explicitly.)
+ */
+export function shouldCopyExtractedFrames(platform: NodeJS.Platform): boolean {
+  return platform === "win32";
+}
+
+export type VideoExtractionStageErrorCode = "VIDEO_SOURCE_UNRENDERABLE" | "VIDEO_EXTRACTION_FAILED";
+
+export interface VideoExtractionStageFailureSummary {
+  kind: VideoExtractionFailureKind;
+  count: number;
+}
+
+export type VideoExtractionFailureMode = "off" | "observe" | "enforce";
+
+export interface VideoExtractionPolicy {
+  failureMode: VideoExtractionFailureMode;
+  maxTransientRetries: 0 | 1;
+}
+
+/**
+ * Candidate-lane rollout controls. Stable behavior remains unchanged unless
+ * explicitly enabled in the producer environment.
+ */
+export function resolveVideoExtractionPolicy(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): VideoExtractionPolicy {
+  const rawMode = env.HF_VIDEO_EXTRACTION_FAILURE_MODE?.trim().toLowerCase();
+  const failureMode: VideoExtractionFailureMode =
+    rawMode === "observe" || rawMode === "enforce" ? rawMode : "off";
+  const maxTransientRetries =
+    failureMode !== "off" && env.HF_VIDEO_EXTRACTION_MAX_RETRIES?.trim() === "1" ? 1 : 0;
+  return { failureMode, maxTransientRetries };
+}
+
+/**
+ * Producer-safe terminal error for per-source extraction failures.
+ *
+ * `ExtractionResult.errors[].error` intentionally retains local diagnostics
+ * and can contain signed URLs or filesystem paths. This error carries only a
+ * bounded taxonomy/count summary so the HTTP/Temporal boundary can transport
+ * the cause without leaking those values.
+ */
+export class VideoExtractionStageError extends Error {
+  constructor(
+    readonly code: VideoExtractionStageErrorCode,
+    readonly retryable: boolean,
+    readonly failures: readonly VideoExtractionStageFailureSummary[],
+  ) {
+    const total = failures.reduce((sum, failure) => sum + failure.count, 0);
+    const breakdown = failures.map((failure) => `${failure.kind}=${failure.count}`).join(",");
+    super(`Video extraction failed for ${total} source(s) [${code}; ${breakdown}]`);
+    this.name = "VideoExtractionStageError";
+  }
+}
+
+export function assertVideoExtractionSucceeded(result: ExtractionResult): void {
+  const error = buildVideoExtractionStageError(result);
+  if (error) throw error;
+}
+
+function buildVideoExtractionStageError(
+  result: ExtractionResult,
+): VideoExtractionStageError | null {
+  if (result.success && result.errors.length === 0) return null;
+  const counts = new Map<VideoExtractionFailureKind, number>();
+  for (const failure of result.errors) {
+    const kind = failure.kind ?? "internal";
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const failures = Array.from(counts, ([kind, count]) => ({ kind, count })).sort((a, b) =>
+    a.kind.localeCompare(b.kind),
+  );
+  const retryable =
+    result.errors.length > 0 && result.errors.every((failure) => failure.retryable === true);
+  return new VideoExtractionStageError(
+    retryable ? "VIDEO_EXTRACTION_FAILED" : "VIDEO_SOURCE_UNRENDERABLE",
+    retryable,
+    failures,
+  );
+}
+
+export function buildHdrProbeStageError(
+  failures: readonly Pick<ReturnType<typeof classifyVideoExtractionError>, "kind" | "retryable">[],
+): VideoExtractionStageError {
+  const counts = new Map<VideoExtractionFailureKind, number>();
+  for (const failure of failures) {
+    counts.set(failure.kind, (counts.get(failure.kind) ?? 0) + 1);
+  }
+  const summary = Array.from(counts, ([kind, count]) => ({ kind, count })).sort((a, b) =>
+    a.kind.localeCompare(b.kind),
+  );
+  const retryable = failures.length > 0 && failures.every((failure) => failure.retryable);
+  return new VideoExtractionStageError(
+    retryable ? "VIDEO_EXTRACTION_FAILED" : "VIDEO_SOURCE_UNRENDERABLE",
+    retryable,
+    summary,
+  );
+}
+
+type HdrProbeFailure = {
+  error: unknown;
+  classified: ReturnType<typeof classifyVideoExtractionError>;
+};
+
+function isHdrProbeFailure(failure: HdrProbeFailure | null): failure is HdrProbeFailure {
+  return failure !== null;
+}
+
+function throwHdrProbeFailures(
+  failures: readonly HdrProbeFailure[],
+  mode: VideoExtractionFailureMode,
+): void {
+  if (failures.length === 0) return;
+  if (mode === "enforce") {
+    throw buildHdrProbeStageError(failures.map((failure) => failure.classified));
+  }
+  const firstFailure = failures[0];
+  if (firstFailure) throw firstFailure.error;
+}
+
+function applyVideoExtractionFailurePolicy(
+  result: ExtractionResult,
+  policy: VideoExtractionPolicy,
+  log?: ProducerLogger,
+): VideoExtractionStageError | null {
+  const error = buildVideoExtractionStageError(result);
+  if (!error || policy.failureMode === "off") return null;
+  log?.warn("Video extraction produced typed source failures", {
+    mode: policy.failureMode,
+    code: error.code,
+    retryable: error.retryable,
+    failures: error.failures,
+  });
+  return policy.failureMode === "enforce" ? error : null;
 }
 
 export async function runExtractVideosStage(
@@ -102,6 +255,7 @@ export async function runExtractVideosStage(
     compiledDir,
     job,
     cfg,
+    log,
     composition,
     abortSignal,
     assertNotAborted,
@@ -109,9 +263,11 @@ export async function runExtractVideosStage(
   } = input;
 
   const stage2Start = Date.now();
+  const extractionPolicy = resolveVideoExtractionPolicy();
 
   let frameLookup: FrameLookupTable | null = null;
   let extractionResult: Awaited<ReturnType<typeof extractAllVideoFrames>> | null = null;
+  let failureToEnforce: VideoExtractionStageError | null = null;
   let videoReadinessSkipIds: string[] = [];
   let videoMetadataHints: CaptureVideoMetadataHint[] = [];
 
@@ -121,8 +277,10 @@ export async function runExtractVideosStage(
   // avoid ffprobe overhead when the user has explicitly opted out.
   const nativeHdrVideoIds = new Set<string>();
   const videoTransfers = new Map<string, HdrTransfer>();
+  let hdrProbeTransientRetries = 0;
   if (job.config.hdrMode !== "force-sdr" && composition.videos.length > 0) {
-    await Promise.all(
+    log?.info("Probing video color spaces...", { videoCount: composition.videos.length });
+    const probeFailures = await Promise.all(
       composition.videos.map(async (v) => {
         // Use the shared resolver so a `<video src="../assets/foo">` in a
         // sub-composition resolves the same way the browser would (see
@@ -132,14 +290,40 @@ export async function runExtractVideosStage(
         const videoPath = isAbsolute(v.src)
           ? v.src
           : resolveProjectRelativeSrc(v.src, projectDir, compiledDir);
-        if (!existsSync(videoPath)) return;
-        const meta = await extractMediaMetadata(videoPath);
-        if (isHdrColorSpace(meta.colorSpace)) {
-          nativeHdrVideoIds.add(v.id);
-          videoTransfers.set(v.id, detectTransfer(meta.colorSpace));
+        if (!existsSync(videoPath)) return null;
+        try {
+          // Retries are separately opt-in from the failure gate. With the
+          // default zero budget this remains the exact legacy single probe.
+          const attempted =
+            extractionPolicy.maxTransientRetries === 0
+              ? { result: await extractMediaMetadata(videoPath), retries: 0 }
+              : await runVideoExtractionWithRetry(() => extractMediaMetadata(videoPath), {
+                  signal: abortSignal,
+                  maxTransientRetries: extractionPolicy.maxTransientRetries,
+                  onRetry: () => {
+                    hdrProbeTransientRetries += 1;
+                  },
+                });
+          const meta = attempted.result;
+          if (isHdrColorSpace(meta.colorSpace)) {
+            nativeHdrVideoIds.add(v.id);
+            videoTransfers.set(v.id, detectTransfer(meta.colorSpace));
+          }
+          return null;
+        } catch (error) {
+          if (extractionPolicy.failureMode === "off") throw error;
+          const classified = classifyVideoExtractionError(error);
+          log?.warn("Video HDR metadata probe failed", {
+            mode: extractionPolicy.failureMode,
+            kind: classified.kind,
+            retryable: classified.retryable,
+            transientRetries: hdrProbeTransientRetries,
+          });
+          return { error, classified };
         }
       }),
     );
+    throwHdrProbeFailures(probeFailures.filter(isHdrProbeFailure), extractionPolicy.failureMode);
   }
 
   // Probe images for HDR color spaces (16-bit PNGs tagged BT.2020 PQ/HLG).
@@ -175,22 +359,33 @@ export async function runExtractVideosStage(
   }
 
   if (composition.videos.length > 0) {
+    const totalVideos = composition.videos.length;
+    for (let i = 0; i < totalVideos; i++) {
+      const v = composition.videos[i]!;
+      log?.info(`Extracting frames from video ${i + 1}/${totalVideos}: ${v.src}`);
+    }
     extractionResult = await extractAllVideoFrames(
       composition.videos,
       projectDir,
-      // extractAllVideoFrames takes fps as a number (decimal). Frames sampled
-      // from a video at 29.97 vs 30 differ by ~1 frame in 1000 — not enough
-      // to break visual parity, and the encoder-side rational keeps the
-      // output framerate exact.
+      // Preserve the configured rational through FFmpeg extraction. NTSC
+      // rates must remain `30000/1001`, not a rounded JavaScript decimal,
+      // because short boundary counts can differ by one frame.
       {
-        fps: fpsToNumber(job.config.fps),
+        fps: job.config.fps,
         outputDir: join(compiledDir, "__hyperframes_video_frames"),
+        format: job.config.videoFrameFormat ?? "auto",
+        timelineEnd: composition.duration,
+        maxTransientRetries: extractionPolicy.maxTransientRetries,
+        collectProbeFailures: extractionPolicy.failureMode === "enforce",
       },
       abortSignal,
-      { extractCacheDir: cfg.extractCacheDir },
+      { extractCacheDir: cfg.extractCacheDir, extractCacheMaxBytes: cfg.extractCacheMaxBytes },
       compiledDir,
     );
+    extractionResult.phaseBreakdown.transientRetries =
+      (extractionResult.phaseBreakdown.transientRetries ?? 0) + hdrProbeTransientRetries;
     assertNotAborted();
+    failureToEnforce = applyVideoExtractionFailurePolicy(extractionResult, extractionPolicy, log);
 
     materializeExtractedFramesForCompiledDir(extractionResult.extracted, compiledDir, {
       materializeSymlinks,
@@ -205,26 +400,7 @@ export async function runExtractVideosStage(
     );
     videoMetadataHints = collectVideoMetadataHints(extractionResult.extracted);
 
-    // Auto-detect audio from video files via ffprobe metadata
-    const existingAudioSrcs = new Set(composition.audios.map((a) => a.src));
-    for (const ext of extractionResult.extracted) {
-      if (ext.metadata.hasAudio) {
-        const video = composition.videos.find((v) => v.id === ext.videoId);
-        if (video && !existingAudioSrcs.has(video.src)) {
-          composition.audios.push({
-            id: `${video.id}-audio`,
-            src: video.src,
-            start: video.start,
-            end: video.end,
-            mediaStart: video.mediaStart,
-            layer: 0,
-            volume: 1.0,
-            type: "video",
-          });
-          existingAudioSrcs.add(video.src);
-        }
-      }
-    }
+    appendAutoDetectedVideoAudio(composition, extractionResult.extracted);
   }
   const videoExtractMs = Date.now() - stage2Start;
 
@@ -240,5 +416,34 @@ export async function runExtractVideosStage(
     hdrImageSrcPaths,
     imageColorSpaces,
     videoExtractMs,
+    failureToEnforce,
   };
+}
+
+/**
+ * Auto-detect audio from extracted video files (ffprobe metadata) and append
+ * to composition.audios. Both the file AND the element must declare audio —
+ * a muted <video> whose source contains audio should not leak into the render.
+ */
+export function appendAutoDetectedVideoAudio(
+  composition: Pick<CompositionMetadata, "videos" | "audios">,
+  extracted: ExtractedFrames[],
+): void {
+  const existingAudioSrcs = new Set(composition.audios.map((a) => a.src));
+  for (const ext of extracted) {
+    if (!ext.metadata.hasAudio) continue;
+    const video = composition.videos.find((v) => v.id === ext.videoId);
+    if (!video || !video.hasAudio || existingAudioSrcs.has(video.src)) continue;
+    composition.audios.push({
+      id: `${video.id}-audio`,
+      src: video.src,
+      start: video.start,
+      end: video.end,
+      mediaStart: video.mediaStart,
+      layer: 0,
+      volume: 1.0,
+      type: "video",
+    });
+    existingAudioSrcs.add(video.src);
+  }
 }

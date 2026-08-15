@@ -7,24 +7,59 @@
 
 import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
-import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, statSync, unlinkSync } from "node:fs";
 import { resolve, join, basename } from "node:path";
 import { createProjectWatcher, type ProjectWatcher } from "./fileWatcher.js";
-import { loadRuntimeSource } from "./runtimeSource.js";
+import {
+  hashSignatureParts,
+  loadRuntimeSource,
+  loadRuntimeSourceSignature,
+} from "./runtimeSource.js";
 import { VERSION as version } from "../version.js";
+import {
+  buildStudioHeadScriptsForHost,
+  identityAllowed,
+  refreshTelemetryPosture,
+  resolveCliTelemetryDistinctId,
+} from "./telemetryIdentity.js";
+import { emitStudioRenderComplete, emitStudioRenderError } from "./studioRenderTelemetry.js";
+import { isDevMode } from "../utils/env.js";
 import {
   createStudioManualEditsRenderBodyScript,
   createStudioApi,
   createProjectSignature,
+  createBackgroundRemovalJob,
+  consumeFileWriteReceipt,
+  fileContentVersion,
   getMimeType,
-  type StudioApiAdapter,
+  type PreviewApiAdapter,
+  thumbnailDeviceScaleFactor,
   type ResolvedProject,
   type RenderJobState,
-} from "@hyperframes/core/studio-api";
-import { getElementScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
-import type { ScreenshotClip } from "@hyperframes/core/studio-api/screenshot-clip";
+  type BackgroundRemovalRender,
+} from "@hyperframes/studio-server";
+import { resolveAutoProxy } from "../utils/projectConfig.js";
+import { getElementScreenshotClip } from "@hyperframes/studio-server/screenshot-clip";
+import type { ScreenshotClip } from "@hyperframes/studio-server/screenshot-clip";
+import type { RenderJob } from "@hyperframes/producer";
+import { seekCompositionTimeline } from "../capture/captureCompositionFrame.js";
+import {
+  assertWebGpuRequirement,
+  resolveCaptureBrowserGpuMode,
+  resolveLocalBrowserGpuMode,
+  type BrowserGpuMode,
+  type ResolvedBrowserGpuMode,
+} from "../browser/gpuPolicy.js";
 
 const STUDIO_MANUAL_EDITS_PATH = ".hyperframes/studio-manual-edits.json";
+const REMOTE_GIF_IMG_SRC_RE =
+  /<img\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+\.gif(?:[?#][^"']*)?)["'][^>]*>/gi;
+
+async function loadStudioProducer() {
+  return isDevMode()
+    ? await import("../../../producer/src/index.js")
+    : await import("@hyperframes/producer");
+}
 
 // ── Path resolution ─────────────────────────────────────────────────────────
 
@@ -113,25 +148,82 @@ async function reapplyStudioManualEditsToThumbnailPage(
   });
 }
 
-// ── Shared thumbnail browser (singleton per process) ────────────────────────
-// One browser instance is reused across all composition thumbnail requests.
-// Spawning a new Puppeteer process per request adds 2-5s overhead and causes
-// contention when the sidebar requests multiple thumbnails simultaneously.
+function collectRemoteGifImageSources(html: string): string[] {
+  const urls = new Set<string>();
+  const re = new RegExp(REMOTE_GIF_IMG_SRC_RE.source, REMOTE_GIF_IMG_SRC_RE.flags);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(html)) !== null) {
+    if (match[1]) urls.add(match[1]);
+  }
+  return [...urls];
+}
 
-let _thumbnailBrowser: import("puppeteer-core").Browser | null = null;
-let _thumbnailBrowserInitializing: Promise<import("puppeteer-core").Browser | null> | null = null;
+async function downloadRemoteGifImageSources(
+  html: string,
+  downloadDir: string,
+  downloadToTemp: (url: string, destDir: string) => Promise<string>,
+): Promise<Map<string, string>> {
+  const sourceAssets = new Map<string, string>();
+  await Promise.all(
+    collectRemoteGifImageSources(html).map(async (url) => {
+      try {
+        sourceAssets.set(url, await downloadToTemp(url, downloadDir));
+      } catch (err) {
+        console.warn(
+          "[Studio] Remote animated GIF prep skipped:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }),
+  );
+  return sourceAssets;
+}
 
-async function getThumbnailBrowser(): Promise<import("puppeteer-core").Browser | null> {
-  if (_thumbnailBrowser?.connected) return _thumbnailBrowser;
-  if (_thumbnailBrowserInitializing) return _thumbnailBrowserInitializing;
+// ── Shared thumbnail browser (pool-backed) ──────────────────────────────────
+// Uses the engine's browser pool so the thumbnail browser and render workers
+// share a single Chrome process instead of running two independent ones.
+
+let _thumbnailBrowserLease: import("@hyperframes/engine").BrowserLease | null = null;
+let _thumbnailBrowserInitializing: Promise<ThumbnailBrowserSession | null> | null = null;
+let _thumbnailBrowserModes: {
+  requested: BrowserGpuMode;
+  resolved: ResolvedBrowserGpuMode;
+} | null = null;
+
+interface ThumbnailBrowserSession {
+  browser: import("puppeteer-core").Browser;
+  requestedGpuMode: BrowserGpuMode;
+  resolvedGpuMode: ResolvedBrowserGpuMode;
+}
+
+async function getThumbnailBrowser(
+  requestedGpuMode: BrowserGpuMode,
+): Promise<ThumbnailBrowserSession | null> {
+  if (
+    _thumbnailBrowserLease?.browser.connected &&
+    _thumbnailBrowserModes?.requested === requestedGpuMode
+  ) {
+    return {
+      browser: _thumbnailBrowserLease.browser,
+      requestedGpuMode: _thumbnailBrowserModes.requested,
+      resolvedGpuMode: _thumbnailBrowserModes.resolved,
+    };
+  }
+  if (_thumbnailBrowserInitializing) {
+    const session = await _thumbnailBrowserInitializing;
+    if (session?.requestedGpuMode === requestedGpuMode) return session;
+  }
+  if (_thumbnailBrowserLease) await closeThumbnailBrowser();
 
   _thumbnailBrowserInitializing = (async () => {
     try {
       const { ensureBrowser } = await import("../browser/manager.js");
       const { acquireBrowser, buildChromeArgs } = await import("@hyperframes/engine");
+      let executablePath: string | undefined;
 
       try {
-        const b = await ensureBrowser();
+        const b = await ensureBrowser({ preferManagedChrome: true });
+        executablePath = b.executablePath;
         if (b.executablePath && !process.env.PRODUCER_HEADLESS_SHELL_PATH) {
           process.env.PRODUCER_HEADLESS_SHELL_PATH = b.executablePath;
         }
@@ -139,16 +231,28 @@ async function getThumbnailBrowser(): Promise<import("puppeteer-core").Browser |
         /* continue — acquireBrowser will try its own resolution */
       }
 
-      const acquired = await acquireBrowser(buildChromeArgs({ width: 1920, height: 1080 }), {
-        enableBrowserPool: false,
-      });
-      _thumbnailBrowser = acquired.browser;
-      _thumbnailBrowser.on("disconnected", () => {
-        _thumbnailBrowser = null;
+      const resolvedGpuMode = await resolveCaptureBrowserGpuMode(requestedGpuMode, executablePath);
+      const acquired = await acquireBrowser(
+        buildChromeArgs(
+          { width: 1920, height: 1080, captureMode: "screenshot" },
+          { browserGpuMode: resolvedGpuMode },
+        ),
+        { forceScreenshot: true },
+      );
+      _thumbnailBrowserLease = acquired;
+      _thumbnailBrowserModes = { requested: requestedGpuMode, resolved: resolvedGpuMode };
+      acquired.browser.on("disconnected", () => {
+        if (_thumbnailBrowserLease !== acquired) return;
+        _thumbnailBrowserLease = null;
+        _thumbnailBrowserModes = null;
         _thumbnailBrowserInitializing = null;
       });
-      return _thumbnailBrowser;
-    } catch {
+      return { browser: acquired.browser, requestedGpuMode, resolvedGpuMode };
+    } catch (err) {
+      console.warn(
+        "[Studio] Failed to launch thumbnail browser:",
+        err instanceof Error ? err.message : err,
+      );
       _thumbnailBrowserInitializing = null;
       return null;
     }
@@ -157,22 +261,96 @@ async function getThumbnailBrowser(): Promise<import("puppeteer-core").Browser |
   return _thumbnailBrowserInitializing;
 }
 
+export async function closeThumbnailBrowser(): Promise<void> {
+  if (!_thumbnailBrowserLease) return;
+  const lease = _thumbnailBrowserLease;
+  _thumbnailBrowserLease = null;
+  _thumbnailBrowserModes = null;
+  _thumbnailBrowserInitializing = null;
+  await lease.release().catch(() => {});
+}
+
 // ── Server factory ──────────────────────────────────────────────────────────
 
 export interface StudioServerOptions {
   projectDir: string;
   /** Display name for the project. Defaults to basename of projectDir. */
   projectName?: string;
+  /**
+   * Auto-transcode browser-hostile video codecs to a cached H.264 preview
+   * proxy. The preview command passes its resolved `--proxy`/`--no-proxy` +
+   * `hyperframes.json` value; when omitted, the project's `media.autoProxy`
+   * config (default true) applies.
+   */
+  autoProxy?: boolean | undefined;
+  /** GPU policy used by Studio thumbnails and frame capture. */
+  browserGpuMode?: BrowserGpuMode;
 }
 
 export interface StudioServer {
   app: Hono;
   watcher: ProjectWatcher;
+  /** Exposed for tests: the adapter handed to the shared studio API (carries
+   * the resolved `autoProxy` flag the preview routes read). */
+  adapter: PreviewApiAdapter;
+}
+
+export async function loadPreviewServerBuildSignature(): Promise<string> {
+  const runtimeSignature = await loadRuntimeSourceSignature();
+  const studioBundle = resolveStudioBundle();
+  const studioIndex =
+    studioBundle.available && existsSync(studioBundle.indexPath)
+      ? readFileSync(studioBundle.indexPath, "utf-8")
+      : "";
+  return hashSignatureParts([
+    version,
+    runtimeSignature,
+    studioIndex,
+    createStudioServer.toString(),
+    createStudioApi.toString(),
+    createProjectSignature.toString(),
+    getMimeType.toString(),
+    getElementScreenshotClip.toString(),
+  ]);
+}
+
+// Rewrite the viewport meta + inline width/height in every written .html to the
+// host composition's dimensions, so an installed fragment matches the host
+// canvas. Applies to ALL written files — including any .html a dependency ships,
+// not just the requested block's — which is intentional. No-op when the host
+// index.html is absent or carries no dimensions.
+function rewriteWrittenToHostViewport(projectDir: string, written: string[]): void {
+  const indexPath = join(projectDir, "index.html");
+  if (!existsSync(indexPath)) return;
+  const indexHtml = readFileSync(indexPath, "utf-8");
+  const hostW = indexHtml.match(/data-width="(\d+)"/)?.[1];
+  const hostH = indexHtml.match(/data-height="(\d+)"/)?.[1];
+  if (!hostW || !hostH) return;
+
+  for (const absPath of written) {
+    if (!absPath.endsWith(".html")) continue;
+    let content = readFileSync(absPath, "utf-8");
+    content = content.replace(
+      /(<meta\s+name="viewport"\s+content="width=)\d+(,\s*height=)\d+/i,
+      `$1${hostW}$2${hostH}`,
+    );
+    content = content.replace(
+      /(\bwidth:\s*)\d+(px;\s*\n?\s*height:\s*)\d+(px;)/g,
+      (match, pre, mid, post) => {
+        if (match.includes("1920") || match.includes("1080")) {
+          return `${pre}${hostW}${mid}${hostH}${post}`;
+        }
+        return match;
+      },
+    );
+    writeFileSync(absPath, content, "utf-8");
+  }
 }
 
 export function createStudioServer(options: StudioServerOptions): StudioServer {
   const { projectDir, projectName } = options;
   const projectId = projectName || basename(projectDir);
+  const browserGpuMode = options.browserGpuMode ?? resolveLocalBrowserGpuMode();
   const studioDir = resolveDistDir();
   const runtimePath = resolveRuntimePath();
   const watcher = createProjectWatcher(projectDir);
@@ -185,7 +363,13 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     cachedProjectSignature = null;
   });
 
-  const adapter: StudioApiAdapter = {
+  const adapter: PreviewApiAdapter = {
+    // Explicit option wins (preview's resolved --proxy/--no-proxy + config);
+    // otherwise honor the project's hyperframes.json media.autoProxy so every
+    // createStudioServer caller (e.g. the background preview child) gets the
+    // configured behavior without its own plumbing.
+    autoProxy: options.autoProxy ?? resolveAutoProxy(projectDir, undefined),
+
     listProjects: () => [project],
 
     resolveProject: (id: string) => (id === projectId ? project : null),
@@ -197,7 +381,10 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
         // we can point it at our hot-reloadable local runtime endpoint. Inlining
         // ~150 KB of runtime body on every preview render would defeat browser
         // caching across composition edits.
-        let html = await bundleToSingleHtml(dir, { runtime: "placeholder" });
+        let html = await bundleToSingleHtml(dir, {
+          runtime: "placeholder",
+          inlineColorGradingLuts: false,
+        });
         html = html.replace(
           'data-hyperframes-preview-runtime="1" src=""',
           'data-hyperframes-preview-runtime="1" src="/api/runtime.js"',
@@ -209,10 +396,28 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       }
     },
 
-    async transformPreviewHtml({ html }) {
+    async transformPreviewHtml({ html, project }) {
       const { injectDeterministicFontFaces } =
         await import("../../../producer/src/services/deterministicFonts.js");
-      return injectDeterministicFontFaces(html);
+      const { prepareAnimatedGifInputs } =
+        await import("../../../producer/src/services/animatedGifPrep.js");
+      const { downloadToTemp, writeUrlDownloadTelemetry } =
+        await import("../../../producer/src/utils/urlDownloader.js");
+      const gifOutputDir = join(project.dir, ".hyperframes", "prepared-assets", "gif");
+      const gifDownloadDir = join(project.dir, ".hyperframes", "prepared-assets", "downloads");
+      const prepared = await prepareAnimatedGifInputs(html, {
+        projectDir: project.dir,
+        downloadDir: gifDownloadDir,
+        outputDir: gifOutputDir,
+        outputSrcPrefix: ".hyperframes/prepared-assets/gif",
+        cacheDir: gifOutputDir,
+        sourceAssets: await downloadRemoteGifImageSources(html, gifDownloadDir, (url, destDir) =>
+          downloadToTemp(url, destDir, undefined, undefined, undefined, {
+            onTelemetry: writeUrlDownloadTelemetry,
+          }),
+        ),
+      });
+      return injectDeterministicFontFaces(prepared.html);
     },
 
     getProjectSignature(dir: string): string {
@@ -222,8 +427,8 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     },
 
     async lint(html: string, opts?: { filePath?: string }) {
-      const { lintHyperframeHtml } = await import("@hyperframes/core/lint");
-      return lintHyperframeHtml(html, opts);
+      const { lintHyperframeHtml } = await import("@hyperframes/lint");
+      return await lintHyperframeHtml(html, opts);
     },
 
     runtimeUrl: "/api/runtime.js",
@@ -231,21 +436,44 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     rendersDir: () => join(projectDir, "renders"),
 
     startRender(opts): RenderJobState {
+      // The render POST is a request boundary like any other. Without this an
+      // already-open Studio tab keeps rendering under the posture cached when
+      // the server booted.
+      refreshTelemetryPosture();
+      const abortController = new AbortController();
       const state: RenderJobState = {
         id: opts.jobId,
         status: "rendering",
         progress: 0,
         outputPath: opts.outputPath,
+        cancel: () => abortController.abort(),
       };
 
       // Run render asynchronously, mutating the state object
+      const startTime = Date.now();
       (async () => {
+        let renderJob: RenderJob | undefined;
+        const removeCancelledOutput = () => {
+          // User-initiated cancel: not a failure. Remove any output so the
+          // cancelled job doesn't resurrect in the render history.
+          state.status = "cancelled";
+          for (const suffix of ["", ".meta.json"]) {
+            const fp = suffix
+              ? opts.outputPath.replace(/\.(mp4|webm|mov)$/, suffix)
+              : opts.outputPath;
+            try {
+              if (existsSync(fp)) unlinkSync(fp);
+            } catch {
+              /* ignore */
+            }
+          }
+        };
         try {
-          const { createRenderJob, executeRenderJob } = await import("@hyperframes/producer");
+          const { createRenderJob, executeRenderJob } = await loadStudioProducer();
           const { ensureBrowser } = await import("../browser/manager.js");
 
           try {
-            const browser = await ensureBrowser();
+            const browser = await ensureBrowser({ preferManagedChrome: true });
             if (browser.executablePath && !process.env.PRODUCER_HEADLESS_SHELL_PATH) {
               process.env.PRODUCER_HEADLESS_SHELL_PATH = browser.executablePath;
             }
@@ -264,13 +492,26 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
             outputResolution: opts.outputResolution,
             ...(manualEditsRenderScript ? { renderBodyScripts: [manualEditsRenderScript] } : {}),
             ...(opts.composition ? { entryFile: opts.composition } : {}),
+            ...(opts.variables ? { variables: opts.variables } : {}),
           });
-          const startTime = Date.now();
+          renderJob = job;
           const onProgress = (j: { progress: number; currentStage?: string }) => {
             state.progress = j.progress;
             if (j.currentStage) state.stage = j.currentStage;
           };
-          await executeRenderJob(job, opts.project.dir, opts.outputPath, onProgress);
+          await executeRenderJob(
+            job,
+            opts.project.dir,
+            opts.outputPath,
+            onProgress,
+            abortController.signal,
+          );
+          if (abortController.signal.aborted) {
+            // Cancel landed just as the render finished: honor the cancel the
+            // route already reported instead of resurrecting a completed job.
+            removeCancelledOutput();
+            return;
+          }
           state.status = "complete";
           state.progress = 100;
           const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json");
@@ -278,9 +519,23 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
             metaPath,
             JSON.stringify({ status: "complete", durationMs: Date.now() - startTime }),
           );
+          // Refreshed HERE, not just at render start: a render can run for
+          // minutes, and `hyperframes telemetry disable` during one must be
+          // honoured by the event that reports it. Studio never polls
+          // /api/telemetry-identity, so this process would otherwise keep its
+          // startup-cached posture for the life of the preview server.
+          refreshTelemetryPosture();
+          emitStudioRenderComplete(opts, Date.now() - startTime, job.perfSummary);
         } catch (err) {
+          if (abortController.signal.aborted) {
+            removeCancelledOutput();
+            return;
+          }
           state.status = "failed";
           state.error = err instanceof Error ? err.message : String(err);
+          // fallow-ignore-next-line code-duplication
+          refreshTelemetryPosture();
+          emitStudioRenderError(opts, Date.now() - startTime, state.stage, err, renderJob);
           try {
             const metaPath = opts.outputPath.replace(/\.(mp4|webm|mov)$/, ".meta.json");
             writeFileSync(metaPath, JSON.stringify({ status: "failed" }));
@@ -293,36 +548,70 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
       return state;
     },
 
+    startBackgroundRemoval(opts) {
+      return createBackgroundRemovalJob(opts, async (renderOpts) => {
+        const sourcePipelinePath = "../background-removal/pipeline.ts";
+        const pipeline = (await import("../background-removal/pipeline.js").catch(
+          () => import(sourcePipelinePath),
+        )) as { render: BackgroundRemovalRender };
+        return pipeline.render(renderOpts);
+      });
+    },
+
     async generateThumbnail(opts): Promise<Buffer | null> {
-      // Reuse a single browser across all thumbnail requests for this server
-      // instance — avoids paying the ~2s Puppeteer startup cost per composition.
-      // The browser is created lazily and kept alive until the process exits.
-      const browser = await getThumbnailBrowser();
-      if (!browser) return null;
+      const session = await getThumbnailBrowser(browserGpuMode);
+      if (!session) {
+        console.warn("[Studio] Thumbnail: no browser available — Chrome may not be installed");
+        return null;
+      }
+      const sourcePath = join(opts.project.dir, opts.compPath);
+      if (existsSync(sourcePath)) {
+        assertWebGpuRequirement(
+          readFileSync(sourcePath, "utf-8"),
+          session.requestedGpuMode,
+          session.resolvedGpuMode,
+        );
+      }
       let page: import("puppeteer-core").Page | null = null;
+      const closePage = () => void page?.close().catch(() => {});
+      opts.signal.addEventListener("abort", closePage, { once: true });
       try {
-        page = await browser.newPage();
-        await page.setViewport({ width: opts.width || 1920, height: opts.height || 1080 });
-        // domcontentloaded instead of networkidle2 — CDN scripts (GSAP, Lottie,
-        // fonts) never reach "idle" and cause a 15s timeout per thumbnail.
+        page = await session.browser.newPage();
+        if (opts.signal.aborted) return null;
+        const width = opts.width || 1920;
+        const height = opts.height || 1080;
+        await page.setViewport({
+          width,
+          height,
+          deviceScaleFactor: thumbnailDeviceScaleFactor(opts),
+        });
         await page.goto(opts.previewUrl, { waitUntil: "domcontentloaded", timeout: 10000 });
-        // Wait for the runtime to register timelines (up to 5s, non-fatal).
         await page
-          .waitForFunction(() => !!(window as any).__timelines || !!(window as any).__playerReady, {
-            timeout: 5000,
-          })
+          .waitForFunction(
+            () => {
+              const w = window as Window & {
+                __timelines?: Record<string, unknown>;
+              };
+              return !!(w.__timelines && Object.keys(w.__timelines).length > 0);
+            },
+            { timeout: 5000 },
+          )
           .catch(() => {});
-        await page.evaluate((t: number) => {
-          const win = window as any;
-          if (win.__player?.seek) win.__player.seek(t);
-          else if (win.__timeline?.seek) {
-            win.__timeline.pause();
-            win.__timeline.seek(t);
-          }
-        }, opts.seekTime);
+        await seekCompositionTimeline(page, opts.seekTime, {
+          fallbackToBridgeAndTimelines: true,
+          waitForPreferredSeekTargetMs: 500,
+          animationFrameSettle: "double",
+          waitForFontsMs: 500,
+        });
         const manifestContent = readStudioManualEditManifestContent(opts.project.dir);
         await applyStudioManualEditsToThumbnailPage(page, manifestContent, opts.compPath);
-        // Let the seek render settle.
+        await page.evaluate(() => {
+          void document.fonts?.ready;
+          const body = document.body;
+          if (body && getComputedStyle(body).backgroundColor === "rgba(0, 0, 0, 0)") {
+            body.style.backgroundColor = "#1c2028";
+          }
+        });
         await new Promise((r) => setTimeout(r, 200));
         await reapplyStudioManualEditsToThumbnailPage(page);
         let clip: ScreenshotClip | undefined;
@@ -342,11 +631,56 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
               },
         )) as Buffer;
         return screenshot;
-      } catch {
+      } catch (err) {
+        if (!opts.signal.aborted) {
+          console.warn(
+            "[Studio] Thumbnail generation failed:",
+            err instanceof Error ? err.message : err,
+          );
+        }
         return null;
       } finally {
+        opts.signal.removeEventListener("abort", closePage);
         await page?.close().catch(() => {});
       }
+    },
+
+    async listRegistryCatalog() {
+      const { listRegistryItems, loadAllItems } = await import("../registry/resolver.js");
+      const entries = await listRegistryItems();
+      const blockAndComponentEntries = entries.filter(
+        (e) => e.type === "hyperframes:block" || e.type === "hyperframes:component",
+      );
+      return loadAllItems(blockAndComponentEntries);
+    },
+
+    async installRegistryBlock(opts) {
+      const { resolveItemWithDependencies } = await import("../registry/resolver.js");
+      const { installItem } = await import("../registry/installer.js");
+      const { gateRegistryItemsCompatibility } = await import("../registry/compatibility.js");
+      // Resolve transitive registryDependencies and install them first so a
+      // block that depends on other registry items installs completely.
+      const items = await resolveItemWithDependencies(opts.blockName);
+      // Compatibility-gate the whole set before writing anything (same gate as
+      // `hyperframes add`), so an incompatible block or dep aborts cleanly.
+      const warnings = gateRegistryItemsCompatibility(items);
+      for (const warning of warnings) {
+        process.stderr.write(`hyperframes:registry ${warning}\n`);
+      }
+      const written: string[] = [];
+      for (const dep of items) {
+        const result = await installItem(dep, { destDir: opts.project.dir });
+        written.push(...result.written);
+      }
+      const item = items[items.length - 1]!;
+
+      rewriteWrittenToHostViewport(opts.project.dir, written);
+
+      const relativePaths = written.map((abs) => {
+        const rel = abs.startsWith(opts.project.dir) ? abs.slice(opts.project.dir.length + 1) : abs;
+        return rel;
+      });
+      return { written: relativePaths, block: item };
     },
   };
 
@@ -358,12 +692,19 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
   // HyperFrames instances and reuse them instead of spawning duplicates.
   // See portUtils.ts detectHyperframesServer() for the consumer.
   app.get("/__hyperframes_config", (c) => {
-    return c.json({
-      isHyperframes: true,
-      projectName: projectId,
-      projectDir: projectDir,
-      version,
-    });
+    const serve = async () => {
+      const serverBuildSignature = await loadPreviewServerBuildSignature();
+      return c.json({
+        isHyperframes: true,
+        pid: process.pid,
+        projectName: projectId,
+        projectDir: projectDir,
+        serverBuildSignature,
+        browserGpuMode,
+        version,
+      });
+    };
+    return serve();
   });
 
   // CLI-specific routes (before shared API)
@@ -381,16 +722,70 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
     return serve();
   });
 
+  // CLI → Studio telemetry identity endpoint (Layer 1). Studio reads the
+  // injected `window.__HF_CLI_DISTINCT_ID` first; this GET is a fallback for
+  // clients that can't rely on the injected global. Returns the CLI's anonymous
+  // distinct id (no PII) so the browser session can join the CLI's PostHog
+  // person, or `{ distinctId: null }` when CLI telemetry is disabled.
+  //
+  // Deliberately does NOT serve `bucketSeed`. Studio gets its canary answers
+  // from the injected `window.__HF_CLI_CANARY_DECISIONS` (booleans, not the
+  // value cohorts derive from), so nothing needs the seed over HTTP — and an
+  // unauthenticated local endpoint is a strictly worse place for it than an
+  // inline script scoped to Studio's own document.
+  //
+  // Host-guarded against DNS rebinding: a remote page can point a hostname it
+  // controls at 127.0.0.1 and read this response as same-origin. Pinning the
+  // Host header to a loopback name means such a request (which carries the
+  // attacker's hostname) is refused. Same-origin Studio traffic always
+  // presents the bound loopback host.
+  app.get("/api/telemetry-identity", (c) => {
+    if (!identityAllowed(c.req.header("host"))) {
+      return c.json({ error: "forbidden" }, 403);
+    }
+    // Same request-boundary refresh the head-script route does: this endpoint
+    // is polled by a long-lived Studio tab, so a cached posture here outlives
+    // an opt-out run in another terminal just as visibly.
+    refreshTelemetryPosture();
+    return c.json({ distinctId: resolveCliTelemetryDistinctId() });
+  });
+
   app.get("/api/events", (c) => {
     return streamSSE(c, async (stream) => {
       const listener = (path: string) => {
-        stream.writeSSE({ event: "file-change", data: JSON.stringify({ path }) }).catch(() => {});
+        const absPath = resolve(projectDir, path);
+        let version: string | null = null;
+        try {
+          version = fileContentVersion(readFileSync(absPath, "utf-8"));
+        } catch {
+          // A deletion has no current bytes to match against an API write receipt.
+        }
+        const receipt = version ? consumeFileWriteReceipt(absPath, version) : null;
+        stream
+          .writeSSE({ event: "file-change", data: JSON.stringify(receipt ?? { path }) })
+          .catch(() => {});
       };
       watcher.addListener(listener);
       while (true) {
         await stream.sleep(30000);
       }
     });
+  });
+
+  // ── Pre-flight checks for render ────────────────────────────────────────
+  // Intercept render requests before they reach the shared API so we can
+  // fail fast with an actionable hint instead of burning through the entire
+  // capture pipeline before hitting "spawn ffmpeg ENOENT" at encode.
+  let cachedFFmpegPath: string | undefined;
+  app.post("/api/projects/:id/render", async (c, next) => {
+    const { findFFmpeg, getFFmpegInstallHint } = await import("../browser/ffmpeg.js");
+    if (!cachedFFmpegPath) {
+      cachedFFmpegPath = findFFmpeg();
+    }
+    if (!cachedFFmpegPath) {
+      return c.json({ error: "FFmpeg not found", hint: getFFmpegInstallHint() }, 503);
+    }
+    return next();
   });
 
   // Mount the shared studio API at /api.
@@ -422,6 +817,22 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
   app.get("/assets/*", serveStudioStaticFile);
   app.get("/icons/*", serveStudioStaticFile);
   app.get("/favicon.svg", serveStudioStaticFile);
+
+  // ── Runtime env injection ───────────────────────────────────────────────
+  // When the studio is served as a pre-built SPA, Vite `VITE_STUDIO_*` env
+  // vars were baked at build time. Collect any such vars from the current
+  // process.env and inject them as `window.__HF_STUDIO_ENV__` so the client
+  // can pick them up at runtime, overriding the baked defaults.
+  function buildRuntimeEnvScript(): string {
+    const overrides: Record<string, string> = {};
+    for (const [key, value] of Object.entries(process.env)) {
+      if (key.startsWith("VITE_STUDIO_") && value !== undefined) {
+        overrides[key] = value;
+      }
+    }
+    if (Object.keys(overrides).length === 0) return "";
+    return `<script>window.__HF_STUDIO_ENV__=${JSON.stringify(overrides)};</script>`;
+  }
 
   // SPA fallback
   app.get("*", (c) => {
@@ -482,8 +893,26 @@ export function createStudioServer(options: StudioServerOptions): StudioServer {
         500,
       );
     }
-    return c.html(readFileSync(indexPath, "utf-8"));
+    let html = readFileSync(indexPath, "utf-8");
+    // Inject before the studio bundle runs. Identity script first (see
+    // buildStudioHeadScripts) so the CLI distinct id is on `window` by the time
+    // telemetry init reads it.
+    //
+    // Host-guarded for the same reason /api/telemetry-identity is, and it has
+    // to be checked HERE too: guarding only the endpoint leaves this route as
+    // an open side door, since a rebound origin can simply fetch `/` and read
+    // the same distinct id and seed out of the returned HTML.
+    //
+    // Only IDENTITY is withheld from an untrusted Host. The canary decisions
+    // map still goes out — it is non-identifying, and a LAN/remote Studio
+    // (`HYPERFRAMES_PREVIEW_HOST=0.0.0.0`) needs it to stay in agreement with
+    // the CLI. See buildStudioHeadScriptsForHost.
+    const headScript = buildStudioHeadScriptsForHost(buildRuntimeEnvScript(), c.req.header("host"));
+    if (headScript) {
+      html = html.replace("<head>", `<head>${headScript}`);
+    }
+    return c.html(html);
   });
 
-  return { app, watcher };
+  return { app, watcher, adapter };
 }

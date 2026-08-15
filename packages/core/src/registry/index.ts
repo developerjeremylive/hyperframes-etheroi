@@ -10,12 +10,17 @@ export type {
   ComponentItem,
   RegistryManifestEntry,
   RegistryManifest,
+  BlockCategory,
+  BlockCategoryMeta,
+  BlockParam,
 } from "./types.js";
 
 export {
   ITEM_TYPES,
   FILE_TYPES,
   ITEM_TYPE_DIRS,
+  BLOCK_CATEGORIES,
+  resolveBlockCategory,
   isExampleItem,
   isBlockItem,
   isComponentItem,

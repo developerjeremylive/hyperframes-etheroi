@@ -5,9 +5,10 @@ import {
   isMediaElement,
   isCompositionElement,
 } from "../core.types";
-import type { GsapAnimation } from "../parsers/gsapParser";
-import { serializeGsapAnimations, keyframesToGsapAnimations } from "../parsers/gsapParser";
+import type { GsapAnimation } from "@hyperframes/parsers";
+import { serializeGsapAnimations, keyframesToGsapAnimations } from "@hyperframes/parsers";
 import { GSAP_CDN, BASE_STYLES, ZOOM_CONTAINER_STYLES } from "../templates/constants";
+import { COMPOSITION_ATTRIBUTES } from "../compositionContract.js";
 
 const GOOGLE_FONTS_BASE = "https://fonts.googleapis.com/css2";
 const FONT_WEIGHTS: Record<string, string> = {
@@ -320,11 +321,26 @@ export function generateHyperframesHtml(
       ? ` data-zoom-keyframes='${JSON.stringify(stageZoomKeyframes).replace(/'/g, "&#39;")}'`
       : "";
 
-  const { coreCss, customCss, googleFontsLink } = generateHyperframesStyles(
-    sortedElements,
-    resolution,
-    customStyles,
-  );
+  let styleTags = "";
+  let googleFontsLink = "";
+  if (includeStyles) {
+    const styles = generateHyperframesStyles(sortedElements, resolution, customStyles);
+    googleFontsLink = styles.googleFontsLink;
+    styleTags = [
+      styles.coreCss
+        ? `  <style data-hf-core="true">
+    ${styles.coreCss.split("\n").join("\n    ")}
+  </style>`
+        : "",
+      styles.customCss
+        ? `  <style data-hf-custom="true">
+    ${styles.customCss.split("\n").join("\n    ")}
+  </style>`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
 
   const gsapScript = includeScripts
     ? generateGsapTimelineScript(sortedElements, totalDuration, {
@@ -344,23 +360,6 @@ ${gsapScript}
   </script>`
     : "";
 
-  const styleTags = includeStyles
-    ? [
-        coreCss
-          ? `  <style data-hf-core="true">
-    ${coreCss.split("\n").join("\n    ")}
-  </style>`
-          : "",
-        customCss
-          ? `  <style data-hf-custom="true">
-    ${customCss.split("\n").join("\n    ")}
-  </style>`
-          : "",
-      ]
-        .filter(Boolean)
-        .join("\n")
-    : "";
-
   const customStylesAttr = customStyles
     ? ` data-custom-styles='${JSON.stringify(customStyles).replace(/'/g, "&#39;")}'`
     : "";
@@ -372,7 +371,7 @@ ${gsapScript}
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  ${includeStyles ? googleFontsLink : ""}
+  ${googleFontsLink}
   ${gsapCdnTag}
 ${styleTags ? `  ${styleTags}` : ""}
 </head>
@@ -447,9 +446,10 @@ function generateZoomGsapAnimations(
 function generateElementHtml(element: TimelineElement, keyframes?: Keyframe[]): string {
   const baseAttrs = [
     `id="${element.id}"`,
-    `data-start="${element.startTime}"`,
-    `data-end="${element.startTime + element.duration}"`,
-    `data-layer="${element.zIndex}"`,
+    `data-hf-id="${element.id}"`,
+    `${COMPOSITION_ATTRIBUTES.start}="${element.startTime}"`,
+    `${COMPOSITION_ATTRIBUTES.duration}="${element.duration}"`,
+    `${COMPOSITION_ATTRIBUTES.trackIndex}="${element.zIndex}"`,
     `data-name="${element.name}"`,
   ];
 

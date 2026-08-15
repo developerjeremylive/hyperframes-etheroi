@@ -1,8 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, type Server } from "node:net";
-import { PORT_PROBE_HOSTS, testPortOnAllHosts } from "./portUtils.js";
+import { resolve } from "node:path";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
+import {
+  PORT_PROBE_HOSTS,
+  detectHyperframesServer,
+  findPortAndServe,
+  testPortOnAllHosts,
+} from "./portUtils.js";
+import type { ServerType } from "@hono/node-server";
 
 const openServers: Server[] = [];
+const openHttpServers: HttpServer[] = [];
+const openAdaptorServers: ServerType[] = [];
 
 async function allocFreePort(): Promise<number> {
   const srv = createServer();
@@ -15,17 +25,39 @@ async function allocFreePort(): Promise<number> {
   return port;
 }
 
-afterEach(async () => {
+async function closeAll(servers: Array<{ close(cb: () => void): void }>): Promise<void> {
   await Promise.all(
-    openServers.splice(0).map(
-      (s) =>
-        new Promise<void>((resolve) => {
-          s.close(() => resolve());
-        }),
-    ),
+    servers.splice(0).map((s) => new Promise<void>((resolve) => s.close(() => resolve()))),
   );
+}
+
+afterEach(async () => {
+  await closeAll(openServers);
+  await closeAll(openHttpServers);
+  await closeAll(openAdaptorServers);
   vi.restoreAllMocks();
 });
+
+function boundAddress(server: ServerType): string {
+  const addr = server.address();
+  if (addr === null || typeof addr === "string") {
+    throw new Error(`expected an AddressInfo, got ${JSON.stringify(addr)}`);
+  }
+  return addr.address;
+}
+
+async function startConfigProbeServer(payload: Record<string, unknown>): Promise<number> {
+  const server = createHttpServer((_req, res) => {
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify(payload));
+  });
+  openHttpServers.push(server);
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  return (server.address() as import("node:net").AddressInfo).port;
+}
 
 describe("testPortOnAllHosts — real-socket behaviour (OS-dependent)", () => {
   // These exercise the real network stack. On Linux the buggy parallel
@@ -95,5 +127,114 @@ describe("testPortOnAllHosts — sequential contract (platform-agnostic)", () =>
 
     expect(result).toBe(false);
     expect(hostsProbed).toEqual(["127.0.0.1", "0.0.0.0"]);
+  });
+});
+
+describe("findPortAndServe — bind host (security: F-001)", () => {
+  const okFetch = (): Response => new Response("ok");
+
+  it("binds to loopback (127.0.0.1) by default — not all interfaces", async () => {
+    const port = await allocFreePort();
+    const result = await findPortAndServe(okFetch, port, "/tmp/demo-project", true);
+    expect(result.type).toBe("started");
+    if (result.type !== "started") return;
+    openAdaptorServers.push(result.server);
+    // A no-host listen() binds the unspecified address (`::`/`0.0.0.0`),
+    // exposing the studio API to the LAN. The fix must default to loopback.
+    expect(boundAddress(result.server)).toBe("127.0.0.1");
+  });
+
+  it("honours an explicit bindHost when the operator opts in to LAN exposure", async () => {
+    const port = await allocFreePort();
+    const result = await findPortAndServe(
+      okFetch,
+      port,
+      "/tmp/demo-project",
+      true,
+      null,
+      "0.0.0.0",
+    );
+    expect(result.type).toBe("started");
+    if (result.type !== "started") return;
+    openAdaptorServers.push(result.server);
+    expect(boundAddress(result.server)).toBe("0.0.0.0");
+  });
+});
+
+describe("detectHyperframesServer", () => {
+  it("treats same-project servers with a different server build signature as mismatch", async () => {
+    const projectDir = "/tmp/demo-project";
+    const port = await startConfigProbeServer({
+      isHyperframes: true,
+      projectName: "demo-project",
+      projectDir,
+      serverBuildSignature: "old-build",
+      version: "0.6.42",
+    });
+
+    const normalizedProjectDir = resolve(projectDir).replace(/\\/g, "/").toLowerCase();
+    const result = await detectHyperframesServer(port, normalizedProjectDir, "new-build");
+
+    expect(result).toEqual({ type: "mismatch", projectName: "demo-project" });
+  });
+
+  it("treats same-project servers with the same server build signature as match", async () => {
+    const projectDir = "/tmp/demo-project";
+    const port = await startConfigProbeServer({
+      isHyperframes: true,
+      projectName: "demo-project",
+      projectDir,
+      serverBuildSignature: "same-build",
+      version: "0.6.42",
+    });
+
+    const normalizedProjectDir = resolve(projectDir).replace(/\\/g, "/").toLowerCase();
+    const result = await detectHyperframesServer(port, normalizedProjectDir, "same-build");
+
+    expect(result).toEqual({ type: "match" });
+  });
+
+  it("treats same-project servers with a different browser GPU policy as mismatch", async () => {
+    const projectDir = "/tmp/demo-project";
+    const port = await startConfigProbeServer({
+      isHyperframes: true,
+      projectName: "demo-project",
+      projectDir,
+      serverBuildSignature: "same-build",
+      browserGpuMode: "hardware",
+      version: "0.6.42",
+    });
+
+    const normalizedProjectDir = resolve(projectDir).replace(/\\/g, "/").toLowerCase();
+    const result = await detectHyperframesServer(
+      port,
+      normalizedProjectDir,
+      "same-build",
+      "software",
+    );
+
+    expect(result).toEqual({ type: "mismatch", projectName: "demo-project" });
+  });
+
+  it("matches same-project servers with the requested browser GPU policy", async () => {
+    const projectDir = "/tmp/demo-project";
+    const port = await startConfigProbeServer({
+      isHyperframes: true,
+      projectName: "demo-project",
+      projectDir,
+      serverBuildSignature: "same-build",
+      browserGpuMode: "software",
+      version: "0.6.42",
+    });
+
+    const normalizedProjectDir = resolve(projectDir).replace(/\\/g, "/").toLowerCase();
+    const result = await detectHyperframesServer(
+      port,
+      normalizedProjectDir,
+      "same-build",
+      "software",
+    );
+
+    expect(result).toEqual({ type: "match" });
   });
 });

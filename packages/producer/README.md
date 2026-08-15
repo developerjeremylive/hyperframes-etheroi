@@ -47,15 +47,16 @@ await startServer({ port: 8080 });
 
 `RenderConfig` controls the render pipeline:
 
-| Option       | Default      | Description                                                                                                                          |
-| ------------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `inputPath`  | —            | Path to the HTML composition                                                                                                         |
-| `outputPath` | —            | Output video file path (or directory, for `format: "png-sequence"`)                                                                  |
-| `width`      | 1920         | Frame width in pixels                                                                                                                |
-| `height`     | 1080         | Frame height in pixels                                                                                                               |
-| `fps`        | 30           | Frames per second (24, 30, or 60)                                                                                                    |
-| `quality`    | `"standard"` | Encoder preset (`"draft"`, `"standard"`, `"high"`)                                                                                   |
-| `format`     | `"mp4"`      | Output container — `"mp4"`, `"webm"`, `"mov"`, or `"png-sequence"`. See [Transparent Video Output](#transparent-video-output) below. |
+| Option             | Default      | Description                                                                                                                                              |
+| ------------------ | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `inputPath`        | —            | Path to the HTML composition                                                                                                                             |
+| `outputPath`       | —            | Output video file path (or directory, for `format: "png-sequence"`)                                                                                      |
+| `width`            | 1920         | Frame width in pixels                                                                                                                                    |
+| `height`           | 1080         | Frame height in pixels                                                                                                                                   |
+| `fps`              | 30           | Frames per second (24, 30, or 60)                                                                                                                        |
+| `quality`          | `"standard"` | Encoder preset (`"draft"`, `"standard"`, `"high"`)                                                                                                       |
+| `format`           | `"mp4"`      | Output container — `"mp4"`, `"webm"`, `"mov"`, or `"png-sequence"`. See [Transparent Video Output](#transparent-video-output) below.                     |
+| `videoFrameFormat` | `"auto"`     | Source video frame extraction format — `"auto"`, `"jpg"`, or `"png"`. Use `"png"` for UI recordings, screen captures, and color-sensitive source videos. |
 
 ## Transparent Video Output
 
@@ -89,7 +90,7 @@ await executeRenderJob(job);
 
 The producer captures Chrome screenshots with the page background forced transparent (`html, body, [data-composition-id] { background: transparent !important }`) and the CDP default background override set to RGBA 0,0,0,0. The captured PNGs carry a real alpha channel and that channel is preserved end-to-end:
 
-- VP9 (`webm`) is encoded with `-pix_fmt yuva420p`, `-auto-alt-ref 0`, and `alpha_mode=1` metadata.
+- VP9 (`webm`) is encoded with `-pix_fmt yuva420p`, `-auto-alt-ref 0`, `-cpu-used 4` by default, and `alpha_mode=1` metadata. Tune the speed/quality tradeoff with `PRODUCER_VP9_CPU_USED` (`-8` to `8`) or local CLI `--vp9-cpu-used`.
 - ProRes 4444 (`mov`) is encoded with `-pix_fmt yuva444p10le`.
 - PNG sequences are written without re-encoding (zero-padded `frame_NNNNNN.png`).
 
@@ -110,33 +111,32 @@ Don't paint a fullscreen background in your HTML. The default body background is
 
 For renders too large for a single machine, the producer ships a public set of distributed-render primitives. They are pure functions over local file paths — networking and orchestration live in adapter packages (Temporal, AWS Lambda + Step Functions, Cloud Run Jobs, K8s Jobs).
 
-```typescript
-import { plan, renderChunk, assemble } from "@hyperframes/producer/distributed";
+Plan v2 is recommended for new integrations. It publishes an immutable
+manifest plus content-addressed artifacts and materializes only each worker's
+declared dependencies:
 
-// Controller-side: produce a self-contained planDir + content-addressed planHash.
-const planResult = await plan(
+```typescript
+import { planV2, renderChunkV2, assembleV2 } from "@hyperframes/producer/distributed";
+
+// Controller-side: produce a v2 manifest + local content-addressed store.
+const planResult = await planV2(
   projectDir,
   { fps: 30, width: 1920, height: 1080, format: "mp4" },
-  "/tmp/plan",
+  "/tmp/plan-v2",
 );
 
-// Worker-side: render one chunk. Byte-identical retries on the same
-// `(planDir, chunkIndex)` — Temporal / Step Functions retry policies are safe
-// to point at this.
-const chunk = await renderChunk("/tmp/plan", 0, "/tmp/chunks/0.mp4");
+const chunk = await renderChunkV2("/tmp/plan-v2", 0, "/tmp/chunks/0.mp4");
 
 // Controller-side: stitch chunks into the final deliverable.
-await assemble(
-  "/tmp/plan",
-  ["/tmp/chunks/0.mp4", "/tmp/chunks/1.mp4"],
-  "/tmp/plan/audio.aac",
-  "/tmp/output.mp4",
-);
+await assembleV2("/tmp/plan-v2", ["/tmp/chunks/0.mp4", "/tmp/chunks/1.mp4"], "/tmp/output.mp4");
 ```
 
-The three activity functions plus their result types are also re-exported from `@hyperframes/producer` so callers that pin the main package don't need a separate subpath import. Supported formats: `mp4` SDR, `mov` ProRes 4444, and `png-sequence`. webm and HDR mp4 trip a typed `FormatNotSupportedInDistributedError` — use the in-process renderer (`executeRenderJob`) for those.
+Cloud adapters should use `planV2WithPublisher()` so artifacts publish
+directly to object storage. The legacy `plan()` / `renderChunk()` /
+`assemble()` v1 layout remains supported, and cloud SDKs still interpret an
+omitted protocol as v1 for backwards compatibility.
 
-See [`DISTRIBUTED-RENDERING-PLAN.md`](../../DISTRIBUTED-RENDERING-PLAN.md) for the full architecture.
+The activity functions plus their result types are also re-exported from `@hyperframes/producer` so callers that pin the main package don't need a separate subpath import. Supported formats: `mp4` SDR, `mov` ProRes 4444, and `png-sequence`. webm and HDR mp4 trip a typed `FormatNotSupportedInDistributedError` — use the in-process renderer (`executeRenderJob`) for those.
 
 ## How it works
 

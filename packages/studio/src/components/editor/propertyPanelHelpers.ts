@@ -1,5 +1,53 @@
 import { parseCssColor, type ParsedColor } from "./colorValue";
 import { COMMON_LOCAL_FONT_FAMILIES } from "./fontCatalog";
+import type { DomEditSelection } from "./domEditing";
+import type { GsapAnimation } from "@hyperframes/parsers/gsap-parser";
+import type { TimelineElement } from "../../player";
+import { roundToCenti } from "../../utils/rounding";
+
+export type {
+  BackgroundRemovalProgress,
+  BackgroundRemovalResult,
+  PropertyPanelProps,
+} from "./propertyPanelTypes";
+
+export function stripQueryAndHash(value: string): string {
+  const queryIndex = value.indexOf("?");
+  const hashIndex = value.indexOf("#");
+  if (queryIndex < 0) return hashIndex < 0 ? value : value.slice(0, hashIndex);
+  if (hashIndex < 0) return value.slice(0, queryIndex);
+  return value.slice(0, Math.min(queryIndex, hashIndex));
+}
+
+export function isSelectedElementHidden(
+  elements: readonly TimelineElement[],
+  selectedElementId: string | null,
+): boolean {
+  if (!selectedElementId) return false;
+  return (
+    elements.find((element) => (element.key ?? element.id) === selectedElementId)?.hidden === true
+  );
+}
+
+/**
+ * 5-part element identity for keying panel remounts on selection change —
+ * id or selector alone collides for id-less same-selector siblings, leaving
+ * mount-initialized state pointed at the previous element. sourceFile is
+ * required too: the same local id/selector can legitimately recur across
+ * different composition files (host vs. an inlined sub-composition, or two
+ * unrelated sub-comps), and without it those collide onto the same key.
+ */
+export function selectionIdentityKey(
+  element: Pick<DomEditSelection, "id" | "hfId" | "selector" | "selectorIndex" | "sourceFile">,
+): string {
+  return [
+    element.id ?? "",
+    element.hfId ?? "",
+    element.selector ?? "",
+    String(element.selectorIndex ?? ""),
+    element.sourceFile ?? "",
+  ].join("|");
+}
 
 /* ------------------------------------------------------------------ */
 /*  Font types & constants (shared by font and section modules)        */
@@ -128,13 +176,13 @@ function fontSourceRank(source: FontSource): number {
 /* ------------------------------------------------------------------ */
 
 export const FIELD =
-  "min-w-0 rounded-xl border border-neutral-800 bg-neutral-900/95 px-3 py-2 text-neutral-100 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition-colors focus-within:border-neutral-600";
-export const LABEL = "text-[11px] font-medium uppercase tracking-[0.18em] text-neutral-500";
+  "min-w-0 rounded-md bg-panel-input px-3 py-[7px] text-panel-text-1 transition-colors focus-within:ring-1 focus-within:ring-panel-accent/30";
+export const LABEL = "text-[11px] font-medium text-panel-text-3";
 export const RESPONSIVE_GRID = "grid grid-cols-[repeat(auto-fit,minmax(118px,1fr))] gap-3";
 export const EMPTY_STYLES: Record<string, string> = {};
 
-export const EMPTY_FILTER_VALUE = "none";
-export const BOX_SHADOW_PRESETS = {
+const EMPTY_FILTER_VALUE = "none";
+const BOX_SHADOW_PRESETS = {
   none: "none",
   soft: "0 12px 36px rgba(0, 0, 0, 0.28)",
   lift: "0 18px 54px rgba(0, 0, 0, 0.38)",
@@ -142,6 +190,16 @@ export const BOX_SHADOW_PRESETS = {
 } as const;
 
 export type BoxShadowPreset = keyof typeof BOX_SHADOW_PRESETS | "custom";
+
+export {
+  buildClipPathValue,
+  buildInsetClipPathSides,
+  buildInsetClipPathValue,
+  getClipPathInsetPx,
+  inferClipPathPreset,
+  parseInsetClipPathSides,
+  type ClipPathInsetSides,
+} from "./clipPathHelpers";
 
 /* ------------------------------------------------------------------ */
 /*  Shared types                                                       */
@@ -166,8 +224,13 @@ export function parseNumericValue(value: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+export function formatTimingValue(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return "0.00s";
+  return `${seconds.toFixed(2)}s`;
+}
+
 export function formatNumericValue(value: number): string {
-  const rounded = Math.round(value * 100) / 100;
+  const rounded = roundToCenti(value);
   return Number.isInteger(rounded)
     ? `${rounded}`
     : rounded.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
@@ -189,12 +252,7 @@ export function parsePxMetricValue(value: string): number | null {
   return token.value;
 }
 
-export function clampPanelNumber(
-  value: number,
-  min: number,
-  max: number,
-  fallback: number,
-): number {
+function clampPanelNumber(value: number, min: number, max: number, fallback: number): number {
   if (!Number.isFinite(value)) return fallback;
   return Math.max(min, Math.min(max, value));
 }
@@ -235,22 +293,24 @@ export function normalizeTextMetricValue(
 }
 
 function splitCssFunctions(value: string): string[] {
+  const source = value.trim();
   const functions: string[] = [];
-  let current = "";
   let depth = 0;
+  let start = 0;
 
-  for (const char of value.trim()) {
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
     if (char === "(") depth += 1;
     if (char === ")") depth = Math.max(0, depth - 1);
     if (/\s/.test(char) && depth === 0) {
-      if (current.trim()) functions.push(current.trim());
-      current = "";
-      continue;
+      const part = source.slice(start, index).trim();
+      if (part) functions.push(part);
+      start = index + 1;
     }
-    current += char;
   }
 
-  if (current.trim()) functions.push(current.trim());
+  const lastPart = source.slice(start).trim();
+  if (lastPart) functions.push(lastPart);
   return functions;
 }
 
@@ -295,23 +355,6 @@ export function buildBoxShadowPresetValue(
   return BOX_SHADOW_PRESETS[preset];
 }
 
-export function inferClipPathPreset(
-  value: string | undefined,
-): "none" | "inset" | "circle" | "custom" {
-  const normalized = value?.trim();
-  if (!normalized || normalized === "none") return "none";
-  if (/^inset\(/i.test(normalized)) return "inset";
-  if (/^circle\(/i.test(normalized)) return "circle";
-  return "custom";
-}
-
-export function getClipPathInsetPx(value: string | undefined): number {
-  const match = /^inset\(\s*(-?\d+(?:\.\d+)?)px\b/i.exec(value?.trim() ?? "");
-  if (!match) return 0;
-  const parsed = Number.parseFloat(match[1]);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
-}
-
 export function buildStrokeWidthStyleUpdates(
   nextWidth: string,
   currentBorderStyle: string | undefined,
@@ -338,23 +381,6 @@ export function buildStrokeStyleUpdates(
     updates.push(["border-width", "1px"]);
   }
   return updates;
-}
-
-export function buildClipPathValue(
-  preset: "none" | "inset" | "circle" | "custom",
-  radiusValue: number,
-  fallback: string | undefined,
-) {
-  if (preset === "custom") return fallback?.trim() || "none";
-  if (preset === "circle") return "circle(50% at 50% 50%)";
-  if (preset === "inset") {
-    return `inset(0 round ${formatNumericValue(Math.max(0, radiusValue))}px)`;
-  }
-  return "none";
-}
-
-export function buildInsetClipPathValue(insetPx: number, radiusValue: number): string {
-  return `inset(${formatNumericValue(Math.max(0, insetPx))}px round ${formatNumericValue(Math.max(0, radiusValue))}px)`;
 }
 
 export function adjustNumericToken(
@@ -398,4 +424,157 @@ export function extractBackgroundImageUrl(value: string | undefined): string {
   const endParen = value.indexOf(")", index);
   if (endParen < index) return "";
   return value.slice(index, endParen).trim();
+}
+
+// ── GSAP runtime value readers (used by PropertyPanel) ────────────────────
+
+// Core transform channels the panel ALWAYS reads live — even before a just-set
+// value (e.g. rotationX) has re-parsed into `gsapAnimations`. Without this the
+// cube + fields drop the prop and flicker to 0 on every commit; gsap.getProperty
+// reflects the in-place instant patch, so it's the true current value.
+// fallow-ignore-next-line complexity
+const ALWAYS_READ_CHANNELS = [
+  "x",
+  "y",
+  "rotation",
+  "rotationX",
+  "rotationY",
+  "rotationZ",
+  "z",
+  "scale",
+  "transformPerspective",
+  "opacity",
+];
+
+/** Every property key the panel should read for an element: animated props + the
+ * always-read transform channels. */
+function collectPanelPropKeys(gsapAnimations: GsapAnimation[]): Set<string> {
+  const keys = new Set<string>(ALWAYS_READ_CHANNELS);
+  for (const anim of gsapAnimations) {
+    if (anim.keyframes) {
+      for (const kf of anim.keyframes.keyframes) {
+        for (const p of Object.keys(kf.properties)) keys.add(p);
+      }
+    }
+    for (const p of Object.keys(anim.properties)) keys.add(p);
+  }
+  return keys;
+}
+
+export function readGsapRuntimeValuesForPanel(
+  gsapAnimId: string | null,
+  gsapAnimations: GsapAnimation[],
+  element: DomEditSelection,
+  previewIframeRef: React.RefObject<HTMLIFrameElement | null>,
+): Record<string, number> | null {
+  if (!gsapAnimId || gsapAnimations.length === 0) return null;
+  const iframe = previewIframeRef?.current;
+  if (!iframe?.contentWindow) return null;
+  const selector = element.id ? `#${element.id}` : element.selector;
+  if (!selector) return null;
+  try {
+    const gsap = (
+      iframe.contentWindow as unknown as {
+        gsap?: { getProperty: (el: Element, prop: string) => number | string };
+      }
+    ).gsap;
+    if (!gsap?.getProperty) return null;
+    const el = iframe.contentDocument?.querySelector(selector);
+    if (!el) return null;
+    const propKeys = collectPanelPropKeys(gsapAnimations);
+    const result: Record<string, number> = {};
+    for (const prop of propKeys) {
+      const v = Number(gsap.getProperty(el, prop));
+      if (Number.isFinite(v)) result[prop] = roundToCenti(v);
+    }
+    return Object.keys(result).length > 0 ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readGsapBorderRadiusForPanel(
+  gsapRuntimeValues: Record<string, number> | null,
+  gsapAnimations: GsapAnimation[],
+  element: DomEditSelection,
+  previewIframeRef: React.RefObject<HTMLIFrameElement | null>,
+): { tl: number; tr: number; br: number; bl: number } | null {
+  if (!gsapRuntimeValues || !("borderRadius" in gsapRuntimeValues)) {
+    const hasBRProp = gsapAnimations.some(
+      (a) =>
+        "borderRadius" in a.properties ||
+        a.keyframes?.keyframes.some((kf) => "borderRadius" in kf.properties),
+    );
+    if (!hasBRProp) return null;
+  }
+  const iframe = previewIframeRef?.current;
+  const selector = element.id ? `#${element.id}` : element.selector;
+  if (!iframe?.contentDocument || !selector) return null;
+  try {
+    const el = iframe.contentDocument.querySelector(selector);
+    if (!el || !iframe.contentWindow) return null;
+    const cs = iframe.contentWindow.getComputedStyle(el);
+    const parse = (v: string) => Number.parseFloat(v) || 0;
+    return {
+      tl: parse(cs.borderTopLeftRadius),
+      tr: parse(cs.borderTopRightRadius),
+      br: parse(cs.borderBottomRightRadius),
+      bl: parse(cs.borderBottomLeftRadius),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Builds the multi-line "element info" text copied to the clipboard for an AI
+ * agent. Shared by both the legacy and flat inspector headers (the flat split
+ * needs the same string), so it lives here rather than as a PropertyPanel
+ * closure. Pure — the caller owns the clipboard write, toast, and copied state.
+ */
+// fallow-ignore-next-line complexity
+export function buildElementInfoText(
+  element: DomEditSelection,
+  sourceLabel: string,
+  gsapAnimations: GsapAnimation[],
+  previewIframeRef?: React.RefObject<HTMLIFrameElement | null>,
+): string {
+  const file = element.sourceFile ?? "index.html";
+  let lineNum: number | null = null;
+  try {
+    const src = previewIframeRef?.current?.contentDocument?.documentElement?.outerHTML ?? "";
+    if (src && element.id) {
+      const idx = src.indexOf(`id="${element.id}"`);
+      if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
+    }
+    if (!lineNum && element.selector) {
+      const tag = element.tagName.toLowerCase();
+      const cls = element.selector.startsWith(".") ? element.selector.slice(1).split(".")[0] : null;
+      const search = cls ? `class="${cls}` : `<${tag}`;
+      const idx = src.indexOf(search);
+      if (idx > -1) lineNum = src.slice(0, idx).split("\n").length;
+    }
+  } catch {}
+  const fileLoc = lineNum ? `${file}:${lineNum}` : file;
+  const lines = [
+    `Element: ${element.label} (${sourceLabel})`,
+    `File: ${fileLoc}`,
+    `Position: x=${Math.round(element.boundingBox.x)}, y=${Math.round(element.boundingBox.y)}`,
+    `Size: ${Math.round(element.boundingBox.width)}×${Math.round(element.boundingBox.height)}`,
+    `Tag: <${element.tagName}>`,
+  ];
+  if (element.computedStyles["z-index"] && element.computedStyles["z-index"] !== "auto") {
+    lines.push(`Z-index: ${element.computedStyles["z-index"]}`);
+  }
+  if (gsapAnimations.length > 0) {
+    const anim = gsapAnimations[0];
+    lines.push(
+      `Animation: ${anim.method}() ${anim.duration}s at ${anim.position}s, ease: ${anim.ease ?? "default"}`,
+    );
+    const props = Object.entries(anim.properties)
+      .map(([k, v]) => `${k}: ${v}`)
+      .join(", ");
+    if (props) lines.push(`Properties: ${props}`);
+  }
+  return lines.join("\n");
 }

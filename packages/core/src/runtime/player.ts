@@ -1,6 +1,37 @@
-import type { RuntimePlayer, RuntimeTimelineLike } from "./types";
+import type { RuntimePlayer, RuntimeSeekOptions, RuntimeTimelineLike } from "./types";
 import { quantizeTimeToFrame } from "../inline-scripts/parityContract";
 import { swallow } from "./diagnostics";
+
+/**
+ * Safely read a numeric value from a timeline property that may be either a
+ * function (conformant GSAP) or a bare number (user-authored timeline-like).
+ */
+function safeNum(obj: unknown, prop: string, fallback: number): number {
+  const val = (obj as Record<string, unknown>)?.[prop];
+  if (typeof val === "function") return Number(val.call(obj)) || fallback;
+  if (typeof val === "number" && Number.isFinite(val)) return val;
+  if (val !== undefined && val !== null) {
+    swallow("runtime.player.nonConformantNum", { prop, actual: typeof val });
+  }
+  return fallback;
+}
+
+/**
+ * Safely invoke a void method on a timeline. If the method is not a function
+ * (missing or overwritten with a non-callable value), silently skip.
+ */
+function safeVoid(obj: unknown, method: string): void {
+  const fn = (obj as Record<string, unknown>)?.[method];
+  if (typeof fn === "function") {
+    fn.call(obj);
+    return;
+  }
+  if (fn !== undefined) {
+    swallow("runtime.player.nonConformantVoid", { method, actual: typeof fn });
+  }
+}
+
+export type RuntimePlayerTransport = Omit<RuntimePlayer, "_timeline">;
 
 type PlayerDeps = {
   getTimeline: () => RuntimeTimelineLike | null;
@@ -12,7 +43,7 @@ type PlayerDeps = {
   getCanonicalFps: () => number;
   onSyncMedia: (timeSeconds: number, playing: boolean) => void;
   onStatePost: (force: boolean) => void;
-  onDeterministicSeek: (timeSeconds: number) => void;
+  onDeterministicSeek: (timeSeconds: number, options?: RuntimeSeekOptions) => void;
   onDeterministicPause: () => void;
   onDeterministicPlay: () => void;
   onRenderFrameSeek: (timeSeconds: number) => void;
@@ -27,6 +58,12 @@ type PlayerDeps = {
    * animations would continue to advance visually past the paused time.
    */
   getTimelineRegistry?: () => Record<string, RuntimeTimelineLike | undefined>;
+  /**
+   * Optional transport implementation for runtimes with a dedicated clock.
+   * The public player methods remain factory-owned and stable for the lifetime
+   * of the runtime; callers must never replace them after construction.
+   */
+  transport?: RuntimePlayerTransport;
 };
 
 function forEachSiblingTimeline(
@@ -50,13 +87,15 @@ function seekTimelineDeterministically(
   timeline: RuntimeTimelineLike,
   timeSeconds: number,
   canonicalFps: number,
+  options?: RuntimeSeekOptions,
 ): number {
   const quantized = quantizeTimeToFrame(timeSeconds, canonicalFps);
-  timeline.pause();
+  const suppressEvents = options?.suppressEvents === true;
+  safeVoid(timeline, "pause");
   if (typeof timeline.totalTime === "function") {
-    timeline.totalTime(quantized, false);
+    timeline.totalTime(quantized, suppressEvents);
   } else {
-    timeline.seek(quantized, false);
+    if (typeof timeline.seek === "function") timeline.seek(quantized, suppressEvents);
   }
   return quantized;
 }
@@ -66,18 +105,19 @@ function seekMasterAndSiblingTimelinesDeterministically(
   master: RuntimeTimelineLike,
   timeSeconds: number,
   canonicalFps: number,
+  options?: RuntimeSeekOptions,
 ): number {
   const rearmedSiblings: RuntimeTimelineLike[] = [];
   forEachSiblingTimeline(registry, master, (tl) => {
-    tl.play();
+    safeVoid(tl, "play");
     rearmedSiblings.push(tl);
   });
   try {
-    return seekTimelineDeterministically(master, timeSeconds, canonicalFps);
+    return seekTimelineDeterministically(master, timeSeconds, canonicalFps, options);
   } finally {
     for (const tl of rearmedSiblings) {
       try {
-        tl.pause();
+        safeVoid(tl, "pause");
       } catch (err) {
         // ignore sibling failures — one broken timeline shouldn't poison seek
         swallow("runtime.player.site2", err);
@@ -91,11 +131,27 @@ function activateSiblingTimelines(
   master: RuntimeTimelineLike,
 ): void {
   forEachSiblingTimeline(registry, master, (tl) => {
-    tl.play();
+    safeVoid(tl, "play");
   });
 }
 
 export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
+  const transport = deps.transport;
+  if (transport) {
+    return {
+      _timeline: null,
+      play: () => transport.play(),
+      pause: () => transport.pause(),
+      seek: (timeSeconds, options) => transport.seek(timeSeconds, options),
+      renderSeek: (timeSeconds, options) => transport.renderSeek(timeSeconds, options),
+      getTime: () => transport.getTime(),
+      getDuration: () => transport.getDuration(),
+      isPlaying: () => transport.isPlaying(),
+      setPlaybackRate: (rate) => transport.setPlaybackRate(rate),
+      getPlaybackRate: () => transport.getPlaybackRate(),
+    };
+  }
+
   return {
     _timeline: null,
     play: () => {
@@ -103,13 +159,13 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
       if (!timeline || deps.getIsPlaying()) return;
       const safeDuration = Math.max(
         0,
-        Number(deps.getSafeDuration?.() ?? timeline.duration() ?? 0) || 0,
+        Number(deps.getSafeDuration?.() ?? safeNum(timeline, "duration", 0)) || 0,
       );
       if (safeDuration > 0) {
-        const currentTime = Math.max(0, Number(timeline.time()) || 0);
+        const currentTime = Math.max(0, safeNum(timeline, "time", 0));
         if (currentTime >= safeDuration) {
-          timeline.pause();
-          timeline.seek(0, false);
+          safeVoid(timeline, "pause");
+          if (typeof timeline.seek === "function") timeline.seek(0, false);
           deps.onDeterministicSeek(0);
           deps.setIsPlaying(false);
           deps.onSyncMedia(0, false);
@@ -119,10 +175,10 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
       if (typeof timeline.timeScale === "function") {
         timeline.timeScale(deps.getPlaybackRate());
       }
-      timeline.play();
+      safeVoid(timeline, "play");
       forEachSiblingTimeline(deps.getTimelineRegistry?.(), timeline, (tl) => {
         if (typeof tl.timeScale === "function") tl.timeScale(deps.getPlaybackRate());
-        tl.play();
+        safeVoid(tl, "play");
       });
       deps.onDeterministicPlay();
       deps.setIsPlaying(true);
@@ -132,11 +188,11 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
     pause: () => {
       const timeline = deps.getTimeline();
       if (!timeline) return;
-      timeline.pause();
+      safeVoid(timeline, "pause");
       forEachSiblingTimeline(deps.getTimelineRegistry?.(), timeline, (tl) => {
-        tl.pause();
+        safeVoid(tl, "pause");
       });
-      const time = Math.max(0, Number(timeline.time()) || 0);
+      const time = Math.max(0, safeNum(timeline, "time", 0));
       deps.onDeterministicSeek(time);
       deps.onDeterministicPause();
       deps.setIsPlaying(false);
@@ -144,10 +200,11 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
       deps.onRenderFrameSeek(time);
       deps.onStatePost(true);
     },
-    seek: (timeSeconds: number) => {
+    seek: (timeSeconds: number, options?: { keepPlaying?: boolean }) => {
       const timeline = deps.getTimeline();
       if (!timeline) return;
       const safeTime = Math.max(0, Number(timeSeconds) || 0);
+      const wasPlaying = deps.getIsPlaying();
       const quantized = seekMasterAndSiblingTimelinesDeterministically(
         deps.getTimelineRegistry?.(),
         timeline,
@@ -155,12 +212,28 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
         deps.getCanonicalFps(),
       );
       deps.onDeterministicSeek(quantized);
-      deps.setIsPlaying(false);
-      deps.onSyncMedia(quantized, false);
+      if (options?.keepPlaying && wasPlaying) {
+        // The deterministic seek helper pauses the master and rearmed siblings.
+        // Resume them so the caller's playback state survives the seek.
+        if (typeof timeline.timeScale === "function") {
+          timeline.timeScale(deps.getPlaybackRate());
+        }
+        safeVoid(timeline, "play");
+        forEachSiblingTimeline(deps.getTimelineRegistry?.(), timeline, (tl) => {
+          if (typeof tl.timeScale === "function") tl.timeScale(deps.getPlaybackRate());
+          safeVoid(tl, "play");
+        });
+        deps.onDeterministicPlay();
+        deps.onShowNativeVideos();
+        deps.onSyncMedia(quantized, true);
+      } else {
+        deps.setIsPlaying(false);
+        deps.onSyncMedia(quantized, false);
+      }
       deps.onRenderFrameSeek(quantized);
       deps.onStatePost(true);
     },
-    renderSeek: (timeSeconds: number) => {
+    renderSeek: (timeSeconds: number, options?: RuntimeSeekOptions) => {
       const timeline = deps.getTimeline();
       const canonicalFps = deps.getCanonicalFps();
       // When a composition has no GSAP timeline (pure CSS / WAAPI / Lottie /
@@ -173,17 +246,17 @@ export function createRuntimePlayer(deps: PlayerDeps): RuntimePlayer {
             // If nested siblings stay paused, GSAP collapses the root back to the
             // authored master duration and later frames clamp incorrectly.
             activateSiblingTimelines(deps.getTimelineRegistry?.(), timeline);
-            return seekTimelineDeterministically(timeline, timeSeconds, canonicalFps);
+            return seekTimelineDeterministically(timeline, timeSeconds, canonicalFps, options);
           })()
         : quantizeTimeToFrame(Math.max(0, Number(timeSeconds) || 0), canonicalFps);
-      deps.onDeterministicSeek(quantized);
+      deps.onDeterministicSeek(quantized, options);
       deps.setIsPlaying(false);
       deps.onSyncMedia(quantized, false);
       deps.onRenderFrameSeek(quantized);
       deps.onStatePost(true);
     },
-    getTime: () => Number(deps.getTimeline()?.time() ?? 0),
-    getDuration: () => Number(deps.getTimeline()?.duration() ?? 0),
+    getTime: () => safeNum(deps.getTimeline(), "time", 0),
+    getDuration: () => safeNum(deps.getTimeline(), "duration", 0),
     isPlaying: () => deps.getIsPlaying(),
     setPlaybackRate: (rate: number) => deps.setPlaybackRate(rate),
     getPlaybackRate: () => deps.getPlaybackRate(),

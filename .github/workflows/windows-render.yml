@@ -3,6 +3,11 @@ name: Windows render verification
 permissions:
   contents: read
 
+# Suppress hyperframes CLI telemetry from HeyGen's own CI runs.
+# External users' CI continues to emit telemetry unless they set this themselves.
+env:
+  HYPERFRAMES_NO_TELEMETRY: "1"
+
 # Manually triggered smoke test that renders a HyperFrames composition on a
 # real Windows runner. Proves the PR #336 `where ffmpeg` fix actually works
 # end-to-end: FFmpeg is discovered natively on Windows, Chrome is installed
@@ -79,6 +84,7 @@ jobs:
     steps:
       - name: Disable Windows Defender real-time monitoring
         shell: pwsh
+        continue-on-error: true
         run: Set-MpPreference -DisableRealtimeMonitoring $true
 
       - name: Checkout
@@ -101,6 +107,12 @@ jobs:
       # -----------------------------------------------------------------
       - name: Install FFmpeg
         uses: ./.github/actions/install-ffmpeg-windows
+
+      - name: Set FFMPEG_BIN for bun install
+        shell: pwsh
+        run: |
+          $path = (Get-Command ffmpeg.exe).Source
+          "FFMPEG_BIN=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       # -----------------------------------------------------------------
       # Verify FFmpeg feature inventory.
@@ -187,6 +199,10 @@ jobs:
 
       - name: Scaffold canary composition
         shell: pwsh
+        # init's --skip-skills flag is neutered (see init.ts); opt out of the
+        # GitHub skills check via this env so the canary scaffold stays offline.
+        env:
+          HYPERFRAMES_SKIP_SKILLS: "1"
         run: |
           New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\windows-canary" | Out-Null
           cd "$env:RUNNER_TEMP\windows-canary"
@@ -353,6 +369,11 @@ jobs:
   # invocations, CRLF, file URLs, etc.) in existing vitest suites.
   # The producer package is skipped because its tests require Docker /
   # Linux-only tooling (Dockerfile.test, LFS golden MP4 baselines).
+  # The aws-lambda package is skipped because it targets the AWS Lambda
+  # Linux runtime exclusively (`@sparticuz/chromium` is Linux-only; the
+  # ZIP layout is for `/var/task` on AL2023). Its handler.test.ts also
+  # trips a bun-on-Windows workspace-symlink quirk reading the
+  # producer's transitive `hono` dep.
   # -------------------------------------------------------------------
   test-windows:
     name: Tests on windows-latest
@@ -364,6 +385,7 @@ jobs:
     steps:
       - name: Disable Windows Defender real-time monitoring
         shell: pwsh
+        continue-on-error: true
         run: Set-MpPreference -DisableRealtimeMonitoring $true
 
       - name: Checkout
@@ -381,6 +403,12 @@ jobs:
       # -----------------------------------------------------------------
       - name: Install FFmpeg
         uses: ./.github/actions/install-ffmpeg-windows
+
+      - name: Set FFMPEG_BIN for bun install
+        shell: pwsh
+        run: |
+          $path = (Get-Command ffmpeg.exe).Source
+          "FFMPEG_BIN=$path" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -407,9 +435,15 @@ jobs:
         shell: pwsh
         run: bun run build
 
-      - name: Run tests (all packages except producer)
+      - name: Run tests (all packages except producer + aws-lambda)
         shell: pwsh
-        run: bun run --filter "!@hyperframes/producer" test
+        # Enumerate the packages we want to test instead of negating —
+        # `bun run --filter "!a" --filter "!b"` composes as a union (any
+        # package matching either negation runs), not an intersection.
+        # That meant `@hyperframes/producer` was effectively still being
+        # tested on Windows, which is what we explicitly want skipped
+        # (Docker / LFS-baseline tooling).
+        run: bun run --filter @hyperframes/core --filter @hyperframes/engine --filter @hyperframes/player --filter @hyperframes/cli --filter @hyperframes/studio --filter @hyperframes/shader-transitions test
 
       - name: Run runtime contract test
         shell: pwsh

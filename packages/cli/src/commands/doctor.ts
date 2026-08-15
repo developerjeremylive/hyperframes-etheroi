@@ -1,13 +1,23 @@
+// fallow-ignore-file complexity
 import { defineCommand } from "citty";
-import { execSync } from "node:child_process";
-import { freemem, platform } from "node:os";
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync } from "node:fs";
+import { platform } from "node:os";
+import { dirname } from "node:path";
+import { resolveExtractCacheDir } from "@hyperframes/engine";
 import type { Example } from "./_examples.js";
 import { c } from "../ui/colors.js";
-import { findBrowser } from "../browser/manager.js";
-import { findFFmpeg, getFFmpegInstallHint } from "../browser/ffmpeg.js";
+import { parseToolVersion, runEnvironmentChecks } from "../browser/preflight.js";
+import { KOKORO_MODULES, KOKORO_PIP, MUSICGEN_MODULES, MUSICGEN_PIP } from "../audio/providers.js";
+import { hasPythonModules } from "../tts/python.js";
 import { VERSION } from "../version.js";
 import { getUpdateMeta, withMeta } from "../utils/updateCheck.js";
-import { getSystemMeta, getShmSizeMb, getFreeDiskMb, bytesToMb } from "../telemetry/system.js";
+import {
+  getSystemMeta,
+  getShmSizeMb,
+  getFreeDiskMb,
+  getAvailableMemoryMb,
+} from "../telemetry/system.js";
 
 export const examples: Example[] = [
   ["Check system dependencies", "hyperframes doctor"],
@@ -25,51 +35,7 @@ interface CheckResult {
   hint?: string;
 }
 
-function checkFFmpeg(): CheckResult {
-  const path = findFFmpeg();
-  if (path) {
-    try {
-      const version =
-        execSync("ffmpeg -version", { encoding: "utf-8", timeout: 5000 }).split("\n")[0] ?? "";
-      return { ok: true, detail: version.trim() };
-    } catch {
-      return { ok: true, detail: path };
-    }
-  }
-  return {
-    ok: false,
-    detail: "Not found",
-    hint: getFFmpegInstallHint(),
-  };
-}
-
-function checkFFprobe(): CheckResult {
-  // `ffprobe -version` works cross-platform if it's on PATH — no need for
-  // `which`/`where` shell detection, which differs by OS.
-  try {
-    const version =
-      execSync("ffprobe -version", { encoding: "utf-8", timeout: 5000 }).split("\n")[0] ?? "";
-    return { ok: true, detail: version.trim() };
-  } catch {
-    return {
-      ok: false,
-      detail: "Not found",
-      hint: `Installed with ffmpeg — ${getFFmpegInstallHint()}`,
-    };
-  }
-}
-
-async function checkChrome(): Promise<CheckResult> {
-  const info = await findBrowser();
-  if (info) {
-    return { ok: true, detail: `${info.source}: ${info.executablePath}` };
-  }
-  return {
-    ok: false,
-    detail: "Not found",
-    hint: "Run: npx hyperframes browser ensure",
-  };
-}
+export { parseToolVersion };
 
 function checkDocker(): CheckResult {
   try {
@@ -124,18 +90,18 @@ function checkCPU(): CheckResult {
 
 function checkMemory(): CheckResult {
   const sys = getSystemMeta();
-  const freeMb = bytesToMb(freemem()); // fresh reading, not cached
+  const availMb = getAvailableMemoryMb();
   const totalGb = (sys.memory_total_mb / 1024).toFixed(1);
-  const freeGb = (freeMb / 1024).toFixed(1);
+  const availGb = (availMb / 1024).toFixed(1);
 
-  if (freeMb < 2048) {
+  if (availMb < 2048) {
     return {
       ok: false,
-      detail: `${totalGb} GB total \u00B7 ${freeGb} GB free`,
+      detail: `${totalGb} GB total \u00B7 ${availGb} GB available`,
       hint: "Low memory — renders may fail. Close other apps or increase RAM.",
     };
   }
-  return { ok: true, detail: `${totalGb} GB total \u00B7 ${freeGb} GB free` };
+  return { ok: true, detail: `${totalGb} GB total \u00B7 ${availGb} GB available` };
 }
 
 function checkShm(): CheckResult {
@@ -170,6 +136,101 @@ function checkDisk(): CheckResult {
   return { ok: true, detail: `${freeGb} GB free` };
 }
 
+/**
+ * Report the effective extracted-frame cache directory. Long renders can
+ * accumulate multi-GB of extracted video frames here; on Windows the OS
+ * `%TEMP%` default lives on C:, so users with output on a data drive but the
+ * OS on a small SSD have hit disk-exhaustion mid-render (field signal
+ * `ts=1784219488` · CLI 0.7.58 · 15GB/8-core). Surfacing the effective path
+ * + free space at that path lets `hyperframes doctor` catch the mismatch
+ * before the render, and reminds users the relocation knob exists.
+ *
+ * `statfsSync` requires the path to exist. When the configured cache dir has
+ * not been created yet, walk up to the nearest existing ancestor and report
+ * the free space there (which is the same filesystem in practice — free space
+ * is per-mount, not per-directory).
+ */
+export function checkFramesCache(
+  env: Record<string, string | undefined> = process.env,
+  freeDiskMb: (path: string) => number | null = getFreeDiskMb,
+  fileExists: (path: string) => boolean = existsSync,
+): CheckResult {
+  const resolution = resolveExtractCacheDir(env);
+  if (resolution.disabled) {
+    return {
+      ok: true,
+      detail: `Disabled (${resolution.rawValue}) — frames extract into per-render workDir`,
+    };
+  }
+  const dir = resolution.dir;
+  const probePath = firstExistingAncestor(dir, fileExists) ?? dir;
+  const freeMb = freeDiskMb(probePath);
+  if (freeMb === null) {
+    return {
+      ok: true,
+      detail: `${dir} (free space unknown; ${sourceLabel(resolution.source)})`,
+    };
+  }
+  const freeGb = (freeMb / 1024).toFixed(1);
+  const suffix = `${freeGb} GB free at ${probePath} · ${sourceLabel(resolution.source)}`;
+  if (freeMb < 2048) {
+    return {
+      ok: false,
+      detail: `${dir} · ${suffix}`,
+      hint:
+        "Low free space at the extract cache location — long renders can exhaust the drive. " +
+        "Relocate via HYPERFRAMES_EXTRACT_CACHE_DIR=<path> or `hyperframes render --frames-cache-dir <path>`.",
+    };
+  }
+  return { ok: true, detail: `${dir} · ${suffix}` };
+}
+
+function firstExistingAncestor(path: string, fileExists: (p: string) => boolean): string | null {
+  let current = path;
+  for (let i = 0; i < 64; i += 1) {
+    if (fileExists(current)) return current;
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+function sourceLabel(source: "env" | "default"): string {
+  return source === "env" ? "HYPERFRAMES_EXTRACT_CACHE_DIR" : "default";
+}
+
+function commandExists(command: string): boolean {
+  try {
+    execFileSync("which", [command], { stdio: "ignore", timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Puppeteer's managed Chrome download delegates ZIP extraction to `unzip` on
+ * macOS and Linux. Windows has built-in tar/PowerShell extraction paths, so it
+ * does not need this Unix dependency.
+ */
+export function checkArchiveExtractor(
+  hostPlatform = platform(),
+  exists: (command: string) => boolean = commandExists,
+): CheckResult {
+  if (hostPlatform === "win32") {
+    return { ok: true, detail: "Built into Windows" };
+  }
+  if (exists("unzip")) {
+    return { ok: true, detail: "unzip" };
+  }
+  return {
+    ok: false,
+    detail: "Not found",
+    hint: "Install unzip so HyperFrames can extract its managed Chrome download.",
+  };
+}
+
 function checkEnvironment(): CheckResult {
   const sys = getSystemMeta();
   const parts: string[] = [];
@@ -182,6 +243,37 @@ function checkEnvironment(): CheckResult {
     return { ok: true, detail: "Native terminal" };
   }
   return { ok: true, detail: parts.join(" \u00B7 ") };
+}
+
+async function checkWhisper(): Promise<CheckResult> {
+  const { findWhisper, getInstallInstructions } = await import("../whisper/manager.js");
+  const result = findWhisper();
+  if (result) {
+    return { ok: true, detail: result.executablePath };
+  }
+  return {
+    ok: false,
+    detail: "Not found (optional \u2014 needed for transcription)",
+    hint: getInstallInstructions(),
+  };
+}
+
+function checkLocalVoice(): CheckResult {
+  if (hasPythonModules(KOKORO_MODULES)) return { ok: true, detail: "Kokoro deps installed" };
+  return {
+    ok: false,
+    detail: "Not installed (optional \u2014 local voice fallback)",
+    hint: KOKORO_PIP,
+  };
+}
+
+function checkLocalMusic(): CheckResult {
+  if (hasPythonModules(MUSICGEN_MODULES)) return { ok: true, detail: "MusicGen deps installed" };
+  return {
+    ok: false,
+    detail: "Not installed (optional \u2014 local music fallback)",
+    hint: MUSICGEN_PIP,
+  };
 }
 
 export interface CheckOutcome {
@@ -237,12 +329,15 @@ export default defineCommand({
     json: { type: "boolean", description: "Output as JSON", default: false },
   },
   async run({ args }) {
+    const environment = await runEnvironmentChecks({ includeBrowser: true });
     const checks: Check[] = [
       { name: "Version", run: checkVersion },
       { name: "Node.js", run: checkNode },
       { name: "CPU", run: checkCPU },
       { name: "Memory", run: checkMemory },
       { name: "Disk", run: checkDisk },
+      { name: "Frames cache", run: () => checkFramesCache() },
+      { name: "Archive extractor", run: checkArchiveExtractor },
     ];
 
     // /dev/shm is only relevant on Linux (especially Docker)
@@ -250,17 +345,33 @@ export default defineCommand({
       checks.push({ name: "/dev/shm", run: checkShm });
     }
 
-    checks.push(
-      { name: "Environment", run: checkEnvironment },
-      { name: "FFmpeg", run: checkFFmpeg },
-      { name: "FFprobe", run: checkFFprobe },
-      { name: "Chrome", run: checkChrome },
-      { name: "Docker", run: checkDocker },
-      { name: "Docker running", run: checkDockerRunning },
-    );
+    checks.push({ name: "Environment", run: checkEnvironment });
+    checks.push({ name: "whisper-cpp", run: checkWhisper });
+    checks.push({ name: "TTS (Kokoro)", run: checkLocalVoice });
+    checks.push({ name: "BGM (MusicGen)", run: checkLocalMusic });
 
     const outcomes: CheckOutcome[] = [];
     for (const check of checks) {
+      const result = await check.run();
+      outcomes.push({
+        name: check.name,
+        ok: result.ok,
+        detail: result.detail,
+        ...(result.hint ? { hint: result.hint } : {}),
+      });
+    }
+    for (const result of environment.outcomes) {
+      outcomes.push({
+        name: result.name,
+        ok: result.ok,
+        detail: result.detail,
+        ...(result.hint ? { hint: result.hint } : {}),
+      });
+    }
+    for (const check of [
+      { name: "Docker", run: checkDocker },
+      { name: "Docker running", run: checkDockerRunning },
+    ]) {
       const result = await check.run();
       outcomes.push({
         name: check.name,

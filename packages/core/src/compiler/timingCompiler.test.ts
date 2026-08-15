@@ -1,10 +1,22 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   compileTimingAttrs,
   injectDurations,
   extractResolvedMedia,
   clampDurations,
+  shouldClampResolvedMediaDuration,
 } from "./timingCompiler.js";
+
+// Raw 0x00 bytes in the HFMASK delimiters shipped once and broke every render
+// under Bun's transpiler while behaving fine under Node (issue #2139) — only a
+// byte-level check catches that, so keep the delimiters as \x00 escapes.
+it("source contains no raw NUL bytes", () => {
+  const testPath = expect.getState().testPath ?? "";
+  const src = readFileSync(join(dirname(testPath), "timingCompiler.ts"), "latin1");
+  expect(src.includes("\x00")).toBe(false);
+});
 
 describe("compileTimingAttrs", () => {
   it("adds data-end when data-start and data-duration are present on a video", () => {
@@ -14,6 +26,29 @@ describe("compileTimingAttrs", () => {
     expect(compiled).toContain('data-end="7"');
     expect(compiled).toContain('data-has-audio="true"');
     expect(unresolved).toHaveLength(0);
+  });
+
+  it("injects a real id when the element has only data-hf-id (not a phantom match)", () => {
+    // Regression: getAttr(tag, "id") matched the trailing id="…" inside
+    // data-hf-id="…" and returned a phantom, so compileTag skipped its
+    // hf-video-N injection — leaving no real el.id and a blank-wash render.
+    const html = '<video data-hf-id="hf-bgvideo01" src="a.mp4" data-start="0" data-duration="2">';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('id="hf-video-0"');
+    expect(compiled).toContain('data-hf-id="hf-bgvideo01"');
+    expect(compiled).toContain('data-end="2"');
+  });
+
+  it("injects a real id on an audio element that has only data-hf-id", () => {
+    // Audio side of the same bug: the mixer selects `audio[id][src]`, so a
+    // phantom-id match meant the element was dropped (silent). compileTag must
+    // inject a real hf-audio-N so the mixer can find it.
+    const html = '<audio data-hf-id="hf-bgaudio01" src="a.mp3" data-start="0" data-duration="2">';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain('id="hf-audio-0"');
+    expect(compiled).toContain('data-hf-id="hf-bgaudio01"');
   });
 
   it("leaves data-end unchanged when already present", () => {
@@ -105,6 +140,51 @@ describe("compileTimingAttrs", () => {
 
     expect(unresolved).toHaveLength(0);
   });
+
+  it("ignores media tags mentioned inside comments (issue #1938)", () => {
+    const html =
+      "<!-- this comment mentions a <video> and an <audio> tag -->\n<p>no media here</p>";
+    const { html: compiled, unresolved } = compileTimingAttrs(html);
+
+    // Comment text is preserved verbatim — no id/data-start/data-hf-auto-start injected.
+    expect(compiled).toBe(html);
+    expect(compiled).not.toContain("data-hf-auto-start");
+    expect(unresolved).toHaveLength(0);
+  });
+
+  it("ignores media tags inside <script> string literals", () => {
+    const html = '<script>const x = "<video src=\\"a.mp4\\">";</script>';
+    const { html: compiled, unresolved } = compileTimingAttrs(html);
+
+    expect(compiled).toBe(html);
+    expect(unresolved).toHaveLength(0);
+  });
+
+  it("still compiles real media tags alongside a comment that mentions them", () => {
+    const html =
+      '<!-- a <video> in prose -->\n<video src="a.mp4" data-start="0" data-duration="2">';
+    const { html: compiled } = compileTimingAttrs(html);
+
+    expect(compiled).toContain("<!-- a <video> in prose -->");
+    expect(compiled).toContain('id="hf-video-0"');
+    expect(compiled).toContain('data-end="2"');
+  });
+
+  it("preserves inert regions when compiled output is compiled again", () => {
+    const html = [
+      '<style>.hero::after { content: "$& $$ $` $\' <video>"; }</style>',
+      '<script>const markup = "$& $$ $` $\' <audio>";</script>',
+      '<video class="hero" src="a.mp4" data-start="0" data-duration="2">',
+    ].join("\n");
+
+    const first = compileTimingAttrs(html).html;
+    const second = compileTimingAttrs(first).html;
+
+    expect(second).toContain('<style>.hero::after { content: "$& $$ $` $\' <video>"; }</style>');
+    expect(second).toContain('<script>const markup = "$& $$ $` $\' <audio>";</script>');
+    expect(second).toContain('data-end="2"');
+    expect(second).not.toContain("HFMASK");
+  });
 });
 
 describe("injectDurations", () => {
@@ -183,5 +263,12 @@ describe("clampDurations", () => {
 
     expect(result).toContain('data-duration="5"');
     expect(result).toContain('data-end="7"');
+  });
+});
+
+describe("shouldClampResolvedMediaDuration", () => {
+  it("preserves an explicit video slot but keeps audio source-bounded", () => {
+    expect(shouldClampResolvedMediaDuration("video", 5, 1)).toBe(false);
+    expect(shouldClampResolvedMediaDuration("audio", 5, 1)).toBe(true);
   });
 });

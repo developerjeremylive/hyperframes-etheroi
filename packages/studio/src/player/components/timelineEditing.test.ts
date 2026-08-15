@@ -4,16 +4,19 @@ import {
   buildPromptCopyText,
   buildTimelineElementAgentPrompt,
   buildTimelineAgentPrompt,
-  buildTrackZIndexMap,
-  canOffsetTrimClipStart,
+  clampTimelineGroupResizeDelta,
   getTimelineEditCapabilities,
   hasPatchableTimelineTarget,
   resolveBlockedTimelineEditIntent,
   resolveTimelineAutoScroll,
   resolveTimelineMove,
   resolveTimelineResize,
+  resolveTimelineGroupMove,
+  resolveTimelineGroupResize,
+  snapKeyframePctToBeat,
   type TimelinePromptElement,
 } from "./timelineEditing";
+import { buildStackingTimelineLayers } from "./timelineTrackOrder";
 
 describe("resolveTimelineMove", () => {
   it("moves timing based on horizontal drag and snaps to centiseconds", () => {
@@ -24,14 +27,13 @@ describe("resolveTimelineMove", () => {
           track: 2,
           duration: 2,
           originClientX: 100,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 8,
           trackOrder: [0, 1, 2, 3, 4],
         },
         245,
-        200,
+        0,
       ),
     ).toEqual({ start: 2.7, track: 2 });
   });
@@ -44,14 +46,13 @@ describe("resolveTimelineMove", () => {
           track: 1,
           duration: 3,
           originClientX: 200,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 10,
           trackOrder: [0, 1, 5, 9],
         },
         150,
-        390,
+        190 / 72,
       ),
     ).toEqual({ start: 1.5, track: 9 });
   });
@@ -64,14 +65,13 @@ describe("resolveTimelineMove", () => {
           track: 0,
           duration: 4,
           originClientX: 300,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 6,
           trackOrder: [0, 10, 20],
         },
         -100,
-        -200,
+        -400 / 72,
       ),
     ).toEqual({ start: 0, track: -1 });
 
@@ -82,14 +82,13 @@ describe("resolveTimelineMove", () => {
           track: 10,
           duration: 4,
           originClientX: 300,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 6,
           trackOrder: [0, 10, 20],
         },
         500,
-        200,
+        0,
       ),
     ).toEqual({ start: 6, track: 10 });
   });
@@ -102,14 +101,13 @@ describe("resolveTimelineMove", () => {
           track: 0,
           duration: 2,
           originClientX: 100,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 8,
           trackOrder: [0, 10, 20],
         },
         100,
-        150,
+        -50 / 72,
       ),
     ).toEqual({ start: 1, track: -1 });
   });
@@ -122,19 +120,18 @@ describe("resolveTimelineMove", () => {
           track: 20,
           duration: 2,
           originClientX: 100,
-          originClientY: 200,
+          originRow: 0,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 8,
           trackOrder: [0, 10, 20],
         },
         100,
-        250,
+        50 / 72,
       ),
     ).toEqual({ start: 1, track: 21 });
   });
 
-  it("accounts for scroll displacement while dragging", () => {
+  it("accounts for horizontal scroll displacement while dragging", () => {
     expect(
       resolveTimelineMove(
         {
@@ -142,79 +139,232 @@ describe("resolveTimelineMove", () => {
           track: 0,
           duration: 2,
           originClientX: 100,
-          originClientY: 200,
+          originRow: 0,
           originScrollLeft: 0,
-          originScrollTop: 0,
           currentScrollLeft: 100,
-          currentScrollTop: 144,
           pixelsPerSecond: 100,
-          trackHeight: 72,
           maxStart: 8,
+          // Vertical scroll never reaches here: the drag preview folds it into the
+          // row index it passes, because rows no longer share one pixel height.
           trackOrder: [0, 1, 2, 3],
         },
         100,
-        200,
+        2,
       ),
     ).toEqual({ start: 2, track: 2 });
   });
-});
 
-describe("buildTrackZIndexMap", () => {
-  it("maps visually higher tracks onto higher z-index values", () => {
-    expect(buildTrackZIndexMap([-2, -1, 0, 3])).toEqual(
-      new Map([
-        [-2, 4],
-        [-1, 3],
-        [0, 2],
-        [3, 1],
-      ]),
-    );
-  });
-
-  it("deduplicates tracks before assigning z-index values", () => {
-    expect(buildTrackZIndexMap([-1, 0, -1, 3, 3])).toEqual(
-      new Map([
-        [-1, 3],
-        [0, 2],
-        [3, 1],
-      ]),
-    );
-  });
-});
-
-describe("canOffsetTrimClipStart", () => {
-  it("allows front trim for clips that carry playback offset metadata", () => {
-    expect(
-      canOffsetTrimClipStart({
+  it("snaps conflicting vertical stacking movement to a new lane without changing data-track-index", () => {
+    const stackingElements = [
+      {
+        id: "root-front",
         tag: "div",
-        playbackStartAttr: "media-start",
-      }),
-    ).toBe(true);
+        start: 0,
+        duration: 2,
+        track: 0,
+        zIndex: 2,
+        hasExplicitZIndex: true,
+        stackingContextId: "root",
+        parentCompositionId: null,
+        compositionAncestors: ["root"],
+      },
+      {
+        id: "root-back",
+        tag: "div",
+        start: 0,
+        duration: 2,
+        track: 1,
+        zIndex: 1,
+        hasExplicitZIndex: true,
+        stackingContextId: "root",
+        parentCompositionId: null,
+        compositionAncestors: ["root"],
+      },
+    ];
+    const layers = buildStackingTimelineLayers(stackingElements).rows;
+    const result = resolveTimelineMove(
+      {
+        start: 0,
+        track: 1,
+        duration: 2,
+        originClientX: 0,
+        originRow: 0,
+        pixelsPerSecond: 100,
+        maxStart: 8,
+        trackOrder: [0, 1],
+        layerOrder: layers.map((layer) => layer.id),
+        timelineLayers: layers,
+        stackingElement: stackingElements[1],
+        stackingElements,
+      },
+      0,
+      -1,
+    );
+
+    expect(result).toEqual({
+      start: 0,
+      track: 1,
+      previewLayerId: `preview:root-back:above:${layers[0]!.id}`,
+      previewLayerIndex: 0,
+      stackingReorder: {
+        contextKey: "root",
+        placement: { type: "above", layerId: layers[0]!.id },
+        zIndexChanges: [{ key: "root-back", zIndex: 3 }],
+      },
+    });
+  });
+});
+
+describe("resolveTimelineGroupMove", () => {
+  it("applies an unclamped delta uniformly", () => {
+    const result = resolveTimelineGroupMove(
+      [
+        { start: 1, duration: 2 },
+        { start: 4, duration: 3 },
+      ],
+      1.25,
+    );
+
+    expect(result).toEqual({
+      delta: 1.25,
+      members: [
+        { start: 2.25, duration: 2 },
+        { start: 5.25, duration: 3 },
+      ],
+    });
   });
 
-  it("allows front trim for media clips with source duration metadata", () => {
+  it("clamps the whole group when the earliest start reaches zero", () => {
+    const result = resolveTimelineGroupMove(
+      [
+        { start: 1, duration: 2 },
+        { start: 5, duration: 3 },
+      ],
+      -3,
+    );
+
+    expect(result).toEqual({
+      delta: -1,
+      members: [
+        { start: 0, duration: 2 },
+        { start: 4, duration: 3 },
+      ],
+    });
+    expect(result.members[1]!.start - result.members[0]!.start).toBe(4);
+  });
+});
+
+describe("resolveTimelineGroupResize", () => {
+  it("returns the shared clamped delta without applying per-member starts", () => {
     expect(
-      canOffsetTrimClipStart({
-        tag: "video",
-        sourceDuration: 12,
-      }),
-    ).toBe(true);
+      clampTimelineGroupResizeDelta(
+        1,
+        [
+          { start: 1, duration: 0.5 },
+          { start: 4, duration: 2 },
+        ],
+        "start",
+      ),
+    ).toBe(0.4);
   });
 
-  it("allows front trim for plain audio clips even before media-start exists", () => {
-    expect(
-      canOffsetTrimClipStart({
-        tag: "audio",
-      }),
-    ).toBe(true);
+  it("applies an unclamped start-edge delta uniformly", () => {
+    const result = resolveTimelineGroupResize(
+      [
+        { start: 1, duration: 3 },
+        { start: 5, duration: 4 },
+      ],
+      "start",
+      1,
+    );
+
+    expect(result).toEqual({
+      delta: 1,
+      members: [
+        { start: 2, duration: 2, playbackStart: undefined },
+        { start: 6, duration: 3, playbackStart: undefined },
+      ],
+    });
+    expect(result.members[1]!.start - result.members[0]!.start).toBe(4);
   });
 
-  it("blocks front trim for generic motion clips", () => {
-    expect(
-      canOffsetTrimClipStart({
-        tag: "section",
-      }),
-    ).toBe(false);
+  it("clamps a start-edge delta when the earliest member reaches zero", () => {
+    const result = resolveTimelineGroupResize(
+      [
+        { start: 0.5, duration: 3 },
+        { start: 4, duration: 4 },
+      ],
+      "start",
+      -2,
+    );
+
+    expect(result).toEqual({
+      delta: -0.5,
+      members: [
+        { start: 0, duration: 3.5, playbackStart: undefined },
+        { start: 3.5, duration: 4.5, playbackStart: undefined },
+      ],
+    });
+    expect(result.members[1]!.start - result.members[0]!.start).toBe(3.5);
+  });
+
+  it("clamps a start-edge delta when any member reaches minimum duration", () => {
+    const result = resolveTimelineGroupResize(
+      [
+        { start: 1, duration: 0.5 },
+        { start: 4, duration: 2 },
+      ],
+      "start",
+      1,
+    );
+
+    expect(result).toEqual({
+      delta: 0.4,
+      members: [
+        { start: 1.4, duration: 0.1, playbackStart: undefined },
+        { start: 4.4, duration: 1.6, playbackStart: undefined },
+      ],
+    });
+    expect(result.members[1]!.start - result.members[0]!.start).toBeCloseTo(3);
+  });
+
+  it("clamps an end-edge delta when any member reaches minimum duration", () => {
+    const result = resolveTimelineGroupResize(
+      [
+        { start: 1, duration: 0.5 },
+        { start: 4, duration: 2 },
+      ],
+      "end",
+      -1,
+    );
+
+    expect(result).toEqual({
+      delta: -0.4,
+      members: [
+        { start: 1, duration: 0.1, playbackStart: undefined },
+        { start: 4, duration: 1.6, playbackStart: undefined },
+      ],
+    });
+    expect(result.members[1]!.start - result.members[0]!.start).toBe(3);
+  });
+
+  it("adjusts each start-edge playback start using the shared delta", () => {
+    const result = resolveTimelineGroupResize(
+      [
+        { start: 2, duration: 3, playbackStart: 1, playbackRate: 1 },
+        { start: 5, duration: 4, playbackStart: 2, playbackRate: 2 },
+      ],
+      "start",
+      0.5,
+    );
+
+    expect(result).toEqual({
+      delta: 0.5,
+      members: [
+        { start: 2.5, duration: 2.5, playbackStart: 1.5 },
+        { start: 5.5, duration: 3.5, playbackStart: 3 },
+      ],
+    });
   });
 });
 
@@ -248,7 +398,7 @@ describe("getTimelineEditCapabilities", () => {
     });
   });
 
-  it("allows moving generic motion clips while keeping trims blocked", () => {
+  it("allows full editing of generic motion clips with authored timing", () => {
     expect(
       getTimelineEditCapabilities({
         tag: "section",
@@ -257,8 +407,8 @@ describe("getTimelineEditCapabilities", () => {
       }),
     ).toEqual({
       canMove: true,
-      canTrimStart: false,
-      canTrimEnd: false,
+      canTrimStart: true,
+      canTrimEnd: true,
     });
   });
 
@@ -309,7 +459,7 @@ describe("getTimelineEditCapabilities", () => {
     });
   });
 
-  it("allows move and end trim for patchable composition hosts", () => {
+  it("allows full editing for patchable composition hosts", () => {
     expect(
       getTimelineEditCapabilities({
         tag: "div",
@@ -319,7 +469,38 @@ describe("getTimelineEditCapabilities", () => {
       }),
     ).toEqual({
       canMove: true,
+      canTrimStart: true,
+      canTrimEnd: true,
+    });
+  });
+
+  it("locks all timeline edits for clips with data-timeline-locked", () => {
+    expect(
+      getTimelineEditCapabilities({
+        tag: "div",
+        duration: 8,
+        selector: '[data-composition-id="caption-highlight"]',
+        compositionSrc: "compositions/components/caption-highlight.html",
+        timelineLocked: true,
+      }),
+    ).toEqual({
+      canMove: false,
       canTrimStart: false,
+      canTrimEnd: false,
+    });
+  });
+
+  it("allows full editing of explicitly authored generic elements", () => {
+    expect(
+      getTimelineEditCapabilities({
+        tag: "div",
+        duration: 4,
+        selector: "#hero-card",
+        timingSource: "authored",
+      }),
+    ).toEqual({
+      canMove: true,
+      canTrimStart: true,
       canTrimEnd: true,
     });
   });
@@ -488,6 +669,38 @@ describe("resolveTimelineAutoScroll", () => {
       ),
     ).toEqual({ x: 9, y: 6 });
   });
+
+  it("uses the time-grid edge instead of the viewport edge when labels are sticky", () => {
+    expect(
+      resolveTimelineAutoScroll(
+        {
+          left: 100,
+          top: 100,
+          right: 700,
+          bottom: 400,
+        },
+        340,
+        250,
+        232,
+      ),
+    ).toEqual({ x: -10, y: 0 });
+  });
+
+  it("caps auto-scroll speed when the pointer moves inside the sticky labels", () => {
+    expect(
+      resolveTimelineAutoScroll(
+        {
+          left: 100,
+          top: 100,
+          right: 700,
+          bottom: 400,
+        },
+        120,
+        250,
+        232,
+      ),
+    ).toEqual({ x: -12, y: 0 });
+  });
 });
 
 describe("buildTimelineAgentPrompt", () => {
@@ -504,7 +717,7 @@ describe("buildTimelineAgentPrompt", () => {
       prompt: "Move the title later and lower the music",
     });
 
-    expect(text).toContain("Time range: 0:01 — 0:04");
+    expect(text).toContain("Time range: 00:01 - 00:04");
     expect(text).toContain("#title (div)");
     expect(text).toContain("#music (audio)");
     expect(text).toContain("Move the title later and lower the music");
@@ -600,6 +813,40 @@ describe("resolveTimelineResize", () => {
       ),
     ).toEqual({ start: 0.8, duration: 3.2, playbackStart: 0 });
   });
+
+  it("trims generic element start without media offset", () => {
+    expect(
+      resolveTimelineResize(
+        {
+          start: 2,
+          duration: 4,
+          originClientX: 100,
+          pixelsPerSecond: 100,
+          minStart: 0,
+          maxEnd: 10,
+        },
+        "start",
+        200,
+      ),
+    ).toEqual({ start: 3, duration: 3, playbackStart: undefined });
+  });
+
+  it("extends generic element start leftward to time zero", () => {
+    expect(
+      resolveTimelineResize(
+        {
+          start: 1,
+          duration: 3,
+          originClientX: 100,
+          pixelsPerSecond: 100,
+          minStart: 0,
+          maxEnd: 10,
+        },
+        "start",
+        -200,
+      ),
+    ).toEqual({ start: 0, duration: 4, playbackStart: undefined });
+  });
 });
 
 describe("buildPromptCopyText", () => {
@@ -607,5 +854,36 @@ describe("buildPromptCopyText", () => {
     expect(buildPromptCopyText("  Tighten the headline timing  ")).toBe(
       "Tighten the headline timing",
     );
+  });
+});
+
+describe("snapKeyframePctToBeat", () => {
+  // el spans 0–10s, so clip-% maps to composition time as pct * 0.1s.
+  // At pps=100 the snap window is 8 / 100 = 0.08s.
+  const el = { start: 0, duration: 10 };
+  const beats = [2, 5, 8];
+
+  it("snaps a keyframe within ~8px of a beat exactly onto it", () => {
+    // pct 50.5 → 5.05s, 0.05s from the beat at 5s (inside 0.08s window) → 50%.
+    expect(snapKeyframePctToBeat(el, 50.5, beats, 100)).toBe(50);
+  });
+
+  it("leaves a keyframe unchanged when no beat is within the window", () => {
+    // pct 55 → 5.5s, 0.5s from the nearest beat → free.
+    expect(snapKeyframePctToBeat(el, 55, beats, 100)).toBe(55);
+  });
+
+  it("is a no-op when there are no beats", () => {
+    expect(snapKeyframePctToBeat(el, 50.5, [], 100)).toBe(50.5);
+    expect(snapKeyframePctToBeat(el, 50.5, undefined, 100)).toBe(50.5);
+  });
+
+  it("is a no-op for a zero-duration clip", () => {
+    expect(snapKeyframePctToBeat({ start: 0, duration: 0 }, 50.5, beats, 100)).toBe(50.5);
+  });
+
+  it("widens the snap window as zoom (pps) decreases", () => {
+    // pct 53 → 5.3s, 0.3s from the beat at 5s. At pps=20 the window is 0.4s → snaps to 50%.
+    expect(snapKeyframePctToBeat(el, 53, beats, 20)).toBe(50);
   });
 });

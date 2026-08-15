@@ -8,7 +8,7 @@ const FONT_EXT_RE = /\.(eot|otf|ttc|ttf|woff2?)$/i;
 const FONT_STYLE_SUFFIX_RE =
   /\s+(thin|extralight|extra light|light|regular|roman|medium|semibold|semi bold|bold|extrabold|extra bold|black|italic|oblique|variable)$/i;
 
-export function cssString(value: string): string {
+function cssString(value: string): string {
   return JSON.stringify(value);
 }
 

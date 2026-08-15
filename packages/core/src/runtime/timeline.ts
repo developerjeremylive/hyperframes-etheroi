@@ -4,8 +4,14 @@ import type {
   RuntimeTimelineScene,
   RuntimeTimelineLike,
 } from "./types";
+import { stableClipId } from "./clipTree";
 import { swallow } from "./diagnostics";
+import { readElementPlaybackRate, readElementPlaybackStart } from "./media";
+import { resolveCssStackingContextId } from "./stackingContext";
 import { createRuntimeStartTimeResolver } from "./startResolver";
+import { isSceneLikeCompositionId } from "../slideshow/index.js";
+import { COMPOSITION_CONTRACT_VERSION } from "../compositionContract.js";
+import { runtimeProtocolMetadata } from "./protocol.js";
 
 const AUTHORED_DURATION_ATTR = "data-hf-authored-duration";
 const AUTHORED_END_ATTR = "data-hf-authored-end";
@@ -29,6 +35,19 @@ function parseElementEndAttr(element: Element): number | null {
   );
 }
 
+function readInlineZIndex(element: Element): number {
+  try {
+    const inline = (element as HTMLElement).style?.zIndex;
+    if (inline && inline !== "auto") {
+      const parsed = parseInt(inline, 10);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
 function maxDefinedNumber(...values: Array<number | null>): number | null {
   const finite = values.filter((value): value is number => Number.isFinite(value ?? null));
   if (finite.length === 0) return null;
@@ -36,57 +55,15 @@ function maxDefinedNumber(...values: Array<number | null>): number | null {
 }
 
 /**
- * When multiple content kinds share the same track number, split them
- * onto separate tracks so the timeline UI shows distinct rows.
- *
- * Preferred kind order (top → bottom): composition, video, image, element, audio.
- * Tracks that contain only one kind are left untouched.
+ * Parse an authored track attribute, honoring 0 (a valid top-lane index).
+ * `parseInt(...) || fallback` silently replaced authored track 0 with the
+ * synthetic fallback, so track-0 clips drifted to the bottom of the timeline.
  */
-const KIND_ORDER: Record<string, number> = {
-  composition: 0,
-  video: 1,
-  image: 2,
-  element: 3,
-  audio: 4,
-};
-
-function normalizeTrackAssignments(clips: RuntimeTimelineClip[]): void {
-  if (clips.length === 0) return;
-
-  // Group clips by their raw track number and detect which tracks have mixed kinds
-  const trackKinds = new Map<number, Set<string>>();
-  for (const clip of clips) {
-    const kinds = trackKinds.get(clip.track) ?? new Set();
-    kinds.add(clip.kind);
-    trackKinds.set(clip.track, kinds);
-  }
-
-  const hasMixedTracks = Array.from(trackKinds.values()).some((kinds) => kinds.size > 1);
-  if (!hasMixedTracks) return;
-
-  // Build new contiguous track numbers, splitting mixed tracks by kind
-  let nextTrack = 0;
-  const newTrackMap = new Map<string, number>(); // "origTrack:kind" → newTrack
-
-  const sortedTracks = [...trackKinds.keys()].sort((a, b) => a - b);
-  for (const track of sortedTracks) {
-    const kinds = trackKinds.get(track)!;
-    if (kinds.size === 1) {
-      newTrackMap.set(`${track}:${[...kinds][0]}`, nextTrack++);
-    } else {
-      // Split by kind in preferred order
-      const sorted = [...kinds].sort((a, b) => (KIND_ORDER[a] ?? 99) - (KIND_ORDER[b] ?? 99));
-      for (const kind of sorted) {
-        newTrackMap.set(`${track}:${kind}`, nextTrack++);
-      }
-    }
-  }
-
-  for (const clip of clips) {
-    const key = `${clip.track}:${clip.kind}`;
-    const newTrack = newTrackMap.get(key);
-    if (newTrack != null) clip.track = newTrack;
-  }
+function parseAuthoredTrack(el: Element, fallback: number): number {
+  const raw = el.getAttribute("data-track-index") ?? el.getAttribute("data-track");
+  if (raw == null) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function toAbsoluteAssetUrl(rawValue: string | null | undefined): string | null {
@@ -176,7 +153,6 @@ function buildTimelineClipLabel(node: Element, kind: RuntimeTimelineClip["kind"]
 
 export function collectRuntimeTimelinePayload(params: {
   canonicalFps: number;
-  maxTimelineDurationSeconds: number;
 }): RuntimeTimelineMessage {
   const runtimeWindow = window as Window & {
     __timelines?: Record<string, RuntimeTimelineLike | undefined>;
@@ -209,7 +185,7 @@ export function collectRuntimeTimelinePayload(params: {
       parseNum(mediaEl.getAttribute("data-media-start")) ??
       0;
     if (Number.isFinite(mediaEl.duration) && mediaEl.duration > playbackStart) {
-      return Math.max(0, mediaEl.duration - playbackStart);
+      return Math.max(0, (mediaEl.duration - playbackStart) / readElementPlaybackRate(mediaEl));
     }
     return null;
   };
@@ -220,20 +196,15 @@ export function collectRuntimeTimelinePayload(params: {
     if (mediaNodes.length === 0) return null;
     let maxWindowEndSeconds = 0;
     for (const mediaNode of mediaNodes) {
-      const start = startResolver.resolveStartForElement(mediaNode, 0);
+      const start = !mediaNode.hasAttribute("data-hf-auto-start")
+        ? Math.max(0, Number(mediaNode.getAttribute("data-start") ?? 0) || 0)
+        : startResolver.resolveStartForElement(mediaNode, 0);
       if (!Number.isFinite(start)) continue;
       const duration = resolveMediaElementDurationSeconds(mediaNode);
       if (duration == null || duration <= 0) continue;
       maxWindowEndSeconds = Math.max(maxWindowEndSeconds, Math.max(0, start) + duration);
     }
     return maxWindowEndSeconds > 0 ? maxWindowEndSeconds : null;
-  };
-  const isSceneLikeCompositionId = (compositionId: string): boolean => {
-    const normalized = compositionId.trim().toLowerCase();
-    if (!normalized || normalized === "main") return false;
-    if (normalized.includes("caption")) return false;
-    if (normalized.includes("ambient")) return false;
-    return true;
   };
   const resolveNearestCompositionContext = (
     node: Element,
@@ -345,10 +316,7 @@ export function collectRuntimeTimelinePayload(params: {
           mediaWindowDurationCandidate,
           compositionWindowDurationCandidate,
         ));
-  const rootCompositionDuration =
-    preferredRootDuration != null
-      ? Math.min(preferredRootDuration, params.maxTimelineDurationSeconds)
-      : null;
+  const rootCompositionDuration = preferredRootDuration ?? null;
   const rootCompositionEnd =
     rootCompositionDuration != null ? rootCompositionStart + rootCompositionDuration : null;
   const timelineWindowEnd =
@@ -378,8 +346,7 @@ export function collectRuntimeTimelinePayload(params: {
     ),
   );
   let maxEnd = 0;
-  for (let i = 0; i < nodes.length; i += 1) {
-    const node = nodes[i];
+  for (const [i, node] of nodes.entries()) {
     if (node === root) continue;
     if (["SCRIPT", "STYLE", "LINK", "META", "TEMPLATE", "NOSCRIPT"].includes(node.tagName))
       continue;
@@ -431,15 +398,13 @@ export function collectRuntimeTimelinePayload(params: {
               ? "image"
               : "element";
     clips.push({
-      id: (node as HTMLElement).id || nodeCompositionId || null,
+      id: stableClipId(node) ?? nodeCompositionId ?? null,
       label: buildTimelineClipLabel(node, kind, clips.length),
       start,
       duration,
-      track:
-        Number.parseInt(
-          node.getAttribute("data-track-index") ?? node.getAttribute("data-track") ?? String(i),
-          10,
-        ) || 0,
+      track: parseAuthoredTrack(node, i),
+      zIndex: readInlineZIndex(node),
+      stackingContextId: resolveCssStackingContextId(node),
       kind,
       tagName: tag,
       compositionId: node.getAttribute("data-composition-id"),
@@ -447,6 +412,8 @@ export function collectRuntimeTimelinePayload(params: {
       parentCompositionId: compositionContext.parentCompositionId,
       nodePath: null,
       compositionSrc: toAbsoluteAssetUrl(node.getAttribute("data-composition-src")),
+      playbackStart: readElementPlaybackStart(node),
+      playbackRate: readElementPlaybackRate(node),
       assetUrl: resolveNodeAssetUrl(node),
       timelineRole: node.getAttribute("data-timeline-role"),
       timelineLabel: node.getAttribute("data-timeline-label"),
@@ -546,11 +513,9 @@ export function collectRuntimeTimelinePayload(params: {
               el.id,
             start: range.start,
             duration: clampedDuration,
-            track:
-              Number.parseInt(
-                el.getAttribute("data-track-index") ?? el.getAttribute("data-track") ?? "",
-                10,
-              ) || gsapTrack,
+            track: parseAuthoredTrack(el, gsapTrack),
+            zIndex: readInlineZIndex(el),
+            stackingContextId: resolveCssStackingContextId(el),
             kind: "element",
             tagName: el.tagName.toLowerCase(),
             compositionId: el.getAttribute("data-composition-id"),
@@ -558,6 +523,8 @@ export function collectRuntimeTimelinePayload(params: {
             parentCompositionId: rootCompositionIdForGsap,
             nodePath: null,
             compositionSrc: null,
+            playbackStart: readElementPlaybackStart(el),
+            playbackRate: readElementPlaybackRate(el),
             assetUrl: null,
             timelineRole: el.getAttribute("data-timeline-role"),
             timelineLabel: el.getAttribute("data-timeline-label"),
@@ -603,11 +570,9 @@ export function collectRuntimeTimelinePayload(params: {
           el.id,
         start: 0,
         duration: clampedDuration,
-        track:
-          Number.parseInt(
-            el.getAttribute("data-track-index") ?? el.getAttribute("data-track") ?? "",
-            10,
-          ) || overlayTrack,
+        track: parseAuthoredTrack(el, overlayTrack),
+        zIndex: readInlineZIndex(el),
+        stackingContextId: resolveCssStackingContextId(el),
         kind: "element",
         tagName: tag,
         compositionId: el.getAttribute("data-composition-id"),
@@ -615,6 +580,8 @@ export function collectRuntimeTimelinePayload(params: {
         parentCompositionId: rootCompositionIdForGsap,
         nodePath: null,
         compositionSrc: null,
+        playbackStart: readElementPlaybackStart(el),
+        playbackRate: readElementPlaybackRate(el),
         assetUrl: null,
         timelineRole,
         timelineLabel: el.getAttribute("data-timeline-label"),
@@ -625,11 +592,12 @@ export function collectRuntimeTimelinePayload(params: {
     }
   }
 
-  // ── Track normalization ────────────────────────────────────────────────
-  // When multiple content kinds (composition, audio, video, …) share the same
-  // data-track-index value, split them onto separate tracks so the timeline UI
-  // shows distinct rows for each kind.
-  normalizeTrackAssignments(clips);
+  // Track assignment honors the authored data-track-index verbatim: a clip stays
+  // on the track it was placed on, regardless of kind. (Previously mixed-kind
+  // tracks were split onto separate rows, but that renumbered tracks — breaking
+  // "drop a clip onto an existing track" and causing the written track to drift
+  // from the displayed one on every move. Track index is display-only; render
+  // never reads it, so honoring it verbatim is the correct NLE behavior.)
 
   for (const compositionNode of compositionNodes) {
     if (compositionNode === root) continue;
@@ -664,20 +632,17 @@ export function collectRuntimeTimelinePayload(params: {
   // hide structural/background tracks from the timeline UI; if we collapse the
   // payload duration down to the last visible clip end, the controls jump even
   // though playback still runs for the full authored root duration.
-  const safeDuration = Math.max(
-    1,
-    Math.min(
-      Math.max(maxEnd || 1, rootCompositionDuration ?? 0),
-      params.maxTimelineDurationSeconds,
-    ),
-  );
+  const safeDuration = Math.max(1, maxEnd || 1, rootCompositionDuration ?? 0);
   const shouldEmitNonDeterministicInf = timelineLooksLoopInflated && attrDurationCandidate == null;
   const durationInFrames = shouldEmitNonDeterministicInf
     ? Number.POSITIVE_INFINITY
-    : Math.max(1, Math.round(safeDuration * Math.max(1, params.canonicalFps)));
+    : Math.max(1, Math.ceil(safeDuration * Math.max(1, params.canonicalFps)));
   return {
+    ...runtimeProtocolMetadata(params.canonicalFps),
     source: "hf-preview",
     type: "timeline",
+    compositionContractVersion: COMPOSITION_CONTRACT_VERSION,
+    durationSeconds: shouldEmitNonDeterministicInf ? Number.POSITIVE_INFINITY : safeDuration,
     durationInFrames,
     clips,
     scenes,

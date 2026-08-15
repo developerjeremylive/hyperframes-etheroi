@@ -18,16 +18,16 @@
  * pass the same quality bar the in-process renderer passes against the
  * same frozen baseline. A separate {@link DISTRIBUTED_SIMULATED_MIN_PSNR_DB}
  * pathology floor catches the case where a fixture authored a permissive
- * threshold and distributed regresses to fully-black output. The §5.1
- * 50 dB target was written for per-render comparison (fresh in-process vs
- * fresh distributed); against the frozen baseline file it's unreachable
- * for either mode due to shared encoder/JPEG-capture jitter, so the
- * harness can't use it as a per-test gate.
+ * threshold and distributed regresses to fully-black output. The 50 dB
+ * "distributed vs in-process" contract is a per-render comparison
+ * (fresh in-process vs fresh distributed); against the frozen baseline
+ * file it's unreachable for either mode due to shared encoder/JPEG-
+ * capture jitter, so the harness can't use it as a per-test gate.
  *
  * Not every fixture can run in distributed-simulated mode. Distributed mode
- * refuses webm, HDR mp4, NTSC framerates, and non-{24,30,60} fps at plan
- * time. Fixtures that don't meet the constraints are skipped — the harness
- * logs the reason and the fixture is treated as "passed (skipped)" in
+ * refuses HDR mp4, NTSC framerates, and non-{24,30,60} fps at plan time.
+ * Fixtures that don't meet the constraints are skipped — the harness logs
+ * the reason and the fixture is treated as "passed (skipped)" in
  * distributed-simulated mode.
  */
 
@@ -35,17 +35,31 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Fps } from "@hyperframes/core";
 import { assemble, plan, renderChunk } from "./distributed.js";
+import { PLAN_AUDIO_RELATIVE_PATH, type DistributedFormat } from "./services/distributed/shared.js";
 
-/** Two-mode contract that backs `--mode=<value>` on the regression harness CLI. */
-export type HarnessMode = "in-process" | "distributed-simulated";
+/**
+ * Three-mode contract that backs `--mode=<value>` on the regression
+ * harness CLI:
+ *
+ *   - `in-process` — `executeRenderJob`, the same path the CLI takes.
+ *   - `distributed-simulated` — `plan` → `renderChunk` × N → `assemble`
+ *     in-process. No adapter (no Temporal, no Lambda).
+ *   - `lambda-local` — drives the OSS `@hyperframes/aws-lambda` handler
+ *     dispatch through a filesystem-backed fake S3, so every event
+ *     shape SFN sends in production also lands here. Catches regressions
+ *     in event JSON / S3 path conventions without paying for a real AWS
+ *     round-trip.
+ */
+export type HarnessMode = "in-process" | "distributed-simulated" | "lambda-local";
 
 /**
  * Absolute pathology floor for `--mode=distributed-simulated` — catches
  * a chunk that renders fully-black against a fixture authored with a
  * permissive `minPsnr`. Non-pathological drift is caught by the fixture's
  * own threshold; both modes share the same encoder/JPEG-capture jitter
- * floor against the frozen baseline file, so the §5.1 50 dB target is
- * unreachable for either mode and isn't a useful per-test gate.
+ * floor against the frozen baseline file, so the 50 dB distributed-vs-
+ * in-process contract value is unreachable for either mode and isn't a
+ * useful per-test gate.
  */
 export const DISTRIBUTED_SIMULATED_MIN_PSNR_DB = 10;
 
@@ -54,15 +68,13 @@ export type DistributedSupportResult = { supported: true } | { supported: false;
 
 /**
  * Decide whether a fixture's `renderConfig` is one the distributed pipeline
- * can actually run. The four hard gates:
+ * can actually run. Two hard gates:
  *
  *   - fps must be `{ num: 24|30|60, den: 1 }`. `DistributedRenderConfig.fps`
  *     accepts only the three integer values, and rationals like
  *     `{ num: 30000, den: 1001 }` (NTSC) trip the type system at the call
  *     site. We surface this gate in code rather than only in TS so the
  *     harness can skip the fixture cleanly instead of throwing.
- *   - format must not be `webm`. `plan()` refuses webm with
- *     `FORMAT_NOT_SUPPORTED_IN_DISTRIBUTED`.
  *   - hdr must not be `true`. Distributed mode is SDR-only at v1.
  *
  * Callers that want the structured reason can read it off the returned
@@ -70,7 +82,7 @@ export type DistributedSupportResult = { supported: true } | { supported: false;
  */
 export function checkDistributedSupport(renderConfig: {
   fps: Fps;
-  format?: "mp4" | "webm" | "mov" | "png-sequence";
+  format?: DistributedFormat;
   hdr?: boolean;
 }): DistributedSupportResult {
   if (renderConfig.fps.den !== 1) {
@@ -84,13 +96,6 @@ export function checkDistributedSupport(renderConfig: {
     return {
       supported: false,
       reason: `fps ${fpsNum} not in {24, 30, 60} (DistributedRenderConfig.fps is a closed set)`,
-    };
-  }
-  const format = renderConfig.format ?? "mp4";
-  if (format === "webm") {
-    return {
-      supported: false,
-      reason: "format=webm refused in distributed mode (VP9+matroska concat-copy is unstable)",
     };
   }
   if (renderConfig.hdr === true) {
@@ -116,7 +121,7 @@ export interface RunDistributedSimulatedInput {
   renderedOutputPath: string;
   /** From the fixture's renderConfig — must pass `checkDistributedSupport`. */
   fps: 24 | 30 | 60;
-  format: "mp4" | "mov" | "png-sequence";
+  format: DistributedFormat;
   /**
    * Codec for `format: "mp4"`. Defaults to `"h264"`; pass `"h265"` to
    * exercise the libx265 closed-GOP path. Ignored for non-mp4 formats —
@@ -171,6 +176,12 @@ export async function runDistributedSimulatedRender(
       chunkSize: input.chunkSize,
       maxParallelChunks: input.maxParallelChunks,
       hdrMode: "force-sdr",
+      // Forward `variables` to plan() so distributed-simulated fixtures
+      // that declare `renderConfig.variables` produce the same pixels in
+      // distributed mode as in-process. Without this, the harness silently
+      // drops the variables for distributed/lambda-local modes and any
+      // composition that reads `window.__hfVariables` diverges.
+      variables: input.variables,
     },
     planDir,
   );
@@ -188,9 +199,9 @@ export async function runDistributedSimulatedRender(
     chunkPaths.push(chunkPath);
   }
 
-  // Step C: assemble. `audio.aac` only exists when the composition has
+  // Step C: assemble. The audio artifact only exists when the composition has
   // audio — pass null otherwise so `assemble()` doesn't try to mux silence.
-  const audioPath = join(planDir, "audio.aac");
+  const audioPath = join(planDir, PLAN_AUDIO_RELATIVE_PATH);
   const audioForAssemble = existsSync(audioPath) ? audioPath : null;
   await assemble(planDir, chunkPaths, audioForAssemble, input.renderedOutputPath);
 }
@@ -206,6 +217,8 @@ export async function runDistributedSimulatedRender(
  */
 export function resolveMinPsnrForMode(mode: HarnessMode, fixtureMinPsnr: number): number {
   if (mode === "in-process") return fixtureMinPsnr;
+  // `lambda-local` shares the distributed-simulated pathology floor —
+  // both modes go through the same plan/renderChunk/assemble primitives.
   return Math.max(fixtureMinPsnr, DISTRIBUTED_SIMULATED_MIN_PSNR_DB);
 }
 
@@ -219,10 +232,11 @@ export function resolveMinPsnrForMode(mode: HarnessMode, fixtureMinPsnr: number)
 export function parseHarnessModeFlag(token: string): HarnessMode | null {
   if (token === "--mode=in-process") return "in-process";
   if (token === "--mode=distributed-simulated") return "distributed-simulated";
+  if (token === "--mode=lambda-local") return "lambda-local";
   if (token.startsWith("--mode=")) {
     const value = token.slice("--mode=".length);
     throw new Error(
-      `regression-harness: --mode must be 'in-process' or 'distributed-simulated' (got ${JSON.stringify(value)})`,
+      `regression-harness: --mode must be 'in-process', 'distributed-simulated', or 'lambda-local' (got ${JSON.stringify(value)})`,
     );
   }
   return null;
