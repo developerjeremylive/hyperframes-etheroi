@@ -69,6 +69,132 @@ describe("external symlink assets", () => {
   });
 });
 
+describe("blank_root_with_standalone_composition", () => {
+  it("errors when the default entry is blank but an authored standalone composition lives under compositions", async () => {
+    const project = makeProject(validHtml(), {
+      "index.html": `<!doctype html><html><body>
+  <div data-composition-id="bona-brand-card" data-width="1920" data-height="1080" data-start="0" data-duration="5">
+    <div id="main-clip" class="clip" data-start="0" data-duration="5" data-track-index="0">BONA</div>
+  </div>
+  <script>window.__timelines = { "bona-brand-card": gsap.timeline({ paused: true }) };</script>
+</body></html>`,
+    });
+
+    const { results, totalErrors } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(totalErrors).toBeGreaterThan(0);
+    expect(finding?.severity).toBe("error");
+    expect(finding?.message).toContain("compositions/index.html");
+    expect(finding?.message).toContain("index.html");
+    expect(finding?.message).toContain("publish");
+    expect(finding?.fixHint).toContain("data-composition-src");
+    expect(finding?.suggestedComposition).toBe("compositions/index.html");
+  });
+
+  it("treats non-rendering script, style, link, meta, and template children as blank", async () => {
+    const shellOnlyRoot = validHtml().replace(
+      "</div>",
+      `<script type="application/json">{}</script>
+       <style>.unused { color: white; }</style>
+       <link rel="stylesheet" href="data:text/css,.unused%7Bcolor:white%7D">
+       <meta name="description" content="shell">
+       <template id="row-template"><div>row</div></template>
+       </div>`,
+    );
+    const project = makeProject(shellOnlyRoot, {
+      "authored.html": `<!doctype html><html><body>
+  <div data-composition-id="authored" data-width="1920" data-height="1080" data-start="0" data-duration="5">
+    <div class="clip" data-start="0" data-duration="5">Visible</div>
+  </div>
+</body></html>`,
+    });
+
+    const { results } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(finding).toBeDefined();
+  });
+
+  it("does not fire when index.html already contains authored clip content", async () => {
+    const authoredRoot = validHtml().replace(
+      "</div>",
+      '<div class="clip" data-start="0" data-duration="10">Master content</div></div>',
+    );
+    const project = makeProject(authoredRoot, {
+      "alternate.html": `<!doctype html><html><body>
+  <div data-composition-id="alternate" data-width="1920" data-height="1080" data-start="0" data-duration="5">
+    <div class="clip" data-start="0" data-duration="5">Alternate</div>
+  </div>
+</body></html>`,
+    });
+
+    const { results } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(finding).toBeUndefined();
+  });
+
+  it("does not treat a template-wrapped sub-composition as a misplaced standalone entry", async () => {
+    const project = makeProject(validHtml(), {
+      "scene.html": `<template>
+  <div data-composition-id="scene" data-width="1920" data-height="1080">
+    <div class="clip" data-start="0" data-duration="5">Scene</div>
+  </div>
+</template>`,
+    });
+
+    const { results } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(finding).toBeUndefined();
+  });
+
+  it("still catches a standalone composition that contains an unrelated nested template", async () => {
+    const project = makeProject(validHtml(), {
+      "card.html": `<!doctype html><html><body>
+  <div data-composition-id="card" data-width="1920" data-height="1080" data-start="0" data-duration="5">
+    <div class="clip" data-start="0" data-duration="5">Card</div>
+    <template id="repeated-row"><div class="row">Row</div></template>
+  </div>
+</body></html>`,
+    });
+
+    const { results } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(finding).toBeDefined();
+  });
+
+  it("does not treat a composition that only mounts another composition as standalone", async () => {
+    const project = makeProject(validHtml(), {
+      "wrapper.html": `<!doctype html><html><body>
+  <div data-composition-id="wrapper" data-width="1920" data-height="1080" data-start="0" data-duration="5">
+    <div data-composition-src="compositions/scene.html" data-start="0" data-duration="5"></div>
+  </div>
+</body></html>`,
+      "scene.html": `<template><div data-composition-id="scene"><p>Scene</p></div></template>`,
+    });
+
+    const { results } = await lintProject(project);
+    const finding = results
+      .flatMap((result) => result.result.findings)
+      .find((item) => item.code === "blank_root_with_standalone_composition");
+
+    expect(finding).toBeUndefined();
+  });
+});
+
 describe("missing_or_empty_sub_composition", () => {
   function htmlWithSubComp(srcPath: string): string {
     return `<html><body>
@@ -245,22 +371,31 @@ describe("template shell style sources", () => {
       <div id="scene" data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="10"></div>
       <template data-composition-id="shell">
         <link rel="stylesheet" href="shell.css">
-        <style>[data-composition-id="main"] .title { opacity: 0; }</style>
+        <style>[data-composition-id="from-style-block"] .title { opacity: 0; }</style>
         <div style="mask-image: url(missing-inline-mask.png)"></div>
-        <template><style>[data-composition-id="main"] .nested { opacity: 0; }</style></template>
+        <template><style>[data-composition-id="from-nested-template"] .nested { opacity: 0; }</style></template>
       </template>
       <script>window.__timelines = {};</script>
     </body></html>`);
     writeFileSync(
       join(project, "shell.css"),
-      '[data-composition-id="main"] .from-link { opacity: 0; }',
+      '[data-composition-id="from-link"] .from-link { opacity: 0; }',
     );
 
     const { results } = await lintProject(project);
     const findings = results.flatMap((entry) => entry.result.findings);
+    // Each style source scopes CSS to a composition id that has no wrapper, so
+    // one scoped_css_missing_wrapper per source proves all three were collected.
     expect(
-      findings.filter((finding) => finding.code === "composition_self_attribute_selector"),
-    ).toHaveLength(3);
+      findings
+        .filter((finding) => finding.code === "scoped_css_missing_wrapper")
+        .map((finding) => finding.selector)
+        .sort(),
+    ).toEqual([
+      '[data-composition-id="from-link"]',
+      '[data-composition-id="from-nested-template"]',
+      '[data-composition-id="from-style-block"]',
+    ]);
     expect(findings.some((finding) => finding.code === "texture_mask_asset_not_found")).toBe(true);
   });
 });
