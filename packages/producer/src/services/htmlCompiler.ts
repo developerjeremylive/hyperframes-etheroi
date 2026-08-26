@@ -1280,6 +1280,8 @@ const REMOTE_MEDIA_SUBDIR = "_remote_media";
 // have `>` inside quoted attribute values (data-title etc.).
 const REMOTE_MEDIA_TAG_RE =
   /<(?:video|audio)\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
+// <source src> on media elements (picture uses srcset, not src).
+const REMOTE_SOURCE_TAG_RE = /<source\b[^>]*?\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>/gi;
 // Match <img> tags (including agent-pipeline-emitted variants where `src` is
 // not the first attribute). Producer-side localisation is the primary fix for
 // the remote-<img> flicker; frameCapture's `pollImagesReady`/`decodeAllImages`
@@ -1350,10 +1352,11 @@ async function downloadAndRewriteUrls(
 }
 
 /**
- * Download any remote `src` URLs on `<video>` and `<audio>` elements into a
- * local subdirectory of `downloadDir`, rewrite the HTML src attributes to
- * relative paths, and return the updated HTML along with a map of
- * `{ relativePath → absoluteLocalPath }` for callers to add to `externalAssets`.
+ * Download any remote `src` URLs on `<video>` / `<audio>` elements and their
+ * `<source>` children into a local subdirectory of `downloadDir`, rewrite the
+ * HTML src attributes to relative paths, and return the updated HTML along with
+ * a map of `{ relativePath → absoluteLocalPath }` for callers to add to
+ * `externalAssets`.
  *
  * Skips URLs that fail to download (warns and preserves the original URL so
  * the browser can still attempt the remote fetch as a fallback).
@@ -1369,12 +1372,13 @@ export async function localizeRemoteMediaSources(
   html: string,
   downloadDir: string,
 ): Promise<{ html: string; remoteMediaAssets: Map<string, string> }> {
-  // Collect unique HTTP URLs from <video>/<audio> src attributes.
   const urlSet = new Set<string>();
-  const re = new RegExp(REMOTE_MEDIA_TAG_RE.source, REMOTE_MEDIA_TAG_RE.flags);
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(html)) !== null) {
-    if (m[1]) urlSet.add(m[1]);
+  for (const tagRe of [REMOTE_MEDIA_TAG_RE, REMOTE_SOURCE_TAG_RE]) {
+    const re = new RegExp(tagRe.source, tagRe.flags);
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) {
+      if (m[1]) urlSet.add(m[1]);
+    }
   }
   return downloadAndRewriteUrls(
     urlSet,
@@ -1668,7 +1672,21 @@ export async function localizeRemoteFontFaces(
   );
 }
 
-const LOCAL_FONTFACE_URL_RE = /url\(["']?(?!data:|https?:\/\/)([^"')]+)["']?\)/gi;
+// `file:` joins data: and http(s): in the exclusion list. Without it an
+// absolute `file:///abs/path/font.ttf` src was read as a project-RELATIVE path,
+// resolved to `<projectDir>/file:/abs/path/...`, and the failed read was
+// swallowed below — leaving the rule untouched for the browser to reject.
+const LOCAL_FONTFACE_URL_RE = /url\(["']?(?!data:|file:|https?:\/\/)([^"')]+)["']?\)/gi;
+
+/**
+ * Match one `url(<path>)` occurrence, with or without quotes, for a literal
+ * path. Exported for tests: the suffix-collision it prevents is invisible in
+ * ordinary projects and easy to reintroduce.
+ */
+export function urlOccurrenceRe(localPath: string): RegExp {
+  const escaped = localPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`url\\((["']?)${escaped}\\1\\)`, "g");
+}
 // Base64 expands bytes by ~33%, then immutable HTML replacements retain more
 // string copies while compiling. Files up to and including 5 MiB remain inline;
 // the first byte above that stays file-backed. This conservative ceiling keeps
@@ -1739,10 +1757,26 @@ async function embedLocalFontFaces(html: string, projectDir: string): Promise<st
               `[Compiler] Embedded local font file: ${localPath} (${(font.buffer.length / 1024).toFixed(0)} KB → data URI)`,
             );
           }
-          result = result.replaceAll(localPath, dataUri);
+          // Anchored on the `url(...)` occurrence, not a bare substring. A
+          // plain replaceAll of `localPath` also rewrites that text anywhere
+          // else it appears -- including inside a LONGER url whose tail
+          // happens to match, e.g. embedding `fonts/x.ttf` would corrupt an
+          // untouched `url("file:///abs/fonts/x.ttf")` into
+          // `url("file:///abs/<data-uri>")`. Any two paths where one is a
+          // suffix of the other collide the same way. Every sibling rewrite
+          // in this file already anchors like this.
+          result = result.replace(urlOccurrenceRe(localPath), `url("${dataUri}")`);
           embeddedPaths.add(localPath);
-        } catch {
-          // File read or compression failed — keep the original path
+        } catch (error) {
+          // Keep the original path: a font that cannot be read must not fail
+          // the render. Logged rather than silently swallowed -- a silent skip
+          // here means the composition renders in a fallback typeface and
+          // nothing says why.
+          defaultLogger.warn(
+            `[Compiler] Could not embed local font ${localPath}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
     }

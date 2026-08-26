@@ -194,27 +194,13 @@ export function readDecodedAttr(tagSource: string, attr: string): string | null 
 }
 
 /**
- * Read an attribute that may legitimately contain the opposite quote
- * character. `readAttr` truncates `data-variable-values='{"title":"Hello"}'`
- * at the first internal `"` because its `[^"']+` class excludes both quote
- * types. This variant alternates: a double-quoted value never contains an
- * unescaped `"`, and a single-quoted value never contains an unescaped `'`,
- * so each branch can use a quote-specific class.
- *
- * Use for attributes whose values are JSON or otherwise carry the opposite
- * quote character. Existing single-token attributes (`id`, `class`, etc.)
- * stick with `readAttr` for consistency with the rest of the lint code.
+ * Read a JSON-bearing attribute with browser-equivalent character-reference
+ * decoding. Imported or formatter-serialized HTML commonly stores JSON quotes
+ * as `&quot;`; lint must inspect the same decoded value that `getAttribute()`
+ * exposes at runtime.
  */
 export function readJsonAttr(tagSource: string, attr: string): string | null {
-  if (!tagSource) return null;
-  const escaped = attr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  // See readAttr: `(?<![\w-])` prevents a short name from matching the tail of a
-  // longer hyphenated attribute (e.g. "id" inside `data-hf-id`).
-  const match = tagSource.match(
-    new RegExp(`(?<![\\w-])${escaped}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, "i"),
-  );
-  if (!match) return null;
-  return match[1] ?? match[2] ?? null;
+  return readDecodedAttr(tagSource, attr);
 }
 
 export function collectCompositionIds(tags: OpenTag[]): Set<string> {
@@ -468,4 +454,18 @@ export function truncateSnippet(value: string, maxLength = 220): string | undefi
   if (!normalized) return undefined;
   if (normalized.length <= maxLength) return normalized;
   return `${normalized.slice(0, maxLength - 3)}...`;
+}
+
+/**
+ * Matches a media tag carrying a real `src` attribute, capturing the tag name in
+ * group 1 and the src value in group 2.
+ *
+ * The leading whitespace before `src` is load-bearing: `\bsrc\s*=` also matches
+ * the tail of `data-var-src="bg"` (a hyphen/`s` boundary is a word boundary), and
+ * since `[^>]*` is greedy it wins over a real `src` earlier in the same tag. Every
+ * element using a variable binding was therefore reported as referencing a missing
+ * file named after the variable id.
+ */
+export function mediaSrcTagRe(tagAlternation: string): RegExp {
+  return new RegExp(`<(${tagAlternation})\\b[^>]*\\ssrc\\s*=\\s*["']([^"']+)["'][^>]*>`, "gi");
 }

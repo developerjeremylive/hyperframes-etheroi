@@ -7,6 +7,7 @@ import { checkSubCompositionUsability } from "@hyperframes/parsers/sub-compositi
 import { parseHTML } from "linkedom";
 import {
   cleanAssetUrl,
+  collectSubCompositionSrcs,
   isRemoteOrInlineUrl,
   isUnresolvedAssetPlaceholder,
   isWithinProjectRoot,
@@ -18,6 +19,7 @@ import { collectLocalVideoCandidates, lintHevcPreviewCodec } from "./hevcPreview
 import { lintHyperframeHtml } from "./hyperframeLinter.js";
 import type { HyperframeLintFinding, HyperframeLintResult } from "./types.js";
 import type { ParsableDocumentLike } from "@hyperframes/parsers/sub-composition-validity";
+import { mediaSrcTagRe } from "./utils";
 
 /** Adapts linkedom's `parseHTML` to the `checkSubCompositionUsability` contract. */
 function parseSubCompHtml(html: string): ParsableDocumentLike {
@@ -336,13 +338,13 @@ function lintAudioSrcNotFound(
 ): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
 
-  const audioSrcRe = /<audio\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const audioSrcRe = mediaSrcTagRe("audio");
 
   const missingSrcs: string[] = [];
   for (const { html, compSrcPath } of htmlSources) {
     let match: RegExpExecArray | null;
     while ((match = audioSrcRe.exec(html)) !== null) {
-      const src = match[1]!;
+      const src = match[2]!;
       if (/^(https?:|data:|blob:)/i.test(src)) continue;
       if (isUnresolvedAssetPlaceholder(src)) continue;
       const rootRelative = compSrcPath
@@ -377,7 +379,7 @@ function lintMissingLocalAsset(
 ): HyperframeLintFinding[] {
   const findings: HyperframeLintFinding[] = [];
 
-  const localAssetSrcRe = /<(video|img|source)\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const localAssetSrcRe = mediaSrcTagRe("video|img|source");
 
   const missingByTag = new Map<string, Map<string, string>>();
 
@@ -587,14 +589,9 @@ function lintMissingOrEmptySubComposition(
 
   // fallow-ignore-next-line complexity
   const walk = (html: string): void => {
-    const compositionSrcRe = /<[^>]*\bdata-composition-src\s*=\s*["']([^"']+)["'][^>]*>/gi;
-    const scannable = maskNonScannableRanges(html);
-    let match: RegExpExecArray | null;
-    while ((match = compositionSrcRe.exec(scannable)) !== null) {
-      const srcPath = (match[1] ?? "").trim();
-      if (!srcPath) continue;
-      if (isUnresolvedAssetPlaceholder(srcPath)) continue; // __UPPER__ placeholder or late-bound templating token
-
+    // Shared scanner — see collectSubCompositionSrcs for why this must be a
+    // text scan rather than a DOM query (template content is inert).
+    for (const srcPath of collectSubCompositionSrcs(html)) {
       // data-composition-src is always written root-relative (even from a
       // nested sub-composition) — matches the resolution the renderer uses
       // in packages/producer/src/services/htmlCompiler.ts (parseSubCompositions

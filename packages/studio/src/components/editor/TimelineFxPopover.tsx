@@ -11,12 +11,16 @@
 import { useEffect, useRef, type CSSProperties, type KeyboardEvent } from "react";
 import type { HfAudioFxChain } from "@hyperframes/core/audio-fx";
 import type { HfAudioNameKind } from "@hyperframes/core/audio-carve";
+import { applyAudioFxPreset, getAudioFxPreset } from "@hyperframes/core/audio-fx-presets";
 import { FxPresetMenu } from "./propertyPanelFxPresetMenu.js";
 import { applyPresetToChain } from "./useApplyAudioFxPreset.js";
 import { useFxAudition } from "./useFxAudition.js";
+import { trackPresetAuditioned } from "./audioFxTelemetry.js";
 
 const POPOVER_WIDTH = 260;
 const VIEWPORT_MARGIN = 8;
+/** Below this the popover is useless anyway; it scrolls instead of vanishing. */
+const MIN_POPOVER_HEIGHT = 160;
 
 function clampedStyle(anchorRect: DOMRect): CSSProperties {
   const left = Math.min(
@@ -24,14 +28,41 @@ function clampedStyle(anchorRect: DOMRect): CSSProperties {
     Math.max(VIEWPORT_MARGIN, window.innerWidth - POPOVER_WIDTH - VIEWPORT_MARGIN),
   );
   const spaceBelow = window.innerHeight - anchorRect.bottom;
-  const openUpward = spaceBelow < 260 && anchorRect.top > spaceBelow;
+  // Named, because the height cap below needs the same quantity the flip does.
+  // (`spaceAbove === anchorRect.top` for a viewport-relative rect, so the flip
+  // condition itself is unchanged — this is a rename, not a behaviour fix.)
+  const spaceAbove = anchorRect.top;
+  const openUpward = spaceBelow < 260 && spaceAbove > spaceBelow;
+  // Flipping direction alone is not enough: the preset list is taller than either
+  // gap on a short window, so the popover ran off the top or the bottom and its
+  // footer ("+ effect" / "Open rack") went with it. Cap to whatever the chosen
+  // side actually has and let the list scroll inside that.
+  const available = (openUpward ? spaceAbove : spaceBelow) - VIEWPORT_MARGIN - 4;
+  // The minimum is a floor against a tight GAP, not against a tight window: keep
+  // a usable list when the gap is smaller than 160px, but never ask for more
+  // height than the viewport itself can hold.
+  const height = Math.min(
+    Math.max(MIN_POPOVER_HEIGHT, available),
+    window.innerHeight - VIEWPORT_MARGIN * 2,
+  );
+  // A floor larger than the gap would hang the box off the edge it opened away
+  // from — reachable at high browser zoom, where both gaps fall under ~172px.
+  // Slide it back in-bounds the way `left` is already clamped, rather than
+  // shrinking below the floor: the offset that keeps BOTH edges inside is
+  // `innerHeight - height - VIEWPORT_MARGIN`, from either side.
+  const inset = (desired: number) =>
+    Math.max(
+      VIEWPORT_MARGIN,
+      Math.min(desired, Math.max(VIEWPORT_MARGIN, window.innerHeight - height - VIEWPORT_MARGIN)),
+    );
   return {
     position: "fixed",
     left,
     width: POPOVER_WIDTH,
+    maxHeight: height,
     ...(openUpward
-      ? { bottom: window.innerHeight - anchorRect.top + 4 }
-      : { top: anchorRect.bottom + 4 }),
+      ? { bottom: inset(window.innerHeight - anchorRect.top + 4) }
+      : { top: inset(anchorRect.bottom + 4) }),
   };
 }
 
@@ -51,6 +82,13 @@ export interface TimelineFxPopoverProps {
   onOpenRack: () => void;
 }
 
+/** A preset applied for AUDITION only: no telemetry, since nothing was chosen.
+ *  `applyPresetToChain` is the tracked path and belongs to `onPick`. */
+function auditionPresetChain(base: HfAudioFxChain, presetId: string): HfAudioFxChain {
+  const preset = getAudioFxPreset(presetId);
+  return preset ? applyAudioFxPreset(base, preset) : base;
+}
+
 export function TimelineFxPopover({
   anchorRect,
   chain,
@@ -62,7 +100,11 @@ export function TimelineFxPopover({
   onOpenRack,
 }: TimelineFxPopoverProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const { audition, clearAudition } = useFxAudition(chain, onChainPreview, onAuditionTransport);
+  const { audition, clearAudition, storedChain } = useFxAudition(
+    chain,
+    onChainPreview,
+    onAuditionTransport,
+  );
 
   // Outside click dismisses like any other popover; the button itself is
   // excluded by pointerdown timing (the button's own click hasn't happened yet).
@@ -75,7 +117,8 @@ export function TimelineFxPopover({
   }, [onClose]);
 
   const applyPreset = (id: string) => {
-    const next = applyPresetToChain(chain, id, trackKind);
+    // The stored chain, not the auditioned one — see `storedChain`.
+    const next = applyPresetToChain(storedChain(), id, trackKind);
     if (!next) return;
     clearAudition();
     onChainChange(next);
@@ -96,22 +139,33 @@ export function TimelineFxPopover({
       ref={rootRef}
       role="dialog"
       aria-label="Effects"
-      className="z-50 rounded-md border border-white/10 bg-[#1b1b1f] p-2 shadow-xl"
+      className="z-[200] flex flex-col overflow-hidden rounded-md border border-white/10 bg-[#1b1b1f] p-2 shadow-xl"
       style={clampedStyle(anchorRect)}
       onKeyDown={onKeyDown}
       onPointerDown={(event) => event.stopPropagation()}
     >
-      <FxPresetMenu
-        trackKind={trackKind}
-        onPick={applyPreset}
-        onAudition={
-          onChainPreview
-            ? (id) =>
-                audition(id ? (base) => applyPresetToChain(base, id, trackKind) ?? base : null)
-            : undefined
-        }
-      />
-      <div className="mt-2 flex items-center justify-between border-t border-white/10 pt-2 text-[10px] text-white/55">
+      {/* The list scrolls; the footer below stays put. `min-h-0` is load-bearing
+          — a flex child defaults to min-height:auto and would refuse to shrink,
+          pushing the footer out of the popover instead of scrolling. */}
+      <div className="min-h-0 flex-1 overflow-y-auto">
+        <FxPresetMenu
+          trackKind={trackKind}
+          onPick={applyPreset}
+          // The RAW apply, not `applyPresetToChain` — that helper fires
+          // `trackPresetApplied` on every call, so auditioning a 12-preset shelf
+          // by hover or arrow key emitted 12 `preset_applied` events and the
+          // numbers could not tell an audition from a decision. `FxSection`
+          // makes exactly this split, with `onAuditionTracked` carrying the
+          // honest event.
+          onAudition={
+            onChainPreview
+              ? (id) => audition(id ? (base) => auditionPresetChain(base, id) : null)
+              : undefined
+          }
+          onAuditionTracked={(id) => trackPresetAuditioned(id, { trackKind })}
+        />
+      </div>
+      <div className="mt-2 flex shrink-0 items-center justify-between border-t border-white/10 pt-2 text-[10px] text-white/55">
         <button
           type="button"
           className="hover:text-white"

@@ -1,4 +1,5 @@
 // Types
+export type { RuntimeTimelineClipIdentity } from "./runtime/types.js";
 export type {
   ExecutionMode,
   Orientation,
@@ -50,6 +51,13 @@ export type {
 } from "./slideshow/index.js";
 
 export { parseSlideshowManifest, resolveSlideshow } from "./slideshow/index.js";
+
+export type {
+  AuthoredTimingValue,
+  RawAuthoredTiming,
+  AuthoredTimingWindow,
+} from "./runtime/authoredTiming.js";
+export { resolveAuthoredTimingWindow } from "./runtime/authoredTiming.js";
 
 export {
   CANVAS_DIMENSIONS,
@@ -144,7 +152,11 @@ export {
   MEDIA_DURATION_CLAMP_EPSILON_SECONDS,
 } from "./compiler/timingCompiler";
 
-export { MEDIA_RENDER_ID_ATTR, assignMediaRenderIds } from "./compiler/mediaRenderIds";
+export {
+  AUDIO_GROUP_RENDER_ID_ATTR,
+  MEDIA_RENDER_ID_ATTR,
+  assignMediaRenderIds,
+} from "./compiler/mediaRenderIds";
 
 export {
   RENDER_FRAME_ID_PREFIX,
